@@ -128,7 +128,7 @@ def _message_text(post: dict) -> str:
         originalHandle = post.get("handle") or post.get("author_did")
         text = f"Reposted @{originalHandle}: {text}" if originalHandle else f"Reposted: {text}"
 
-    return text
+    return uiutil.single_line(text)
 
 
 class UserActionMixin:
@@ -517,6 +517,12 @@ class FeedListMixin:
         self._loadingTimer = None
         self._checkingUpdates = False
         self._suppressFocusEvents = False
+        # Only meaningful for hosts with SUPPORTS_JUMP_TO_USER = True,
+        # but harmless to always set -- keeps _jumpToUserPost/
+        # onItemFocused from needing a getattr(..., False) fallback.
+        self._jumpTargetDid = None
+        self._jumpTargetHandle = None
+        self._jumpingToUser = False
         self._startTimeRefreshTimer()
 
     def _startTimeRefreshTimer(self):
@@ -532,6 +538,18 @@ class FeedListMixin:
         self.Bind(wx.EVT_TIMER, self._onTimeRefreshTick, self._timeRefreshTimer)
         self._timeRefreshTimer.Start(60000)
 
+    # Column index of the "Posted"/"Received" time column -- 3 for the
+    # standard Embed/Author/Message/Posted layout (FeedWindow, Saved,
+    # Lists, ListTab), overridden by hosts with a different column
+    # layout (NotificationsWindow). Confirmed by testing (see
+    # plan-09.md): this was hardcoded to 3 unconditionally before,
+    # which crashed NVDA outright (unhandled wxAssertionError, not
+    # caught by safe_ui_callback since it's not a "has been deleted"
+    # RuntimeError) whenever this timer ticked while Notifications
+    # (only 3 columns, time column at index 2) was the visible tab
+    # under a relative-time Display setting.
+    TIME_COLUMN_INDEX = 3
+
     def _onTimeRefreshTick(self, evt):
         # Absolute/custom modes print the same string every time --
         # skip the (harmless but pointless) work there. wx.Notebook
@@ -543,7 +561,7 @@ class FeedListMixin:
         if not self.postList.IsShownOnScreen():
             return
         for i, post in enumerate(self._posts):
-            self.postList.SetItem(i, 3, _format_post_time(post.get("indexed_at")))
+            self.postList.SetItem(i, self.TIME_COLUMN_INDEX, _format_post_time(post.get("indexed_at")))
 
     def _stopTimeRefreshTimer(self):
         timer = getattr(self, "_timeRefreshTimer", None)
@@ -723,9 +741,6 @@ class FeedListMixin:
             return
         newestFirst = db.get_ui_state("sort_order") != "oldest_first"
         index = (n - 1) if newestFirst else (len(self._posts) - n)
-        columnCount = self.postList.GetColumnCount()
-        parts = [self.postList.GetItemText(index, col) for col in range(columnCount)]
-        nvdaUi.message(", ".join(p for p in parts if p))
         # Alt+number doesn't move focus, so onItemFocused (the normal
         # mark-on-scroll path, below) never fires for it -- without
         # this, reading an item aloud this way never marked it read.
@@ -734,9 +749,10 @@ class FeedListMixin:
         # future FeedListMixin tab) instead of needing the same fix
         # repeated per tab and occasionally forgotten -- the exact
         # class of bug already hit twice over in Chat.
-        self.postList.Focus(index)
-        self.postList.Select(index)
-        self.postList.EnsureVisible(index)
+        if uiutil.move_focus_and_check_announce(self.postList, index):
+            columnCount = self.postList.GetColumnCount()
+            parts = [self.postList.GetItemText(index, col) for col in range(columnCount)]
+            nvdaUi.message(", ".join(p for p in parts if p))
         post = self._posts[index]
         if not post.get("is_read"):
             self._markItemRead(post)
@@ -988,6 +1004,144 @@ class FeedListMixin:
             nvdaUi.message(f"1 new post in {self.TAB_NAME} feed.")
         else:
             nvdaUi.message(f"{newCount} new posts in {self.TAB_NAME} feed.")
+
+    # ---------------- window-level keyboard shortcuts (shared) ----------------
+    # Consolidated from 5 near-identical copies (Home/Saved/Lists/ListTab/
+    # Notifications) -- see plan-09.md. Per-class differences are gated by
+    # class attributes (default False, set True where the original class
+    # had that behavior) so this preserves every class's exact prior
+    # behavior rather than guessing which differences were intentional.
+    # ListsWindow's Alt+number/Alt+U logic is genuinely class-specific
+    # (branches on list purpose), so it overrides _onAltNumber/_onAltU
+    # below instead of using a flag.
+
+    def onCharHook(self, evt):
+        keyCode = evt.GetKeyCode()
+
+        if keyCode == wx.WXK_F5 and evt.ControlDown():
+            evt.Skip()  # bubble up to MainWindow's checkAllOpenTabs
+            return
+        if keyCode == wx.WXK_F5 and evt.ShiftDown():
+            self.onFetchPreviousPosts(None)
+            return
+        if keyCode == wx.WXK_F5:
+            self.onCheckForUpdates(None)
+            return
+        if evt.ControlDown() and keyCode == ord("N") and getattr(self, "SUPPORTS_NEW_POST", False):
+            self.onNewPost(None)
+            return
+        if evt.AltDown() and keyCode == ord("A"):
+            self.onPostAction()
+            return
+        if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
+            self._onAltNumber(keyCode - ord("0"))
+            return
+        if evt.AltDown() and keyCode == ord("U"):
+            self._onAltU()
+            return
+        if keyCode == wx.WXK_SPACE and getattr(self, "SUPPORTS_FOCUS_NEXT_UNREAD", False) and self.FindFocus() is self.postList:
+            self._focusNextUnread()
+            return
+        if evt.ControlDown() and keyCode == ord("A") and getattr(self, "SUPPORTS_SELECT_ALL", False) and self.FindFocus() is self.postList:
+            self._selectAllPosts()
+            return
+        if keyCode == wx.WXK_LEFT and not evt.HasAnyModifiers() and getattr(self, "SUPPORTS_JUMP_TO_USER", False) and self.FindFocus() is self.postList:
+            self._jumpToUserPost(-1)
+            return
+        if keyCode == wx.WXK_RIGHT and not evt.HasAnyModifiers() and getattr(self, "SUPPORTS_JUMP_TO_USER", False) and self.FindFocus() is self.postList:
+            self._jumpToUserPost(1)
+            return
+
+        evt.Skip()
+
+    def _onAltNumber(self, n):
+        self._announceNthNewestPost(n)
+
+    def _onAltU(self):
+        self.onUserAction()
+
+    # ---------------- Left/Right jump-to-user (SUPPORTS_JUMP_TO_USER) ----------------
+    # Moved here from FeedWindow (see plan-09.md) so ListsWindow can
+    # opt in via the SUPPORTS_JUMP_TO_USER flag too -- logic itself was
+    # already fully generic (self._posts/self.postList only), nothing
+    # FeedWindow-specific.
+
+    def _postInvolvesUser(self, post, did):
+        if (
+            post.get("author_did") == did
+            or post.get("reposted_by_did") == did
+            or post.get("reply_to_did") == did
+        ):
+            return True
+        facets_json = post.get("facets_json")
+        if facets_json:
+            try:
+                facets = json.loads(facets_json)
+            except (ValueError, TypeError):
+                facets = []
+            for facet in facets:
+                for feature in facet.get("features", []):
+                    if feature.get("$type") == "app.bsky.richtext.facet#mention" and feature.get("did") == did:
+                        return True
+        return False
+
+    def _jumpToUserPost(self, direction: int):
+        """
+        Left/Right jump to the next/previous post (going up/down the
+        list) that's either BY the reference user or MENTIONS them --
+        like OpenTween's jump-to-this-user's-tweets. The reference user
+        locks to whoever the focused post's author was on the FIRST
+        Left/Right press, and stays locked across repeated presses so
+        jumping onto a mention-post (authored by someone else) doesn't
+        silently switch who you're tracking -- it only resets once you
+        navigate some other way (arrow keys, click, etc).
+        """
+        current = self._getFocusedPost()
+        if current is None:
+            return
+
+        if self._jumpTargetDid is None:
+            targetDid = current["author_did"]
+            targetHandle = current.get("handle") or targetDid
+        else:
+            targetDid = self._jumpTargetDid
+            targetHandle = self._jumpTargetHandle
+
+        n = len(self._posts)
+        i = self.postList.GetFocusedItem()
+        for _ in range(n):
+            i += direction
+            if i < 0 or i >= n:
+                break
+            if self._postInvolvesUser(self._posts[i], targetDid):
+                self._jumpTargetDid = targetDid
+                self._jumpTargetHandle = targetHandle
+                self._jumpingToUser = True
+                try:
+                    # Left/Right is a single-item jump, not an additive
+                    # multi-select action like Ctrl+A -- Select() only
+                    # ADDS a row to the selection, it doesn't clear the
+                    # old one the way arrow-key navigation does natively.
+                    # Without this, repeated jumps left multiple rows
+                    # selected at once, so Post action (Alt+A) wrongly
+                    # treated it as a bulk selection.
+                    for j in range(self.postList.GetItemCount()):
+                        if j != i and self.postList.GetItemState(j, wx.LIST_STATE_SELECTED):
+                            self.postList.SetItemState(j, 0, wx.LIST_STATE_SELECTED)
+                    self.postList.Focus(i)
+                    self.postList.Select(i)
+                    self.postList.EnsureVisible(i)
+                finally:
+                    self._jumpingToUser = False
+                return
+
+        nvdaUi.message(f"No more posts involving @{targetHandle} in that direction.")
+
+    # ---------------- new post (SUPPORTS_NEW_POST) ----------------
+
+    def onNewPost(self, evt=None):
+        dlg = ComposeDialog(self, onClosed=None)
+        dlg.Show()
 
 
 class ProfileDialog(UserActionMixin, wx.Dialog):
@@ -1845,6 +1999,10 @@ class ItemActionMixin:
 
 class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     TAB_KEY = "home"  # for MainWindow's remember-last-tab feature
+    SUPPORTS_NEW_POST = True
+    SUPPORTS_FOCUS_NEXT_UNREAD = True
+    SUPPORTS_SELECT_ALL = True
+    SUPPORTS_JUMP_TO_USER = True
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -1852,10 +2010,7 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         self._account = db.get_active_account()
         self.TAB_NAME = TAB_NAME
         self._feedKey = "home"  # switched by onFilterChanged() below
-        self._initFeedListState()
-        self._jumpTargetDid = None
-        self._jumpTargetHandle = None
-        self._jumpingToUser = False
+        self._initFeedListState()  # also sets _jumpTargetDid/_jumpTargetHandle/_jumpingToUser now
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -1989,83 +2144,9 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         self._updateStatusBar()
         _announce_now(f"Marked {len(posts)} posts as {'read' if read else 'unread'}.")
 
-    def _postInvolvesUser(self, post, did):
-        if (
-            post.get("author_did") == did
-            or post.get("reposted_by_did") == did
-            or post.get("reply_to_did") == did
-        ):
-            return True
-        facets_json = post.get("facets_json")
-        if facets_json:
-            try:
-                facets = json.loads(facets_json)
-            except (ValueError, TypeError):
-                facets = []
-            for facet in facets:
-                for feature in facet.get("features", []):
-                    if feature.get("$type") == "app.bsky.richtext.facet#mention" and feature.get("did") == did:
-                        return True
-        return False
-
-    def _jumpToUserPost(self, direction: int):
-        """
-        Left/Right jump to the next/previous post (going up/down the
-        list) that's either BY the reference user or MENTIONS them --
-        like OpenTween's jump-to-this-user's-tweets. The reference user
-        locks to whoever the focused post's author was on the FIRST
-        Left/Right press, and stays locked across repeated presses so
-        jumping onto a mention-post (authored by someone else) doesn't
-        silently switch who you're tracking -- it only resets once you
-        navigate some other way (arrow keys, click, etc).
-        """
-        current = self._getFocusedPost()
-        if current is None:
-            return
-
-        if self._jumpTargetDid is None:
-            targetDid = current["author_did"]
-            targetHandle = current.get("handle") or targetDid
-        else:
-            targetDid = self._jumpTargetDid
-            targetHandle = self._jumpTargetHandle
-
-        n = len(self._posts)
-        i = self.postList.GetFocusedItem()
-        for _ in range(n):
-            i += direction
-            if i < 0 or i >= n:
-                break
-            if self._postInvolvesUser(self._posts[i], targetDid):
-                self._jumpTargetDid = targetDid
-                self._jumpTargetHandle = targetHandle
-                self._jumpingToUser = True
-                try:
-                    # Left/Right is a single-item jump, not an additive
-                    # multi-select action like Ctrl+A -- Select() only
-                    # ADDS a row to the selection, it doesn't clear the
-                    # old one the way arrow-key navigation does natively.
-                    # Without this, repeated jumps left multiple rows
-                    # selected at once, so Post action (Alt+A) wrongly
-                    # treated it as a bulk selection.
-                    for j in range(self.postList.GetItemCount()):
-                        if j != i and self.postList.GetItemState(j, wx.LIST_STATE_SELECTED):
-                            self.postList.SetItemState(j, 0, wx.LIST_STATE_SELECTED)
-                    self.postList.Focus(i)
-                    self.postList.Select(i)
-                    self.postList.EnsureVisible(i)
-                finally:
-                    self._jumpingToUser = False
-                return
-
-        nvdaUi.message(f"No more posts involving @{targetHandle} in that direction.")
-
-    # ---------------- compose / refresh ----------------
-
-    def onNewPost(self, evt):
-        dlg = ComposeDialog(self, onClosed=None)
-        dlg.Show()
-
+    # _postInvolvesUser/_jumpToUserPost/onNewPost moved to FeedListMixin
+    # (see plan-09.md) so ListsWindow can share them via SUPPORTS_*
+    # flags -- nothing left to define here, FeedWindow inherits them.
 
     # ---------------- post action menu (Alt+A) ----------------
 
@@ -2144,52 +2225,9 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         return users
 
     # ---------------- window-level keyboard shortcuts ----------------
-
-    def onCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
-
-        # Escape and Ctrl+W used to close this whole window -- Home is
-        # now a permanent tab embedded in MainWindow, so both are
-        # deliberately NOT handled here anymore. Ctrl+W bubbles up
-        # (evt.Skip() below) to MainWindow.onCharHook, which closes the
-        # current tab and already no-ops for non-closable tabs like
-        # this one; Escape simply does nothing on a permanent tab now.
-        if keyCode == wx.WXK_F5 and evt.ControlDown():
-            evt.Skip()  # bubble up to MainWindow's checkAllOpenTabs
-            return
-        if keyCode == wx.WXK_F5 and evt.ShiftDown():
-            self.onFetchPreviousPosts(None)
-            return
-        if keyCode == wx.WXK_F5:
-            self.onCheckForUpdates(None)
-            return
-        if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
-            self._announceNthNewestPost(keyCode - ord("0"))
-            return
-        if evt.ControlDown() and keyCode == ord("N"):
-            self.onNewPost(None)
-            return
-        if evt.AltDown() and keyCode == ord("A"):
-            self.onPostAction()
-            return
-        if evt.AltDown() and keyCode == ord("U"):
-            self.onUserAction()
-            return
-        if keyCode == wx.WXK_SPACE and self.FindFocus() is self.postList:
-            self._focusNextUnread()
-            return
-        if evt.ControlDown() and keyCode == ord("A") and self.FindFocus() is self.postList:
-            self._selectAllPosts()
-            return
-        if keyCode == wx.WXK_LEFT and not evt.HasAnyModifiers() and self.FindFocus() is self.postList:
-            self._jumpToUserPost(-1)
-            return
-        if keyCode == wx.WXK_RIGHT and not evt.HasAnyModifiers() and self.FindFocus() is self.postList:
-            self._jumpToUserPost(1)
-            return
-
-        evt.Skip()
-
+    # onCharHook is inherited from FeedListMixin (see SUPPORTS_* flags
+    # above) -- Escape/Ctrl+W are still deliberately not handled here:
+    # Home is a permanent tab now, so both bubble up to MainWindow.
 
 class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     TAB_KEY = "saved"
@@ -2277,10 +2315,10 @@ class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 break
 
     def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 1, _message_text(post))
-        self.postList.SetItem(index, 2, _format_post_time(post.get("indexed_at")))
-        self.postList.SetItem(index, 3, _describe_embed(post.get("embed_json")))
+        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
+        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
@@ -2301,29 +2339,8 @@ class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             return
         self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
 
-    def onCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
-
-        if keyCode == wx.WXK_F5 and evt.ControlDown():
-            evt.Skip()  # bubble up to MainWindow's checkAllOpenTabs
-            return
-        if keyCode == wx.WXK_F5 and evt.ShiftDown():
-            self.onFetchPreviousPosts(None)
-            return
-        if keyCode == wx.WXK_F5:
-            self.onCheckForUpdates(None)
-            return
-        if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
-            self._announceNthNewestPost(keyCode - ord("0"))
-            return
-        if evt.AltDown() and keyCode == ord("A"):
-            self.onPostAction()
-            return
-        if evt.AltDown() and keyCode == ord("U"):
-            self.onUserAction()
-            return
-
-        evt.Skip()
+    # onCharHook is inherited from FeedListMixin -- no SUPPORTS_* flags
+    # needed here, this class never had Space/Ctrl+A/Left-Right/Ctrl+N.
 
 class AddListDialog(wx.Dialog):
     def __init__(self, parent):
@@ -2805,6 +2822,14 @@ class ManageMembersDialog(wx.Dialog):
 
 class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     TAB_KEY = "lists"
+    # Same content shape as Home, so it gets the full shortcut set too
+    # (see plan-09.md) -- Alt+number/Alt+U still branch on list purpose
+    # via the _onAltNumber/_onAltU overrides below, independent of
+    # these flags.
+    SUPPORTS_NEW_POST = True
+    SUPPORTS_FOCUS_NEXT_UNREAD = True
+    SUPPORTS_SELECT_ALL = True
+    SUPPORTS_JUMP_TO_USER = True
 
     """
     "My lists" -- a flat tree of every list this account created or
@@ -2959,9 +2984,24 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
 
         self._updateListsStatusBar()
         self._updateToolbarVisibility()
-
-        if self._account is not None:
-            self._syncListsFromServer()
+        # Deliberately NOT auto-syncing from the server here anymore.
+        # This used to fire unconditionally on every __init__ (i.e.
+        # every MainWindow open), unlike the other 4 permanent tabs
+        # which only ever load from local cache at construction time
+        # -- this was Stage 2 of the original crash-hardening plan
+        # (plan-07.md), agreed on but never actually done; Stage 0's
+        # safe_ui_callback fix made the resulting race SAFE at the
+        # Python level (caught RuntimeError instead of a hard crash)
+        # but never removed the race itself. Confirmed by testing
+        # (see plan-09.md): every "quick close after opening
+        # MainWindow" crash report so far shows this exact background
+        # sync's completion handler as the immediately-preceding
+        # event, every time, regardless of which tab the user actually
+        # interacted with -- removing the automatic call here matches
+        # ListsWindow's behavior to the other 4 tabs (cache-only on
+        # open, sync only ever on explicit user action -- F5/Shift+F5/
+        # after add-list/remove-list/subscribe, which still call
+        # _syncListsFromServer() directly and are untouched by this).
 
     def _updateToolbarVisibility(self):
         # No-op now -- Remove/Show in new tab/Manage members live in
@@ -3096,10 +3136,10 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         return post
 
     def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 1, _message_text(post))
-        self.postList.SetItem(index, 2, _format_post_time(post.get("indexed_at")))
-        self.postList.SetItem(index, 3, _describe_embed(post.get("embed_json")))
+        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
+        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
@@ -3306,33 +3346,18 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
 
     # ---------------- keyboard ----------------
 
-    def onCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
+    # onCharHook is inherited from FeedListMixin -- Alt+number/Alt+U
+    # stay class-specific here since they branch on list purpose.
 
-        if keyCode == wx.WXK_F5 and evt.ControlDown():
-            evt.Skip()  # bubble up to MainWindow's checkAllOpenTabs
-            return
-        if keyCode == wx.WXK_F5 and evt.ShiftDown():
-            self.onFetchPreviousPosts(None)
-            return
-        if keyCode == wx.WXK_F5:
-            self.onCheckForUpdates(None)
-            return
-        if evt.AltDown() and keyCode == ord("A"):
-            self.onPostAction()
-            return
-        if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
-            if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
-                self._announceNthNewestPost(keyCode - ord("0"))
-            return
-        if evt.AltDown() and keyCode == ord("U"):
-            if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
-                self.onMemberAction()
-            else:
-                self.onUserAction()
-            return
+    def _onAltNumber(self, n):
+        if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
+            self._announceNthNewestPost(n)
 
-        evt.Skip()
+    def _onAltU(self):
+        if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
+            self.onMemberAction()
+        else:
+            self.onUserAction()
         
     def _syncForBulkCheck(self, atprotoClient):
         self._syncListsFromServer()
@@ -3422,10 +3447,10 @@ class ListTabWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMi
         return post
 
     def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 1, _message_text(post))
-        self.postList.SetItem(index, 2, _format_post_time(post.get("indexed_at")))
-        self.postList.SetItem(index, 3, _describe_embed(post.get("embed_json")))
+        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
+        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
@@ -3450,8 +3475,14 @@ class ListTabWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMi
         # MainWindow.removeCurrentTab() calls this (if present) right
         # before DeletePage() -- see the mainWindow.py edit -- so a
         # temp tab the user closes with Ctrl+W doesn't come back next
-        # time NVSky opens.
-        self._stopTimeRefreshTimer()
+        # time NVSky opens. Scans for every wx.Timer instance rather
+        # than calling _stopTimeRefreshTimer() by name (see plan-09.md
+        # -- MainWindow.onClose had the identical gap: only knew about
+        # _timeRefreshTimer and missed _loadingTimer, the F5-in-progress
+        # beep, which this tab can also start via onCheckForUpdates).
+        for value in vars(self).values():
+            if isinstance(value, wx.Timer):
+                value.Stop()
         if self._account is not None:
             db.remove_open_temp_tab(self._account["id"], "list", self._feedKey)
 
@@ -3463,30 +3494,9 @@ class ListTabWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMi
         if self._account is not None:
             db.set_temp_tab_custom_name(self._account["id"], "list", self._feedKey, newName)
     
-    def onCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
+    # onCharHook is inherited from FeedListMixin -- no SUPPORTS_* flags
+    # needed here, this class never had Space/Ctrl+A/Left-Right/Ctrl+N.
 
-        if keyCode == wx.WXK_F5 and evt.ControlDown():
-            evt.Skip()  # bubble up to MainWindow's checkAllOpenTabs
-            return
-        if keyCode == wx.WXK_F5 and evt.ShiftDown():
-            self.onFetchPreviousPosts(None)
-            return
-        if keyCode == wx.WXK_F5:
-            self.onCheckForUpdates(None)
-            return
-        if evt.AltDown() and keyCode == ord("A"):
-            self.onPostAction()
-            return
-        if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
-            self._announceNthNewestPost(keyCode - ord("0"))
-            return
-        if evt.AltDown() and keyCode == ord("U"):
-            self.onUserAction()
-            return
-
-        evt.Skip()
-        
 def _describe_notification(notif: dict) -> str:
     reason = notif.get("reason")
     subjectText = (notif.get("subject_text") or "").replace("\n", " ").strip()
@@ -3511,6 +3521,9 @@ def _describe_notification(notif: dict) -> str:
 
 class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     TAB_KEY = "notifications"
+    SUPPORTS_FOCUS_NEXT_UNREAD = True
+    SUPPORTS_SELECT_ALL = True
+    TIME_COLUMN_INDEX = 2  # Author(0)/Notification(1)/Received(2) -- only 3 columns, not the usual 4
 
     """
     Notifications list -- likes, reposts, follows, replies, mentions,
@@ -3655,34 +3668,9 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
         self._loadFromCache(reset=True)
         _announce_now("Marked as read." if read else "Marked as unread.")
 
-    def onCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
-
-        # Escape/Ctrl+W deliberately not handled here -- same reasoning
-        # as FeedWindow's onCharHook: this is a permanent tab now, both
-        # keys are handled at the MainWindow level instead (evt.Skip()
-        # below lets them bubble up).
-        if keyCode == wx.WXK_F5 and evt.ShiftDown():
-            self.onFetchPreviousPosts(None)
-            return
-        if keyCode == wx.WXK_F5:
-            self.onCheckForUpdates(None)
-            return
-        if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
-            self._announceNthNewestPost(keyCode - ord("0"))
-            return
-        if evt.AltDown() and keyCode == ord("A"):
-            self.onPostAction()
-            return
-        if evt.AltDown() and keyCode == ord("U"):
-            self.onUserAction()
-            return
-        if keyCode == wx.WXK_SPACE and self.FindFocus() is self.postList:
-            self._focusNextUnread()
-            return
-        if evt.ControlDown() and keyCode == ord("A") and self.FindFocus() is self.postList:
-            self._selectAllPosts()
-            return
-
-        evt.Skip()
+    # onCharHook is inherited from FeedListMixin (see SUPPORTS_* flags
+    # above). This also fixes a real bug: this class's old onCharHook
+    # never had the "Ctrl+F5 bubbles up to MainWindow" guard the other
+    # 4 tabs have, so Ctrl+F5 here was silently doing a single-tab F5
+    # sync instead of MainWindow.checkAllOpenTabs' full sweep.
 

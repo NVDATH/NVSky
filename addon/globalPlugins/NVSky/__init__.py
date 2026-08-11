@@ -31,7 +31,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
     __gestures = {
         "kb:NVDA+alt+b": "openFeed",
-        "kb:NVDA+alt+n": "openNotifications",
     }
 
     def __init__(self):
@@ -152,32 +151,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         evt.Skip()
 
     script_openFeed.__doc__ = _("Open the NVSky main window")
-
-    def script_openNotifications(self, gesture):
-        if self._mainWindow is None:
-            self.script_openFeed(gesture)
-        else:
-            self._mainWindow.Raise()
-        self._mainWindow.selectTab(NotificationsWindow)
-
-    script_openNotifications.__doc__ = _("Switch to the NVSky Notifications tab")
-
-    def script_openNotifications(self, gesture):
-        if self._notificationsWindow is not None:
-            self._notificationsWindow.Raise()
-            return
-
-        gui.mainFrame.prePopup()
-        self._notificationsWindow = NotificationsWindow(gui.mainFrame)
-        self._notificationsWindow.Bind(wx.EVT_CLOSE, self._onNotificationsWindowClosed)
-        self._notificationsWindow.Show()
-
-    def _onNotificationsWindowClosed(self, evt):
-        self._notificationsWindow = None
-        gui.mainFrame.postPopup()
-        evt.Skip()
-
-    script_openNotifications.__doc__ = _("Open the NVSky notifications window")
 
     def script_quickNewPost(self, gesture):
         # ComposeDialog is shown non-modally (Show(), never ShowModal()) --

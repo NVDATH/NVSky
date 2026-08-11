@@ -66,6 +66,11 @@ class MainWindow(wx.Frame):
         # in sync as the user switches tabs.
         super().__init__(parent, title="NVSky", size=(900, 550))
 
+        # Reset here (not just set True in onClose below) so a second
+        # NVSky open within the same NVDA session isn't permanently
+        # blocked by the previous session's shutdown flag.
+        uiutil.app_closing = False
+
         # True until activateInitialTab() flips it off once startup has
         # picked and focused the remembered tab -- while True, onPageChanged
         # below still updates the tab-strip/window title but skips calling
@@ -242,6 +247,7 @@ class MainWindow(wx.Frame):
             # initially-selected tab, once notebook layout has settled.
             wx.CallAfter(self._focusPanel, panel)
 
+    @uiutil.safe_ui_callback
     def _focusPanel(self, panel):
         restoreFocus = getattr(panel, "_restoreFocusPosition", None)
         if callable(restoreFocus) and getattr(panel, "_account", None) is not None:
@@ -518,4 +524,31 @@ class MainWindow(wx.Frame):
         evt.Skip()
 
     def onClose(self, evt):
+        # Set FIRST, before anything else -- any wx.CallAfter-queued
+        # background completion (safe_ui_callback-guarded) that lands
+        # from this point on will see this and skip touching wx
+        # entirely, rather than trying and hoping RuntimeError catches
+        # it cleanly. See uiutil.app_closing for the full reasoning.
+        uiutil.app_closing = True
+
+        # wx.Timer isn't part of the parent-child window destroy
+        # cascade -- Destroy() below tears down every child panel's
+        # C++ object, but any still-running timer keeps firing into
+        # those now-destroyed panels regardless. Confirmed by checking
+        # source (see plan-09.md): scanning for every wx.Timer INSTANCE
+        # stored on each panel (rather than checking specific known
+        # attribute names) on purpose -- an earlier version of this
+        # fix only checked for _timeRefreshTimer by name and missed
+        # _loadingTimer (the ~1s F5-in-progress beep, only ever
+        # stopped from inside _onCheckForUpdatesDone), which is a much
+        # more likely crash trigger than the 60s one since it fires so
+        # much more often during exactly the "refresh then immediately
+        # close" window. Scanning by type instead of by name means any
+        # future timer added anywhere doesn't need this method updated
+        # again to stay covered.
+        for i in range(self.notebook.GetPageCount()):
+            panel = self.notebook.GetPage(i)
+            for value in vars(panel).values():
+                if isinstance(value, wx.Timer):
+                    value.Stop()
         self.Destroy()

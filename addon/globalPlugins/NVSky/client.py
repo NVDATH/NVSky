@@ -1852,3 +1852,97 @@ def count_graphemes(text: str) -> int:
             continue
         count += 1
     return count
+
+
+def split_at_grapheme_boundary(text: str, max_chars: int):
+    """
+    Splits `text` into (first, rest), targeting the MIDPOINT of `text`
+    (capped at max_chars) rather than always maxing out the first
+    chunk -- for a message near the overall length cap, putting as
+    much as possible in the first chunk just pushes the overflow risk
+    onto the second chunk instead. Aiming for the midpoint keeps both
+    halves roughly balanced and safely under the per-cell limit for
+    any message up to roughly 2 * max_chars total.
+
+    The split never falls in the middle of a grapheme cluster -- a
+    naive index slice can sever a Thai combining tone/vowel mark from
+    its base consonant (or split a ZWJ emoji sequence), corrupting
+    both halves. Uses the same category-based boundary logic as
+    count_graphemes above, just recording each grapheme's start index
+    instead of counting them.
+
+    Within WHITESPACE_LOOKBACK chars of the target, prefers to land
+    right after whitespace OR a punctuation mark (Unicode general
+    category starting with "P" -- covers CJK full-width punctuation
+    like "。","、","！","？" and Western ".", ",", "!", "?" alike), so
+    the split lands on a natural phrase/sentence break instead of
+    mid-word wherever the text has ANY such break nearby. Thai commonly
+    has no punctuation or spaces at all within a short span, and CJK
+    scripts don't reliably mark every word boundary either -- for text
+    with no such landmark near the target, this still falls back to a
+    grapheme-safe hard cut, which can land mid-word. There is no
+    general-purpose dictionary-based word segmenter here (e.g.
+    PyThaiNLP), which would be needed to close that gap fully, and is
+    out of scope for this add-on.
+
+    NOTE: this optimizes the common arrow-key-navigation read; it does
+    NOT guarantee zero truncation in absolute worst case (e.g. a
+    message at Bluesky's stated max length -- itself LOW CONFIDENCE,
+    see plan-08.md -- combined with this app's own reply-preview
+    prefix could theoretically still slightly exceed a 2-column
+    budget). "Show message..." (chatWindow.py) is the dialog that
+    reads the full, unsplit text and is the actual guaranteed-complete
+    fallback for that edge case.
+
+    Used by chatWindow.py to spread a long message across two
+    ListCtrl columns (Message / Message (more)) to work around
+    Windows' native per-cell text limit (confirmed by testing to sit
+    around ~511 characters, cause not fully pinned down -- see
+    plan-09.md). Returns (text, "") unchanged if text already fits
+    within max_chars.
+    """
+    WHITESPACE_LOOKBACK = 100
+
+    if len(text) <= max_chars:
+        return text, ""
+
+    targetSplit = min(max_chars, (len(text) + 1) // 2)
+
+    boundaries = [0]
+    prevWasJoiner = False
+    for i, ch in enumerate(text):
+        if i == 0:
+            continue
+        category = unicodedata.category(ch)
+        if category in ("Mn", "Mc", "Me"):
+            prevWasJoiner = False
+            continue
+        if ch == "\u200d":
+            prevWasJoiner = True
+            continue
+        if prevWasJoiner:
+            prevWasJoiner = False
+            continue
+        boundaries.append(i)
+
+    validBoundaries = [b for b in boundaries if b <= targetSplit]
+    splitIndex = max(validBoundaries, default=0)
+
+    # Look for the whitespace/punctuation boundary closest to (but not
+    # past) the target -- validBoundaries is already in ascending
+    # order, so the last match found in the window is the closest one.
+    windowStart = max(0, splitIndex - WHITESPACE_LOOKBACK)
+    for b in validBoundaries:
+        if b < windowStart:
+            continue
+        prevChar = text[b - 1] if b > 0 else ""
+        if prevChar.isspace() or unicodedata.category(prevChar).startswith("P"):
+            splitIndex = b
+
+    if splitIndex == 0:
+        # First grapheme cluster is itself longer than targetSplit --
+        # extremely unlikely, but fall back to a hard cut rather than
+        # returning the whole string unsplit.
+        splitIndex = targetSplit or 1
+
+    return text[:splitIndex].rstrip(), text[splitIndex:].lstrip()

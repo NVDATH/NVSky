@@ -77,6 +77,20 @@ from . import uiutil
 # error back and this gets corrected.
 CHAT_MESSAGE_MAX_LENGTH = 1000
 
+# How many characters go in the "Message" column before the rest
+# spills into "Message (more)" -- kept well under the ~511-character
+# native ListCtrl cell limit confirmed by testing (see plan-09.md) to
+# leave a safety margin, since the exact cutoff may vary slightly with
+# content (e.g. astral-plane emoji use a UTF-16 surrogate pair on
+# Windows despite counting as one Python character). Doesn't need to
+# be exact -- NVDA reads both columns back to back automatically when
+# arrow-navigating a row, so the user never notices the split.
+MESSAGE_COLUMN_SPLIT_THRESHOLD = 450
+
+
+def _split_for_columns(text):
+    return client.split_at_grapheme_boundary(text, MESSAGE_COLUMN_SPLIT_THRESHOLD)
+
 
 def _format_time(value):
     mode, pattern = timeutils.current_mode_and_pattern(db)
@@ -152,6 +166,35 @@ def _pick_emoji(parent, title):
     return result
 
 
+def _show_message_dialog(parent, title, text):
+    # Read-only, freely-scrollable full text -- same idea as the
+    # Column Review add-on's cell-inspection dialog (which the user
+    # used to independently confirm the ~511-char cutoff is native to
+    # the ListCtrl itself, not specific to LC_VIRTUAL -- see
+    # plan-09.md). Exists specifically to bypass the ListCtrl's own
+    # text storage/retrieval entirely.
+    dlg = wx.Dialog(parent, title=title, size=(500, 350))
+    sizer = wx.BoxSizer(wx.VERTICAL)
+    textCtrl = wx.TextCtrl(dlg, value=text, style=wx.TE_MULTILINE | wx.TE_READONLY)
+    sizer.Add(textCtrl, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+    closeBtn = wx.Button(dlg, id=wx.ID_CLOSE, label="&Close")
+    sizer.Add(closeBtn, flag=wx.ALIGN_RIGHT | wx.RIGHT | wx.BOTTOM, border=10)
+    dlg.SetSizer(sizer)
+    dlg.CentreOnScreen()
+
+    def onCharHook(evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            dlg.EndModal(wx.ID_CLOSE)
+            return
+        evt.Skip()
+
+    closeBtn.Bind(wx.EVT_BUTTON, lambda e: dlg.EndModal(wx.ID_CLOSE))
+    dlg.Bind(wx.EVT_CHAR_HOOK, onCharHook)
+    textCtrl.SetFocus()
+    dlg.ShowModal()
+    dlg.Destroy()
+
+
 class _ChatMessagePanelMixin:
     """
     Shared behavior for anything that displays "the currently selected
@@ -180,7 +223,8 @@ class _ChatMessagePanelMixin:
         self.messageList.InsertColumn(0, "Reactions", width=100)
         self.messageList.InsertColumn(1, "From", width=140)
         self.messageList.InsertColumn(2, "Message", width=350)
-        self.messageList.InsertColumn(3, "Sent", width=140)
+        self.messageList.InsertColumn(3, "Message (more)", width=250)
+        self.messageList.InsertColumn(4, "Sent", width=140)
 
     # ---------------- read tracking ----------------
 
@@ -235,23 +279,29 @@ class _ChatMessagePanelMixin:
         # math flips depending on which end "newest" currently is.
         # Doesn't move focus, just speaks it, so the user can stay
         # wherever they were (e.g. typing in the compose box). Reads
-        # every column straight off the already-rendered row.
+        # every field straight from self._currentMessages instead of
+        # the ListCtrl's own GetItemText -- confirmed by testing (see
+        # plan-09.md) that GetItemText's returned text is itself capped
+        # at ~511 characters on Windows regardless of LC_VIRTUAL, so it
+        # can never be trusted to carry a full-length message.
         messages = getattr(self, "_currentMessages", [])
         newestFirst = getattr(self, "_messagesNewestFirst", False)
         index = (n - 1) if newestFirst else (len(messages) - n)
         if not (0 <= index < len(messages)):
             nvdaUi.message(f"No message {n}.")
             return
-        columnCount = self.messageList.GetColumnCount()
-        parts = [self.messageList.GetItemText(index, col) for col in range(columnCount)]
-        nvdaUi.message(", ".join(p for p in parts if p))
+        message = messages[index]
         # Alt+number doesn't move focus, so onMessageFocused never
         # fires for it -- without this, reading a message aloud this
         # way never marked it read.
-        self.messageList.Focus(index)
-        self.messageList.Select(index)
-        self.messageList.EnsureVisible(index)
-        message = messages[index]
+        if uiutil.move_focus_and_check_announce(self.messageList, index):
+            parts = [
+                _describe_reactions(message.get("reactions_json")),
+                self._messageFromLabel(message),
+                self._messageDisplayText(message),
+                _format_time(message["sent_at"]) if message.get("sent_at") else "Sending...",
+            ]
+            nvdaUi.message(", ".join(p for p in parts if p))
         messageId = message.get("message_id")
         convoId = self._currentConvoId
         if self._account and convoId and messageId and not message.get("is_read"):
@@ -335,6 +385,11 @@ class _ChatMessagePanelMixin:
             wx.TheClipboard.SetData(wx.TextDataObject(message.get("text", "")))
             wx.TheClipboard.Close()
         nvdaUi.message("Message text copied to clipboard.")
+
+    def _showFullMessage(self, message):
+        fromLabel = self._messageFromLabel(message)
+        text = self._messageDisplayText(message)
+        _show_message_dialog(self, f"Message from {fromLabel}", text)
 
     def _deleteMessageForSelf(self, message):
         convoId = self._currentConvoId
@@ -446,11 +501,13 @@ class _ChatMessagePanelMixin:
         replyItem = menu.Append(wx.ID_ANY, "Reply")
         reactItem = menu.Append(wx.ID_ANY, "React...")
         copyItem = menu.Append(wx.ID_ANY, "Copy text")
+        showItem = menu.Append(wx.ID_ANY, "Show message...")
         deleteItem = menu.Append(wx.ID_ANY, "Delete for me...")
 
         self.Bind(wx.EVT_MENU, lambda e: self._startReply(message), replyItem)
         self.Bind(wx.EVT_MENU, lambda e: self._reactToMessage(convoId, message), reactItem)
         self.Bind(wx.EVT_MENU, lambda e: self._copyMessageText(message), copyItem)
+        self.Bind(wx.EVT_MENU, lambda e: self._showFullMessage(message), showItem)
         self.Bind(wx.EVT_MENU, lambda e: self._deleteMessageForSelf(message), deleteItem)
 
         self.PopupMenu(menu)
@@ -493,10 +550,12 @@ class _ChatMessagePanelMixin:
         # silent resync below -- this temp row just holds the spot.
         newestFirst = getattr(self, "_messagesNewestFirst", False)
         tempIndex = 0 if newestFirst else self.messageList.GetItemCount()
+        mainText, moreText = _split_for_columns(text)
         self.messageList.InsertItem(tempIndex, "")
         self.messageList.SetItem(tempIndex, 1, "You")
-        self.messageList.SetItem(tempIndex, 2, text)
-        self.messageList.SetItem(tempIndex, 3, "Sending...")
+        self.messageList.SetItem(tempIndex, 2, mainText)
+        self.messageList.SetItem(tempIndex, 3, moreText)
+        self.messageList.SetItem(tempIndex, 4, "Sending...")
         self.messageList.Focus(tempIndex)
         self.messageList.Select(tempIndex)
         self.messageList.EnsureVisible(tempIndex)
@@ -538,6 +597,7 @@ class _ChatMessagePanelMixin:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    @uiutil.safe_ui_callback
     def _onSendComplete(self, convoId, error):
         if error:
             nvdaUi.message(f"Could not send message: {error}")
@@ -873,7 +933,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         for i, message in enumerate(getattr(self, "_currentMessages", [])):
             sentAt = message.get("sent_at")
             if sentAt:  # skip the still-"Sending..." optimistic row
-                self.messageList.SetItem(i, 3, _format_time(sentAt))
+                self.messageList.SetItem(i, 4, _format_time(sentAt))
 
     def _updateTitle(self):
         # Same pattern as FeedListMixin._updateTitle in feedWindow.py --
@@ -890,30 +950,49 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
     # ---------------- loading from local cache (instant, no network) ----------------
 
     def _loadFromCache(self):
-        self.convoTree.Freeze()
-        self.convoTree.DeleteAllItems()
-        self._convoRoot = self.convoTree.AddRoot("Conversations")
-        allConvos = db.get_convos(self._account["id"]) if self._account else []
-        # Requests always come first regardless of last-message time, so
-        # they're the priority thing the user sees and acts on.
-        requests = [c for c in allConvos if c.get("status") == "request"]
-        accepted = [c for c in allConvos if c.get("status") != "request"]
-        self._convos = requests + accepted
+        if getattr(self, "_reloadingConvos", False):
+            # Reentrancy guard -- see plan-09.md. SelectItem() below
+            # fires EVT_TREE_SEL_CHANGED synchronously (-> onConvoSelected
+            # -> _showMessages), all before this method itself returns.
+            # Several call sites reach _loadFromCache() via wx.CallAfter
+            # from a background thread (e.g. _onCheckForUpdatesDone from
+            # F5 sync) -- if one of those lands while an earlier call's
+            # SelectItem-triggered chain is still unwinding, its
+            # DeleteAllItems() would tear down convoTree out from under
+            # the still-running outer call. This is the leading
+            # hypothesis for the "wrapped C/C++ object of type TreeCtrl
+            # has been deleted" crash (not yet confirmed against a live
+            # repro) -- turning the reentrant call into a no-op removes
+            # that overlap regardless of the exact trigger.
+            return
+        self._reloadingConvos = True
+        try:
+            self.convoTree.Freeze()
+            self.convoTree.DeleteAllItems()
+            self._convoRoot = self.convoTree.AddRoot("Conversations")
+            allConvos = db.get_convos(self._account["id"]) if self._account else []
+            # Requests always come first regardless of last-message time, so
+            # they're the priority thing the user sees and acts on.
+            requests = [c for c in allConvos if c.get("status") == "request"]
+            accepted = [c for c in allConvos if c.get("status") != "request"]
+            self._convos = requests + accepted
 
-        for convo in self._convos:
-            item = self.convoTree.AppendItem(self._convoRoot, self._convoLabel(convo))
-            self.convoTree.SetItemData(item, convo["convo_id"])
+            for convo in self._convos:
+                item = self.convoTree.AppendItem(self._convoRoot, self._convoLabel(convo))
+                self.convoTree.SetItemData(item, convo["convo_id"])
 
-        self._updateStatusBar()
+            self._updateStatusBar()
 
-        firstItem, _cookie = self.convoTree.GetFirstChild(self._convoRoot)
-        if firstItem.IsOk():
-            self.convoTree.SelectItem(firstItem)
-        else:
-            self.messageList.DeleteAllItems()
-            self._currentConvoId = None
-            self._updateActionArea(None)
-        self.convoTree.Thaw()
+            firstItem, _cookie = self.convoTree.GetFirstChild(self._convoRoot)
+            if firstItem.IsOk():
+                self.convoTree.SelectItem(firstItem)
+            else:
+                self.messageList.DeleteAllItems()
+                self._currentConvoId = None
+                self._updateActionArea(None)
+            self.convoTree.Thaw()
+        finally:
+            self._reloadingConvos = False
 
     def _convoLabel(self, convo):
         name = convo.get("member_display_name") or convo.get("member_handle") or "Unknown"
@@ -956,6 +1035,19 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         convo = self._currentConvo()
         if convo and convo["convo_id"] == convoId:
             self._showMessages(convoId)
+
+    # ---------------- full-text hooks (Alt+number / Show message...) ----------------
+
+    def _messageFromLabel(self, message):
+        myDid = self._account["did"] if self._account else None
+        return "You" if message.get("sender_did") == myDid else self._senderLabel(self._currentConvoId)
+
+    def _messageDisplayText(self, message):
+        text = message.get("text", "")
+        replyPreview = message.get("reply_to_text")
+        if replyPreview:
+            text = f"(Reply to: {replyPreview[:30]}) {text}"
+        return text
 
     def onConvoSelected(self, evt):
         # Defensive guard added after the _openChatConvo suppression fix
@@ -1008,23 +1100,20 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
             self._currentMessages = messages
             self._messagesNewestFirst = newestFirst
-            myDid = self._account["did"]
-            senderLabel = self._senderLabel(convoId)
             # Suppressed so rendering the list and giving the newest
             # message initial focus doesn't itself mark it read -- only the
             # user actually moving focus onto it (or Alt+number) should.
             self._suppressFocusEvents = True
             try:
                 for i, message in enumerate(messages):
-                    fromLabel = "You" if message["sender_did"] == myDid else senderLabel
-                    text = message.get("text", "")
-                    replyPreview = message.get("reply_to_text")
-                    if replyPreview:
-                        text = f"(Reply to: {replyPreview[:30]}) {text}"
+                    fromLabel = self._messageFromLabel(message)
+                    text = uiutil.single_line(self._messageDisplayText(message))
+                    mainText, moreText = _split_for_columns(text)
                     self.messageList.InsertItem(i, _describe_reactions(message.get("reactions_json")))
                     self.messageList.SetItem(i, 1, fromLabel)
-                    self.messageList.SetItem(i, 2, text)
-                    self.messageList.SetItem(i, 3, _format_time(message.get("sent_at")))
+                    self.messageList.SetItem(i, 2, mainText)
+                    self.messageList.SetItem(i, 3, moreText)
+                    self.messageList.SetItem(i, 4, _format_time(message.get("sent_at")))
                 if messages:
                     newestIndex = 0 if newestFirst else len(messages) - 1
                     self.messageList.Focus(newestIndex)
@@ -1467,6 +1556,23 @@ class ConvoTabWindow(_ChatMessagePanelMixin, wx.Panel):
         # is unconditional.
         self._loadMessages()
 
+    # ---------------- full-text hooks (Alt+number / Show message...) ----------------
+
+    def _messageFromLabel(self, message):
+        myDid = self._account["did"] if self._account else None
+        return "You" if message.get("sender_did") == myDid else self.TAB_NAME
+
+    def _messageDisplayText(self, message):
+        text = message.get("text", "")
+        replyToId = message.get("reply_to_message_id")
+        if replyToId:
+            messageById = {m["message_id"]: m for m in getattr(self, "_currentMessages", [])}
+            replyMessage = messageById.get(replyToId)
+            if replyMessage is not None:
+                preview = (replyMessage.get("text") or "")[:30]
+                text = f"(Reply to: {preview}) {text}"
+        return text
+
     def _updateStatusBar(self):
         unread = db.get_unread_message_count(self._account["id"], self._convo["convo_id"]) if self._account else 0
         messages = getattr(self, "_currentMessages", [])
@@ -1477,25 +1583,21 @@ class ConvoTabWindow(_ChatMessagePanelMixin, wx.Panel):
         self.messageList.DeleteAllItems()
         messages = db.get_messages_for_convo(self._account["id"], self._convo["convo_id"])
         newestFirst = db.get_ui_state("sort_order") != "oldest_first"
-        messageById = {m["message_id"]: m for m in messages}  # built before reversal -- reply lookups need the real id map either way
         if newestFirst:
             messages = list(reversed(messages))
         self._currentMessages = messages
         self._messagesNewestFirst = newestFirst
-        myDid = self._account["did"]
         self._suppressFocusEvents = True
         try:
             for i, message in enumerate(messages):
-                fromLabel = "You" if message["sender_did"] == myDid else self.TAB_NAME
-                text = message.get("text", "")
-                replyToId = message.get("reply_to_message_id")
-                if replyToId and replyToId in messageById:
-                    preview = (messageById[replyToId].get("text") or "")[:30]
-                    text = f"(Reply to: {preview}) {text}"
+                fromLabel = self._messageFromLabel(message)
+                text = uiutil.single_line(self._messageDisplayText(message))
+                mainText, moreText = _split_for_columns(text)
                 self.messageList.InsertItem(i, _describe_reactions(message.get("reactions_json")))
                 self.messageList.SetItem(i, 1, fromLabel)
-                self.messageList.SetItem(i, 2, text)
-                self.messageList.SetItem(i, 3, _format_time(message.get("sent_at")))
+                self.messageList.SetItem(i, 2, mainText)
+                self.messageList.SetItem(i, 3, moreText)
+                self.messageList.SetItem(i, 4, _format_time(message.get("sent_at")))
             if messages:
                 newestIndex = 0 if newestFirst else len(messages) - 1
                 # SetFocus() BEFORE Focus()/Select() -- reversed from
