@@ -180,9 +180,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS convos (
                 account_id INTEGER NOT NULL,
                 convo_id TEXT NOT NULL,
-                member_did TEXT,
-                member_handle TEXT,
-                member_display_name TEXT,
+                is_group INTEGER DEFAULT 0,
+                group_name TEXT,
+                locked INTEGER DEFAULT 0,
                 last_message_text TEXT,
                 last_message_sent_at TEXT,
                 unread_count INTEGER DEFAULT 0,
@@ -191,6 +191,15 @@ def init_db():
                 PRIMARY KEY (account_id, convo_id)
             );
             CREATE INDEX IF NOT EXISTS idx_convos_last_message ON convos(account_id, last_message_sent_at);
+
+            CREATE TABLE IF NOT EXISTS convo_members (
+                account_id INTEGER NOT NULL,
+                convo_id TEXT NOT NULL,
+                did TEXT NOT NULL,
+                handle TEXT,
+                display_name TEXT,
+                PRIMARY KEY (account_id, convo_id, did)
+            );
 
             CREATE TABLE IF NOT EXISTS messages (
                 account_id INTEGER NOT NULL,
@@ -410,17 +419,22 @@ def get_post(uri: str):
 
 
 def upsert_convo(convo: dict):
+    # Plain overwrite on every field -- convo.kind (see
+    # client._store_convo) turned out to carry is_group/group_name/
+    # lock_status directly and reliably every sync, so there's no
+    # longer a need to protect any of these from being clobbered by a
+    # stale/missing value the way an earlier, wrong theory needed.
     with _connect() as conn:
         conn.execute(
             """INSERT INTO convos
-               (account_id, convo_id, member_did, member_handle, member_display_name,
+               (account_id, convo_id, is_group, group_name, locked,
                 last_message_text, last_message_sent_at, unread_count, muted, status)
-               VALUES (:account_id, :convo_id, :member_did, :member_handle, :member_display_name,
+               VALUES (:account_id, :convo_id, :is_group, :group_name, :locked,
                        :last_message_text, :last_message_sent_at, :unread_count, :muted, :status)
                ON CONFLICT(account_id, convo_id) DO UPDATE SET
-                   member_did=excluded.member_did,
-                   member_handle=excluded.member_handle,
-                   member_display_name=excluded.member_display_name,
+                   is_group=excluded.is_group,
+                   group_name=excluded.group_name,
+                   locked=excluded.locked,
                    last_message_text=excluded.last_message_text,
                    last_message_sent_at=excluded.last_message_sent_at,
                    unread_count=excluded.unread_count,
@@ -429,6 +443,56 @@ def upsert_convo(convo: dict):
             convo,
         )
         conn.commit()
+
+
+def replace_convo_members(account_id: int, convo_id: str, members: list):
+    """
+    Delete-then-insert sync of a convo's OTHER members (never includes
+    the active account itself) -- simpler than diffing since group
+    membership lists are small. Called every time a convo is stored
+    (client._store_convo, i.e. every sync_convos/sync_convo_messages).
+    """
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM convo_members WHERE account_id = ? AND convo_id = ?",
+            (account_id, convo_id),
+        )
+        for m in members:
+            conn.execute(
+                """INSERT INTO convo_members (account_id, convo_id, did, handle, display_name)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (account_id, convo_id, m["did"], m.get("handle"), m.get("display_name")),
+            )
+        conn.commit()
+
+
+def get_convo_members(account_id: int, convo_id: str):
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT did, handle, display_name FROM convo_members WHERE account_id = ? AND convo_id = ?",
+            (account_id, convo_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def describe_convo_from_members(convo: dict, members: list) -> str:
+    """
+    Pure display-name helper, no DB access -- deliberately takes an
+    already-fetched member list instead of querying itself, so callers
+    that already have (or are caching) the member list for a batch of
+    convos don't reintroduce the N+1 query pattern that caused the
+    MainWindow-open freeze fixed in plan-07.md. Shared by ChatWindow,
+    ConvoTabWindow, and __init__.py's temp-tab restore.
+    """
+    if convo.get("is_group"):
+        if convo.get("group_name"):
+            return convo["group_name"]
+        names = [m.get("display_name") or m.get("handle") or "?" for m in members]
+        return ", ".join(names) if names else "Group"
+    other = members[0] if members else None
+    if other is None:
+        return "Conversation"
+    return other.get("display_name") or other.get("handle") or "Conversation"
 
 
 def get_convos(account_id: int):
@@ -462,6 +526,7 @@ def delete_convo(account_id: int, convo_id: str):
     with _connect() as conn:
         conn.execute("DELETE FROM convos WHERE account_id = ? AND convo_id = ?", (account_id, convo_id))
         conn.execute("DELETE FROM messages WHERE account_id = ? AND convo_id = ?", (account_id, convo_id))
+        conn.execute("DELETE FROM convo_members WHERE account_id = ? AND convo_id = ?", (account_id, convo_id))
         conn.commit()
 
 

@@ -116,8 +116,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                         # every time.
                         db.remove_open_temp_tab(account["id"], "conversation", entry.get("key"))
                         continue
-                    label = entry.get("custom_name") or convo.get("member_display_name") or convo.get("member_handle") or "Conversation"
-                    convoTab = ConvoTabWindow(self._mainWindow.notebook, convo, account)
+                    convoMembers = db.get_convo_members(account["id"], convo["convo_id"])
+                    label = entry.get("custom_name") or db.describe_convo_from_members(convo, convoMembers)
+                    convoTab = ConvoTabWindow(self._mainWindow.notebook, convo, account, convoMembers)
                     # ConvoTabWindow's own __init__ always computes
                     # TAB_NAME from the convo record -- override it here
                     # so a persisted rename sticks. addTab() below is

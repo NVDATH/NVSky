@@ -438,11 +438,22 @@ class MainWindow(wx.Frame):
         # client.get_client_for_active_account()'s session/token
         # refresh and caused sporadic "re-login failed" errors), and
         # ONE spoken summary at the end (not N "no new X" announcements
-        # firing back to back). Only the currently VISIBLE tab actually
-        # re-renders here -- every other tab's local DB is now fresh,
-        # and already re-renders itself next time it's activated (see
-        # each panel's onTabActivated), so there's no need to touch
-        # their widgets from a background tab right now.
+        # firing back to back).
+        #
+        # NOTE: this used to only re-render whichever tab was currently
+        # visible, on the assumption every other tab would re-render
+        # itself next time it was activated (see each panel's
+        # onTabActivated). That assumption was wrong -- onTabActivated
+        # only calls _restoreFocusPosition(), which re-shows whatever
+        # was already rendered, it never re-reads the DB. Confirmed
+        # bug: after a fresh login, Home/Saved/etc all render once
+        # against an empty cache; running Ctrl+F5 from Chat correctly
+        # refreshed Chat (the active tab) but Home stayed empty even
+        # after switching to it, despite its own status bar (which
+        # queries the DB fresh) already showing the right unread count.
+        # Fixed below by reloading every tab that actually got new
+        # data, not just the active one -- moveFocus=False keeps a
+        # background reload from stealing real keyboard focus.
         panels = [p for p in self.getOpenTabs() if callable(getattr(p, "_syncForBulkCheck", None))]
         if not panels:
             return
@@ -454,31 +465,40 @@ class MainWindow(wx.Frame):
             except Exception as e:
                 wx.CallAfter(self._onCheckAllOpenTabsDone, [], str(e))
                 return
-            updatedNames = []
+            updatedPanels = []
             for panel in panels:
                 try:
                     if panel._syncForBulkCheck(atprotoClient):
-                        updatedNames.append(getattr(panel, "TAB_NAME", "a tab"))
+                        updatedPanels.append(panel)
                 except Exception as e:
                     log.error(f"NVSky: checkAllOpenTabs sync failed for a tab: {e}")
-            wx.CallAfter(self._onCheckAllOpenTabsDone, updatedNames, None)
+            wx.CallAfter(self._onCheckAllOpenTabsDone, updatedPanels, None)
 
         threading.Thread(target=worker, daemon=True).start()
 
     @uiutil.safe_ui_callback
-    def _onCheckAllOpenTabsDone(self, updatedNames, error):
+    def _onCheckAllOpenTabsDone(self, updatedPanels, error):
         if error:
             log.error(f"NVSky: checkAllOpenTabs failed: {error}")
             nvdaUi.message(f"Could not check for updates: {error}")
             return
         index = self.notebook.GetSelection()
-        if index != wx.NOT_FOUND:
-            panel = self.notebook.GetPage(index)
+        activePanel = self.notebook.GetPage(index) if index != wx.NOT_FOUND else None
+        for panel in updatedPanels:
             reload = getattr(panel, "_reloadAfterBulkCheck", None)
             if callable(reload):
-                reload()
-        if updatedNames:
-            nvdaUi.message(f"Updates in: {', '.join(updatedNames)}.")
+                reload(moveFocus=(panel is activePanel))
+        # The active tab reloads even if it personally had nothing new
+        # (e.g. right after a fresh login, its very first render
+        # happened against an empty local cache) -- matches the old
+        # always-reload-the-active-tab behavior.
+        if activePanel is not None and activePanel not in updatedPanels:
+            reload = getattr(activePanel, "_reloadAfterBulkCheck", None)
+            if callable(reload):
+                reload(moveFocus=True)
+        if updatedPanels:
+            names = [getattr(p, "TAB_NAME", "a tab") for p in updatedPanels]
+            nvdaUi.message(f"Updates in: {', '.join(names)}.")
         else:
             nvdaUi.message("No new updates in any open tab.")
 

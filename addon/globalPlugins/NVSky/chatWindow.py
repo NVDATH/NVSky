@@ -667,24 +667,33 @@ class _ChatMessagePanelMixin:
             return
         evt.Skip()
 
-
 class NewChatDialog(wx.Dialog):
     """
-    Start (or reopen) a 1:1 conversation with someone not already in
-    your conversation list -- same typeahead-search pattern as
-    feedWindow.py's SubscribeListDialog/ManageMembersDialog. Requires
-    an actual first message: chat.bsky.convo.getConvoForMembers only
-    resolves/creates a conversation record, it doesn't put anything in
-    it -- an empty conversation isn't listed anywhere (not even on
-    bsky.app) until a real message is sent to it.
+    Start a new 1:1 conversation, or -- if more than one recipient
+    ends up added -- a new GROUP chat, decided automatically from how
+    many recipients are queued when "Start chat" is pressed. Same
+    search+checklist pattern as ManageGroupMembersDialog (and
+    feedWindow.py's ManageMembersDialog for Lists) -- both search
+    results and the accumulated recipients list are check-list boxes,
+    so several people can be queued or removed in one action, kept
+    deliberately consistent with those dialogs' UX.
+
+    Requires an actual first message either way:
+    chat.bsky.convo.getConvoForMembers (1:1) and
+    chat.bsky.group.createGroup (group, EXPERIMENTAL -- see
+    client.create_group's docstring) both only resolve/create the
+    conversation record, neither puts anything in it -- an empty
+    conversation isn't listed anywhere (not even on bsky.app) until a
+    real message is sent to it.
     """
 
     def __init__(self, parent, account, on_started=None):
         self._account = account
         self._userSuggestions = []
+        self._recipients = []  # list of {"did", "handle", "display_name"}
         self._onStarted = on_started
 
-        super().__init__(parent, title="Start a new chat", size=(420, 260))
+        super().__init__(parent, title="Start a new chat", size=(440, 560))
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -693,8 +702,35 @@ class NewChatDialog(wx.Dialog):
         sizer.Add(userLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
         sizer.Add(self.userSearchText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
 
-        self.userChoice = wx.Choice(self, choices=[])
-        sizer.Add(self.userChoice, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
+        self.searchResultsLabel = wx.StaticText(self, label="Search results:")
+        self.searchResultsList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
+        sizer.Add(self.searchResultsLabel, flag=wx.LEFT | wx.TOP, border=10)
+        sizer.Add(self.searchResultsList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        self.addRecipientButton = wx.Button(self, label="Add checked")
+        sizer.Add(self.addRecipientButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        self.searchResultsLabel.Hide()
+        self.searchResultsList.Hide()
+        self.addRecipientButton.Hide()
+
+        self.recipientsLabel = wx.StaticText(self, label="Recipients:")
+        self.recipientsList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
+        sizer.Add(self.recipientsLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        sizer.Add(self.recipientsList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
+        self.removeRecipientButton = wx.Button(self, label="Remove checked")
+        sizer.Add(self.removeRecipientButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        # Nothing to show/remove until at least one recipient has been
+        # added -- an empty check-list box otherwise has odd, screen-
+        # reader-confusing focus/read behavior of its own.
+        self.recipientsLabel.Hide()
+        self.recipientsList.Hide()
+        self.removeRecipientButton.Hide()
+
+        groupNameLabel = wx.StaticText(
+            self, label="Group name (optional -- set this to force a group chat even with a single recipient):"
+        )
+        self.groupNameText = wx.TextCtrl(self)
+        sizer.Add(groupNameLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        sizer.Add(self.groupNameText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
 
         messageLabel = wx.StaticText(self, label="First message:")
         self.messageText = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(-1, 60))
@@ -712,6 +748,8 @@ class NewChatDialog(wx.Dialog):
         self.CentreOnScreen()
 
         self.userSearchText.Bind(wx.EVT_TEXT, self.onUserSearchChanged)
+        self.addRecipientButton.Bind(wx.EVT_BUTTON, self.onAddRecipient)
+        self.removeRecipientButton.Bind(wx.EVT_BUTTON, self.onRemoveRecipient)
         self.startButton.Bind(wx.EVT_BUTTON, self.onStartChat)
         closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
         self.Bind(wx.EVT_CLOSE, self.onClose)
@@ -736,8 +774,12 @@ class NewChatDialog(wx.Dialog):
         if query != self.userSearchText.GetValue():
             return
         if not query.strip():
-            self.userChoice.Set([])
+            self.searchResultsList.Set([])
             self._userSuggestions = []
+            self.searchResultsLabel.Hide()
+            self.searchResultsList.Hide()
+            self.addRecipientButton.Hide()
+            self.Layout()
             return
 
         def worker():
@@ -756,27 +798,98 @@ class NewChatDialog(wx.Dialog):
     def _onUserSearchDone(self, results, error):
         if error:
             return
-        self._userSuggestions = results
-        self.userChoice.Set([f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in results])
-        if results:
-            self.userChoice.SetSelection(0)
+        # Already-added recipients don't need to show up again.
+        addedDids = {r["did"] for r in self._recipients}
+        self._userSuggestions = [r for r in results if r["did"] not in addedDids]
+        hasResults = bool(self._userSuggestions)
+        self.searchResultsLabel.Show(hasResults)
+        self.searchResultsList.Show(hasResults)
+        self.addRecipientButton.Show(hasResults)
+        self.Layout()
+        self.searchResultsList.Set(
+            [f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in self._userSuggestions]
+        )
+        self.searchResultsList.CheckedItems = []
+
+    def onAddRecipient(self, evt):
+        indices = list(self.searchResultsList.CheckedItems)
+        if not indices:
+            nvdaUi.message("No search results checked.")
+            return
+        toAdd = [self._userSuggestions[i] for i in indices if 0 <= i < len(self._userSuggestions)]
+        if not toAdd:
+            return
+        wasEmpty = not self._recipients
+        self._recipients.extend(toAdd)
+        self.recipientsList.Set(
+            [f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in self._recipients]
+        )
+        self.recipientsList.CheckedItems = []
+        self.userSearchText.SetValue("")
+        self.searchResultsList.Set([])
+        self._userSuggestions = []
+        self.searchResultsLabel.Hide()
+        self.searchResultsList.Hide()
+        self.addRecipientButton.Hide()
+        if wasEmpty:
+            self.recipientsLabel.Show()
+            self.recipientsList.Show()
+            self.removeRecipientButton.Show()
+        self.Layout()
+        nvdaUi.message(f'Added {len(toAdd)}. {len(self._recipients)} recipient(s) total.')
+
+    def onRemoveRecipient(self, evt):
+        indices = list(self.recipientsList.CheckedItems)
+        if not indices:
+            nvdaUi.message("No recipients checked.")
+            return
+        toRemove = {self._recipients[i]["did"] for i in indices if 0 <= i < len(self._recipients)}
+        if not toRemove:
+            return
+        removedCount = len(toRemove)
+        self._recipients = [r for r in self._recipients if r["did"] not in toRemove]
+        self.recipientsList.Set(
+            [f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in self._recipients]
+        )
+        self.recipientsList.CheckedItems = []
+        if not self._recipients:
+            self.recipientsLabel.Hide()
+            self.recipientsList.Hide()
+            self.removeRecipientButton.Hide()
+            self.Layout()
+            self.userSearchText.SetFocus()
+        nvdaUi.message(f'Removed {removedCount}. {len(self._recipients)} recipient(s) left.')
 
     def onStartChat(self, evt):
-        index = self.userChoice.GetSelection()
-        if not (0 <= index < len(self._userSuggestions)):
-            nvdaUi.message("Search for a user and pick one from the list first.")
+        if not self._recipients:
+            nvdaUi.message("Add at least one recipient first.")
             return
         text = self.messageText.GetValue().strip()
         if not text:
             nvdaUi.message("Type a first message before starting the chat.")
             return
-        user = self._userSuggestions[index]
-        nvdaUi.message(f'Starting chat with @{user["handle"]}, please wait...')
+        groupName = self.groupNameText.GetValue().strip() or None
+        recipients = list(self._recipients)
+        # A group name typed in forces a group even with a single
+        # recipient (e.g. deliberately starting a 2-person group
+        # instead of a plain 1:1). LOW CONFIDENCE: whether
+        # chat.bsky.group.createGroup actually accepts just one
+        # initial member has never been tested -- if the server
+        # rejects it, paste back the error and this will need a
+        # minimum-2 guard added here instead.
+        isGroup = len(recipients) > 1 or bool(groupName)
+        nvdaUi.message(
+            "Starting group chat, please wait..." if isGroup
+            else f'Starting chat with @{recipients[0]["handle"]}, please wait...'
+        )
 
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
-                convo = client.get_or_create_convo_for_member(atprotoClient, user["did"])
+                if isGroup:
+                    convo = client.create_group(atprotoClient, [r["did"] for r in recipients], groupName)
+                else:
+                    convo = client.get_or_create_convo_for_member(atprotoClient, recipients[0]["did"])
                 convoId = convo.get("id") if convo else None
                 if not convoId:
                     wx.CallAfter(self._onStartChatDone, None, "no conversation was returned")
@@ -798,13 +911,227 @@ class NewChatDialog(wx.Dialog):
             nvdaUi.message(f"Could not start chat: {error}")
             return
         if not convo or not convo.get("id"):
-            log.error(f"NVSky: getConvoForMembers returned no usable convo: {convo!r}")
+            log.error(f"NVSky: start chat returned no usable convo: {convo!r}")
             nvdaUi.message("Could not start chat: no conversation was returned.")
             return
         gui.mainFrame.postPopup()
         self.Destroy()
         if self._onStarted:
             self._onStarted(convo.get("id"))
+            
+
+class ManageGroupMembersDialog(wx.Dialog):
+    """
+    Add/remove members for an existing group conversation. Both the
+    current-members list and the search-results list are check-list
+    boxes (gui.nvdaControls.CustomCheckListBox -- same control
+    feedWindow.py's ManageMembersDialog already uses for Lists), so
+    several members can be added or removed in one action instead of
+    one at a time -- matches that dialog's UX on purpose.
+
+    EXPERIMENTAL -- chat.bsky.group.* has never been exercised against
+    a real server in this project before now. Paste back a traceback
+    if either action fails.
+    """
+
+    def __init__(self, parent, account, convo, members):
+        self._account = account
+        self._convo = convo
+        self._members = list(members)
+        self._suggestions = []
+
+        title = convo.get("group_name") or "Group"
+        super().__init__(parent, title=f"Manage members - {title}", size=(460, 520))
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        memberLabel = wx.StaticText(self, label="Current members:")
+        sizer.Add(memberLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        self.memberList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
+        self._renderMembers()
+        sizer.Add(self.memberList, proportion=1, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+
+        self.removeButton = wx.Button(self, label="Remove checked")
+        sizer.Add(self.removeButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        self.removeButton.Show(bool(self._members))
+
+        addLabel = wx.StaticText(self, label="Add member (type a handle or name to search):")
+        sizer.Add(addLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        self.searchText = wx.TextCtrl(self)
+        sizer.Add(self.searchText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=10)
+
+        self.suggestLabel = wx.StaticText(self, label="Search results:")
+        self.suggestionList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
+        sizer.Add(self.suggestLabel, flag=wx.LEFT | wx.TOP, border=10)
+        sizer.Add(self.suggestionList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        self.addButton = wx.Button(self, label="Add checked")
+        sizer.Add(self.addButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        self.suggestLabel.Hide()
+        self.suggestionList.Hide()
+        self.addButton.Hide()
+
+        closeBtn = wx.Button(self, label="&Close")
+        sizer.Add(closeBtn, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
+
+        self.SetSizer(sizer)
+        self.CentreOnScreen()
+
+        self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
+        self.searchText.Bind(wx.EVT_TEXT, self.onSearchTextChanged)
+        self.addButton.Bind(wx.EVT_BUTTON, self.onAddSuggestion)
+        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        self.Bind(wx.EVT_CLOSE, self.onClose)
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+
+        self.memberList.SetFocus()
+
+    def onCharHook(self, evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        evt.Skip()
+
+    def onClose(self, evt):
+        gui.mainFrame.postPopup()
+        self.Destroy()
+
+    def _renderMembers(self):
+        self.memberList.Set([f'@{m["handle"]} ({m.get("display_name") or "no display name"})' for m in self._members])
+        self.memberList.CheckedItems = []
+
+    def onRemove(self, evt):
+        indices = list(self.memberList.CheckedItems)
+        if not indices:
+            nvdaUi.message("No members checked.")
+            return
+        toRemove = [self._members[i] for i in indices if 0 <= i < len(self._members)]
+        if not toRemove:
+            return
+
+        names = ", ".join(f'@{m["handle"]}' for m in toRemove)
+        confirm = wx.MessageDialog(
+            self, f"Remove {names} from this group?", "Confirm remove", wx.YES_NO | wx.NO_DEFAULT
+        )
+        confirmed = confirm.ShowModal() == wx.ID_YES
+        confirm.Destroy()
+        if not confirmed:
+            return
+
+        # Optimistic: update the UI immediately instead of waiting on
+        # the server round-trip, roll back if the actual request fails.
+        removedDids = {m["did"] for m in toRemove}
+        self._members = [m for m in self._members if m["did"] not in removedDids]
+        self._renderMembers()
+        self.removeButton.Show(bool(self._members))
+        self.Layout()
+        nvdaUi.message(f"Removing {len(toRemove)} member(s)...")
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                client.remove_group_members(atprotoClient, self._convo["convo_id"], list(removedDids))
+                client.sync_convos(atprotoClient, self._account["id"], self._account["did"])
+                error = None
+            except Exception as e:
+                error = str(e)
+            wx.CallAfter(self._onRemoveDone, toRemove, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onRemoveDone(self, removed, error):
+        if error:
+            # Roll back the optimistic removal.
+            self._members.extend(removed)
+            self._renderMembers()
+            self.removeButton.Show(bool(self._members))
+            self.Layout()
+            nvdaUi.message(f"Could not remove member(s): {error}")
+            return
+        nvdaUi.message(f"Removed {len(removed)} member(s).")
+
+    def onSearchTextChanged(self, evt):
+        wx.CallLater(400, self._runSearch, self.searchText.GetValue())
+
+    def _runSearch(self, query):
+        if query != self.searchText.GetValue():
+            return
+        if not query.strip():
+            self.suggestionList.Set([])
+            self._suggestions = []
+            return
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                results = client.search_actors_typeahead(atprotoClient, query)
+                error = None
+            except Exception as e:
+                results = []
+                error = str(e)
+            wx.CallAfter(self._onSearchDone, results, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onSearchDone(self, results, error):
+        if error:
+            return
+        existingDids = {m["did"] for m in self._members}
+        self._suggestions = [r for r in results if r["did"] not in existingDids]
+        hasResults = bool(self._suggestions)
+        self.suggestLabel.Show(hasResults)
+        self.suggestionList.Show(hasResults)
+        self.addButton.Show(hasResults)
+        self.Layout()
+        self.suggestionList.Set([f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in self._suggestions])
+        self.suggestionList.CheckedItems = []
+
+    def onAddSuggestion(self, evt):
+        indices = list(self.suggestionList.CheckedItems)
+        if not indices:
+            nvdaUi.message("No suggestions checked.")
+            return
+        toAdd = [self._suggestions[i] for i in indices if 0 <= i < len(self._suggestions)]
+        if not toAdd:
+            return
+
+        # Optimistic here too, for consistency with member removal.
+        self._members.extend(toAdd)
+        self._renderMembers()
+        self.removeButton.Show(bool(self._members))
+        self.searchText.SetValue("")
+        self.suggestionList.Set([])
+        self.suggestLabel.Hide()
+        self.suggestionList.Hide()
+        self.addButton.Hide()
+        self.Layout()
+        nvdaUi.message(f"Adding {len(toAdd)} member(s)...")
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                client.add_group_members(atprotoClient, self._convo["convo_id"], [u["did"] for u in toAdd])
+                client.sync_convos(atprotoClient, self._account["id"], self._account["did"])
+                error = None
+            except Exception as e:
+                error = str(e)
+            wx.CallAfter(self._onAddDone, toAdd, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onAddDone(self, added, error):
+        if error:
+            # Roll back.
+            addedDids = {u["did"] for u in added}
+            self._members = [m for m in self._members if m["did"] not in addedDids]
+            self._renderMembers()
+            self.removeButton.Show(bool(self._members))
+            self.Layout()
+            nvdaUi.message(f"Could not add member(s): {error}")
+            return
+        nvdaUi.message(f"Added {len(added)} member(s).")
 
 
 class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
@@ -976,6 +1303,14 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             requests = [c for c in allConvos if c.get("status") == "request"]
             accepted = [c for c in allConvos if c.get("status") != "request"]
             self._convos = requests + accepted
+            # Member lists for group naming/sender-lookup -- fetched once
+            # per load pass here (not per-row inside _convoLabel/_senderLabel)
+            # since this loop already touches every convo anyway. See
+            # db.describe_convo_from_members's docstring for why.
+            self._membersByConvo = {
+                c["convo_id"]: db.get_convo_members(self._account["id"], c["convo_id"])
+                for c in self._convos
+            } if self._account else {}
 
             for convo in self._convos:
                 item = self.convoTree.AppendItem(self._convoRoot, self._convoLabel(convo))
@@ -995,14 +1330,20 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             self._reloadingConvos = False
 
     def _convoLabel(self, convo):
-        name = convo.get("member_display_name") or convo.get("member_handle") or "Unknown"
+        members = self._membersByConvo.get(convo["convo_id"], [])
+        name = db.describe_convo_from_members(convo, members)
         # db.get_unread_message_count (kept in sync with the server via
         # reconcile_message_read_state + client.mark_message_read)
         # instead of convo["unread_count"] directly -- that field only
         # changes on a full resync or the explicit "Mark read" action.
         unread = db.get_unread_message_count(self._account["id"], convo["convo_id"]) if self._account else 0
         suffix = f", {unread} unread" if unread else ""
-        prefix = "(request) " if convo.get("status") == "request" else ""
+        if convo.get("status") == "request":
+            prefix = "(request) "
+        elif convo.get("is_group"):
+            prefix = "(group) "
+        else:
+            prefix = ""
         return f"{prefix}{name}{suffix}"
 
     def _updateStatusBar(self):
@@ -1040,7 +1381,10 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
     def _messageFromLabel(self, message):
         myDid = self._account["did"] if self._account else None
-        return "You" if message.get("sender_did") == myDid else self._senderLabel(self._currentConvoId)
+        senderDid = message.get("sender_did")
+        if senderDid == myDid:
+            return "You"
+        return self._memberLabel(self._currentConvoId, senderDid)
 
     def _messageDisplayText(self, message):
         text = message.get("text", "")
@@ -1128,13 +1472,26 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         # Exactly one of (compose+Send) / (Accept+Decline) is visible at
         # a time, based on the selected conversation's status -- never
         # both, never neither (unless nothing is selected at all).
+        # A locked group is a third state: compose is hidden (sending
+        # to a locked group errors on the server -- confirmed by
+        # testing), but it isn't a request either, so Accept/Decline
+        # stay hidden too. composeLabel is repurposed to explain why
+        # instead of adding a brand new widget just for this.
         isRequest = convo is not None and convo.get("status") == "request"
+        isLocked = convo is not None and bool(convo.get("locked")) and not isRequest
         hasConvo = convo is not None
+        canCompose = hasConvo and not isRequest and not isLocked
 
+        if not hasattr(self, "_composeLabelDefaultText"):
+            self._composeLabelDefaultText = self.composeLabel.GetLabel()
+        self.composeLabel.SetLabel(
+            "This group is locked -- no new messages can be sent."
+            if isLocked else self._composeLabelDefaultText
+        )
         self.composeLabel.Show(hasConvo and not isRequest)
-        self.composeText.Show(hasConvo and not isRequest)
-        self.emojiButton.Show(hasConvo and not isRequest)
-        self.sendButton.Show(hasConvo and not isRequest)
+        self.composeText.Show(canCompose)
+        self.emojiButton.Show(canCompose)
+        self.sendButton.Show(canCompose)
         self.acceptButton.Show(isRequest)
         self.declineButton.Show(isRequest)
         self.Layout()
@@ -1149,11 +1506,15 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         if convo is not None:
             self._declineConvo(convo)
 
-    def _senderLabel(self, convoId):
-        convo = next((c for c in self._convos if c["convo_id"] == convoId), None)
-        if convo is None:
+    def _memberLabel(self, convoId, did):
+        # Per-SENDER lookup, not per-convo -- a group has more than one
+        # possible "them", so this can't just describe the whole convo
+        # the way a 1:1's single member used to.
+        members = self._membersByConvo.get(convoId, [])
+        member = next((m for m in members if m["did"] == did), None)
+        if member is None:
             return "Them"
-        return convo.get("member_display_name") or convo.get("member_handle") or "Them"
+        return member.get("display_name") or member.get("handle") or "Them"
 
     def _currentConvo(self):
         item = self.convoTree.GetSelection()
@@ -1195,9 +1556,38 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.Bind(wx.EVT_MENU, lambda e: self._toggleMuteConvo(convo), muteItem)
         self.Bind(wx.EVT_MENU, lambda e: self._leaveConvo(convo), leaveItem)
         self.Bind(wx.EVT_MENU, lambda e: self._openInNewTab(convo), openTabItem)
+        if convo.get("is_group"):
+            manageMembersItem = menu.Append(wx.ID_ANY, "Manage members...")
+            self.Bind(wx.EVT_MENU, lambda e: self._manageGroupMembers(convo), manageMembersItem)
+            locked = bool(convo.get("locked"))
+            lockItem = menu.Append(wx.ID_ANY, "Unlock this group" if locked else "Lock this group")
+            self.Bind(wx.EVT_MENU, lambda e: self._setGroupLocked(convo, not locked), lockItem)
 
         self.PopupMenu(menu)
         menu.Destroy()
+
+    def _manageGroupMembers(self, convo):
+        members = self._membersByConvo.get(convo["convo_id"], [])
+        gui.mainFrame.prePopup()
+        dlg = ManageGroupMembersDialog(self, self._account, convo, members)
+        dlg.Show()
+
+    def _setGroupLocked(self, convo, locked):
+        convoId = convo["convo_id"]
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                if locked:
+                    client.lock_convo(atprotoClient, convoId)
+                else:
+                    client.unlock_convo(atprotoClient, convoId)
+                error = None
+            except Exception as e:
+                error = str(e)
+            wx.CallAfter(self._onConvoActionDone, "Group locked." if locked else "Group unlocked.", error)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _acceptConvo(self, convo):
         convoId = convo["convo_id"]
@@ -1214,8 +1604,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         threading.Thread(target=worker, daemon=True).start()
 
     def _declineConvo(self, convo):
+        name = db.describe_convo_from_members(convo, self._membersByConvo.get(convo["convo_id"], []))
         confirm = wx.MessageDialog(
-            self, f"Decline this message request from {convo.get('member_handle')}?",
+            self, f"Decline this message request from {name}?",
             "Decline request", wx.YES_NO | wx.NO_DEFAULT,
         )
         confirmed = confirm.ShowModal() == wx.ID_YES
@@ -1297,9 +1688,10 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         threading.Thread(target=worker, daemon=True).start()
 
     def _leaveConvo(self, convo):
+        name = db.describe_convo_from_members(convo, self._membersByConvo.get(convo["convo_id"], []))
         confirm = wx.MessageDialog(
             self,
-            f"Leave this conversation with {convo.get('member_handle')}? "
+            f"Leave this conversation with {name}? "
             "It will be removed from your list.",
             "Leave conversation", wx.YES_NO | wx.NO_DEFAULT,
         )
@@ -1326,7 +1718,14 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
     def _onLeaveConvoDone(self, error):
         if error:
             log.error(f"NVSky: leave conversation failed: {error}")
-            nvdaUi.message(f"Could not leave conversation: {error}")
+            if "OwnerCannotLeave" in error:
+                nvdaUi.message(
+                    "You're the owner of this group -- lock it first "
+                    "(right-click the conversation, Lock this group), "
+                    "then you'll be able to leave."
+                )
+            else:
+                nvdaUi.message(f"Could not leave conversation: {error}")
             return
         nvdaUi.message("Left conversation.")
         self._loadFromCache()
@@ -1342,8 +1741,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
     def _openInNewTab(self, convo):
         mainWindow = self.GetTopLevelParent()
-        panel = ConvoTabWindow(mainWindow.notebook, dict(convo), self._account)
-        label = convo.get("member_display_name") or convo.get("member_handle") or "Conversation"
+        members = self._membersByConvo.get(convo["convo_id"], [])
+        panel = ConvoTabWindow(mainWindow.notebook, dict(convo), self._account, members)
+        label = db.describe_convo_from_members(convo, members)
         mainWindow.addTab(panel, f"Chat: {label}", select=True, removable=True)
         db.add_open_temp_tab(self._account["id"], {
             "type": "conversation",
@@ -1382,7 +1782,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             nvdaUi.message(f"Could not check for updates: {error}")
             return
         self._reloadMessagesIfCurrent(convoId)
-        name = self._senderLabel(convoId)
+        convo = next((c for c in self._convos if c["convo_id"] == convoId), None)
+        members = self._membersByConvo.get(convoId, [])
+        name = db.describe_convo_from_members(convo, members) if convo else "this conversation"
         newCount = len(getattr(self, "_currentMessages", []))
         if newCount <= previousMessageCount:
             nvdaUi.message(f"No new chat for {name}.")
@@ -1396,7 +1798,12 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         afterUnread = sum(c.get("unread_count") or 0 for c in afterConvos)
         return afterUnread != beforeUnread
 
-    def _reloadAfterBulkCheck(self):
+    def _reloadAfterBulkCheck(self, moveFocus=True):
+        # moveFocus accepted for a uniform call signature with the
+        # other tabs (see mainWindow.checkAllOpenTabs) -- unused here
+        # since _selectConvoById uses wx.TreeCtrl.SelectItem, which
+        # (unlike ListCtrl's SetFocus()) doesn't grab real OS focus on
+        # its own.
         currentConvo = self._currentConvo()
         self._loadFromCache()
         if currentConvo:
@@ -1427,13 +1834,14 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             log.error(f"NVSky: Chat sync failed: {error}")
             nvdaUi.message(f"Could not check Chat for updates: {error}")
             return
-        currentConvo = self._currentConvo()
+        currentConvoBefore = self._currentConvo()
         self._loadFromCache()
-        if currentConvo:
-            self._selectConvoById(currentConvo["convo_id"])
+        if currentConvoBefore:
+            self._selectConvoById(currentConvoBefore["convo_id"])
         newMessageCount = len(getattr(self, "_currentMessages", []))
-        if currentConvo and newMessageCount <= previousMessageCount:
-            name = currentConvo.get("member_display_name") or currentConvo.get("member_handle") or "this conversation"
+        if currentConvoBefore and newMessageCount <= previousMessageCount:
+            members = self._membersByConvo.get(currentConvoBefore["convo_id"], [])
+            name = db.describe_convo_from_members(currentConvoBefore, members) if members or currentConvoBefore.get("is_group") else "this conversation"
             nvdaUi.message(f"No new chat for {name}.")
         else:
             nvdaUi.message("Chat updated.")
@@ -1447,7 +1855,7 @@ class ConvoTabWindow(_ChatMessagePanelMixin, wx.Panel):
     conversation. Removable (Ctrl+W) unlike the main Chat tab.
     """
 
-    def __init__(self, parent, convo, account):
+    def __init__(self, parent, convo, account, members=None):
         super().__init__(parent)
 
         self._convo = convo
@@ -1456,7 +1864,14 @@ class ConvoTabWindow(_ChatMessagePanelMixin, wx.Panel):
         self._jumpBackMessageId = None
         self._currentConvoId = convo["convo_id"]
         self._suppressFocusEvents = False
-        self.TAB_NAME = convo.get("member_display_name") or convo.get("member_handle") or "Conversation"
+        # members is passed directly when opened via ChatWindow's "Open
+        # in new tab..." (already has it cached); fetched fresh here
+        # when reconstructed at NVSky startup from a saved temp-tab
+        # entry (see __init__.py), where nothing else has loaded it yet.
+        if members is None:
+            members = db.get_convo_members(account["id"], convo["convo_id"]) if account else []
+        self._members = members
+        self.TAB_NAME = db.describe_convo_from_members(convo, self._members)
         # Generic identity MainWindow uses for its remember-last-tab
         # feature (see _getTabIdentity in mainWindow.py) -- matches the
         # "type"/"key" fields this tab is already stored under via
@@ -1560,7 +1975,13 @@ class ConvoTabWindow(_ChatMessagePanelMixin, wx.Panel):
 
     def _messageFromLabel(self, message):
         myDid = self._account["did"] if self._account else None
-        return "You" if message.get("sender_did") == myDid else self.TAB_NAME
+        senderDid = message.get("sender_did")
+        if senderDid == myDid:
+            return "You"
+        member = next((m for m in self._members if m["did"] == senderDid), None)
+        if member is None:
+            return self.TAB_NAME
+        return member.get("display_name") or member.get("handle") or self.TAB_NAME
 
     def _messageDisplayText(self, message):
         text = message.get("text", "")
@@ -1632,8 +2053,8 @@ class ConvoTabWindow(_ChatMessagePanelMixin, wx.Panel):
         after = len(db.get_messages_for_convo(self._account["id"], convoId))
         return after != before
 
-    def _reloadAfterBulkCheck(self):
-        self._loadMessages()
+    def _reloadAfterBulkCheck(self, moveFocus=True):
+        self._loadMessages(moveFocus=moveFocus)
 
     def onCheckForUpdates(self, evt=None):
         convoId = self._convo["convo_id"]

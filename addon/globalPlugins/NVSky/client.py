@@ -114,7 +114,51 @@ def get_client_for_active_account():
 # ---------------- timeline sync ----------------
 
 def _store_convo(convo, account_id: int, my_did: str, status: str):
-    other = next((m for m in convo.members if m.did != my_did), convo.members[0])
+    otherMembers = [
+        {"did": m.did, "handle": m.handle, "display_name": getattr(m, "display_name", None)}
+        for m in convo.members if m.did != my_did
+    ]
+    # LOW CONFIDENCE: no confirmed field on ConvoView that explicitly
+    # flags a group vs a 1:1 DM -- using "more than one other member"
+    # as a heuristic until a real listConvos/getConvo response for a
+    # group is seen (this project will generate one via the new
+    # create_group() below, so it'll get confirmed on first real test).
+    # Paste back the raw convo (repr) if a 1:1 ever misclassifies as a
+    # group or vice versa.
+    # CONFIRMED via testing: convo.kind is itself a nested
+    # discriminated-union object (chat.bsky.convo.defs#groupConvo or
+    # #directConvo), not a plain string -- a first attempt logging
+    # str(convo.kind) just dumped this whole nested object as text
+    # instead of the simple value expected. It carries is_group (via
+    # its own $type/py_type discriminator), the group's real name
+    # (kind.name), and lock state (kind.lock_status, 'locked' or
+    # 'unlocked') directly -- none of this was ever on the top-level
+    # convo object, which is why earlier attempts guessing convo.name
+    # and a plain convo.kind string both came back empty.
+    # kind.py_type/$type turned out to be a dead end -- getattr(kind,
+    # "py_type", ...) returns pydantic's FieldInfo schema metadata
+    # object, not the actual runtime discriminator string (confirmed:
+    # the logged value was literally "FieldInfo(annotation=NoneType,
+    # ..., default='chat.bsky.convo.defs#groupConvo', ...)", not a
+    # plain string), so comparing it with .endswith() never matched
+    # anything. Detecting by field presence instead: a real groupConvo
+    # instance carries name/lock_status/member_count/created_at (all
+    # confirmed present with real values in earlier testing); a real
+    # directConvo instance carries none of those extra fields at all.
+    kind = convo.kind
+    if kind is not None and hasattr(kind, "name") and hasattr(kind, "lock_status"):
+        isGroup = True
+        groupName = getattr(kind, "name", None)
+        locked = getattr(kind, "lock_status", None) == "locked"
+    elif kind is not None:
+        isGroup = False
+        groupName = None
+        locked = False
+    else:
+        log.info(f"NVSky: convo.kind was None for convo {getattr(convo, 'id', '?')}")
+        isGroup = len(otherMembers) > 1
+        groupName = None
+        locked = False
 
     lastMessage = convo.last_message
     lastText = getattr(lastMessage, "text", "") if lastMessage is not None else ""
@@ -123,15 +167,16 @@ def _store_convo(convo, account_id: int, my_did: str, status: str):
     db.upsert_convo({
         "account_id": account_id,
         "convo_id": convo.id,
-        "member_did": other.did,
-        "member_handle": other.handle,
-        "member_display_name": getattr(other, "display_name", None),
+        "is_group": int(isGroup),
+        "group_name": groupName,
+        "locked": int(locked),
         "last_message_text": lastText or "",
         "last_message_sent_at": lastSentAt,
         "unread_count": convo.unread_count or 0,
         "muted": bool(convo.muted),
         "status": status,
     })
+    db.replace_convo_members(account_id, convo.id, otherMembers)
 
 
 def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int = 0, limit: int = 100):
@@ -315,6 +360,65 @@ def get_or_create_convo_for_member(client, member_did: str):
     return response.content.get("convo") if isinstance(response.content, dict) else None
 
 
+def _group_ns(client):
+    return get_chat_client(client).chat.bsky.group
+
+
+def create_group(client, member_dids: list, name: str = None):
+    """
+    EXPERIMENTAL -- first use of chat.bsky.group.* in NVSky, never
+    exercised against a real server. Same raw-JSON-bypass approach as
+    get_or_create_convo_for_member/send_message (see their comments)
+    since every chat.bsky.convo.* endpoint touched so far has hit a
+    pydantic discriminated-union parsing bug on its typed response --
+    group responses are expected to hit the same issue. Body is built
+    as a DotDict (not a plain dict) for the same reason send_message
+    does -- invoke_procedure calls .model_dump_json() on whatever it's
+    given, which a plain dict doesn't have; confirmed by testing (a
+    first attempt using a plain dict here failed with exactly
+    "'dict' object has no attribute 'model_dump_json'").
+
+    LOW CONFIDENCE: request body field names ("members" for the
+    invitee DID list, "name" for the group name) are guessed from the
+    lexicon docs' prose description, not a confirmed real schema.
+    Also unconfirmed whether the server accepts a single-member group
+    (name set but only one recipient) -- paste back the raw traceback
+    if either errors.
+    """
+    from atproto_client.models.dot_dict import DotDict
+
+    body = {"members": member_dids}
+    if name:
+        body["name"] = name
+    response = _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.createGroup", data=DotDict(body),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    return response.content.get("convo") if isinstance(response.content, dict) else None
+
+
+def add_group_members(client, convo_id: str, member_dids: list):
+    """LOW CONFIDENCE -- see create_group's docstring."""
+    from atproto_client.models.dot_dict import DotDict
+
+    _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.addMembers",
+        data=DotDict({"convoId": convo_id, "members": member_dids}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+
+
+def remove_group_members(client, convo_id: str, member_dids: list):
+    """LOW CONFIDENCE -- see create_group's docstring."""
+    from atproto_client.models.dot_dict import DotDict
+
+    _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.removeMembers",
+        data=DotDict({"convoId": convo_id, "members": member_dids}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+
+
 def mark_message_read(client, convo_id: str, message_id: str):
     """
     LOW CONFIDENCE: chat.bsky.convo.updateRead's optional messageId
@@ -340,6 +444,22 @@ def unmute_convo(client, convo_id: str):
 
 def leave_convo(client, convo_id: str):
     get_chat_client(client).chat.bsky.convo.leave_convo(data={"convo_id": convo_id})
+
+
+def lock_convo(client, convo_id: str):
+    """
+    LOW CONFIDENCE -- chat.bsky.convo.lockConvo has never been
+    exercised against a real server in this project. Confirmed via a
+    real 400 error that locking is a real prerequisite for a group's
+    owner to leave it ('OwnerCannotLeave: Owner must lock the group
+    before leaving'). Paste back a traceback if this doesn't work.
+    """
+    get_chat_client(client).chat.bsky.convo.lock_convo(data={"convo_id": convo_id})
+
+
+def unlock_convo(client, convo_id: str):
+    """LOW CONFIDENCE -- see lock_convo's docstring."""
+    get_chat_client(client).chat.bsky.convo.unlock_convo(data={"convo_id": convo_id})
 
 
 def accept_convo(client, convo_id: str):
@@ -1874,7 +1994,7 @@ def split_at_grapheme_boundary(text: str, max_chars: int):
     Within WHITESPACE_LOOKBACK chars of the target, prefers to land
     right after whitespace OR a punctuation mark (Unicode general
     category starting with "P" -- covers CJK full-width punctuation
-    like "。","、","！","？" and Western ".", ",", "!", "?" alike), so
+    like "ใ€","ใ€","๏ผ","๏ผ" and Western ".", ",", "!", "?" alike), so
     the split lands on a natural phrase/sentence break instead of
     mid-word wherever the text has ANY such break nearby. Thai commonly
     has no punctuation or spaces at all within a short span, and CJK

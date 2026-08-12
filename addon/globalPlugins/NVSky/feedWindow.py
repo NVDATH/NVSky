@@ -948,11 +948,13 @@ class FeedListMixin:
         newTopUri = after[0]["uri"] if after else None
         return newTopUri != oldTopUri
 
-    def _reloadAfterBulkCheck(self):
-        # Main-thread only -- called back by checkAllOpenTabs, but only
-        # for whichever tab is currently the visible one.
+    def _reloadAfterBulkCheck(self, moveFocus=True):
+        # Main-thread only -- called back by checkAllOpenTabs for every
+        # tab that had new data, not just the visible one; moveFocus is
+        # False for any tab that isn't actually on screen right now, so
+        # a background refresh can't steal real keyboard focus.
         self._loadFromCache(reset=True)
-        self._restoreFocusPosition()
+        self._restoreFocusPosition(moveFocus=moveFocus)
 
     def onCheckForUpdates(self, evt):
         if self._account is None:
@@ -3365,9 +3367,9 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             return super()._syncForBulkCheck(atprotoClient)
         return False  # a moderation list's member roster isn't a "new post" concept
 
-    def _reloadAfterBulkCheck(self):
+    def _reloadAfterBulkCheck(self, moveFocus=True):
         if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
-            super()._reloadAfterBulkCheck()
+            super()._reloadAfterBulkCheck(moveFocus=moveFocus)
         elif self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
             self._loadMembersLive()
 
