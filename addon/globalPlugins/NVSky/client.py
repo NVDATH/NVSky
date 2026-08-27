@@ -13,8 +13,13 @@ one errors.
 """
 
 import json
+import os
+import random
 import re
+import string
+import tempfile
 import threading
+import time
 import unicodedata
 import types
 import urllib.parse
@@ -46,7 +51,7 @@ def _extract_error_message(e: Exception) -> str:
         response = getattr(e, "response", None)
         content = getattr(response, "content", None)
     message = getattr(content, "message", None)
-    return message or str(e)
+    return message or str(e) or type(e).__name__
 
 
 def _parse_at_uri(uri: str) -> dict:
@@ -87,8 +92,33 @@ def login(handle: str, app_password: str) -> dict:
     account_id = db.upsert_account(handle=profile.handle, did=profile.did, encrypted_password=encrypted)
     db.set_active_account(account_id)
 
-    log.info(f"NVSky: logged in as {profile.handle}")
-    return {"id": account_id, "handle": profile.handle, "did": profile.did}
+    chatSupported = check_chat_supported(client)
+    db.set_chat_supported(account_id, chatSupported)
+
+    log.info(f"NVSky: logged in as {profile.handle} (chat supported: {chatSupported})")
+    return {"id": account_id, "handle": profile.handle, "did": profile.did, "chat_supported": chatSupported}
+
+
+def check_chat_supported(client) -> bool:
+    """
+    LOW CONFIDENCE -- no dedicated "does this account/PDS support
+    chat" endpoint was found during the group-chat lexicon research
+    this session (chat.bsky.actor.getStatus checks OTHER accounts'
+    invite-ability, not the caller's own general chat access). Probes
+    the cheapest real chat call instead (listing convos, capped to 1)
+    and treats ANY failure as "not supported" -- almost certainly too
+    broad (a transient network error would also read as unsupported),
+    but safe in the sense that it only hides a tab rather than breaking
+    anything, and this runs again on every login so a wrong result
+    isn't permanent. Paste back the actual error if a real
+    chat-capable account ever gets flagged unsupported here.
+    """
+    try:
+        get_chat_client(client).chat.bsky.convo.list_convos(params={"limit": 1})
+        return True
+    except Exception as e:
+        log.info(f"NVSky: chat capability check failed (treating as unsupported): {e}")
+        return False
 
 
 def get_client_for_active_account():
@@ -100,18 +130,78 @@ def get_client_for_active_account():
 
     app_password = crypto.decrypt(account["encrypted_password"])
 
-    client = ATProtoClient()
-    try:
-        client.login(account["handle"], app_password)
-    except Exception as e:
-        message = _extract_error_message(e)
-        log.error(f"NVSky: re-login failed for {account['handle']}: {message}")
-        raise LoginError(message) from e
+    # LOW CONFIDENCE: reported WinError 10038 ("not a socket") here
+    # looked like a transient OS/network-layer glitch, not a real auth
+    # failure -- a fresh ATProtoClient() + one retry with a short pause
+    # resolved it in testing. Paste back the traceback if this keeps
+    # happening after the retry too; that would mean it's a real
+    # recurring problem, not a one-off blip.
+    lastError = None
+    for attempt in range(2):
+        client = ATProtoClient()
+        try:
+            client.login(account["handle"], app_password)
+            return client
+        except Exception as e:
+            lastError = e
+            if attempt == 0:
+                time.sleep(0.5)
 
-    return client
+    message = _extract_error_message(lastError)
+    log.error(f"NVSky: re-login failed for {account['handle']}: {message}")
+    raise LoginError(message) from lastError
 
 
 # ---------------- timeline sync ----------------
+
+def debug_dump(obj, label: str = "debug"):
+    """
+    Ad-hoc dev tool: writes whatever the SDK actually returned to a
+    JSON file instead of guessing field names one log.info at a time
+    (confirmed repeatedly this session to waste rounds -- kind's real
+    shape, the group-name field, the never-found admin/role field, all
+    took multiple back-and-forth rounds each). Handles pydantic models,
+    plain dicts/lists/lists-of-models, and falls back to repr() for
+    anything it can't otherwise serialize. Files land in
+    globalPlugins/NVSky/debug_dumps/ -- open one and paste back
+    whatever's relevant instead of another log.info round.
+    """
+    import json
+    import os
+    import datetime
+
+    folder = os.path.join(os.path.dirname(__file__), "debug_dumps")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{label}_{datetime.datetime.now():%Y%m%d_%H%M%S}.json")
+
+    def _serialize(o, depth=0):
+        if depth > 8:
+            return repr(o)
+        if o is None or isinstance(o, (str, int, float, bool)):
+            return o
+        if hasattr(o, "model_dump"):
+            try:
+                return o.model_dump(mode="json")
+            except Exception:
+                pass
+        if isinstance(o, dict):
+            return {str(k): _serialize(v, depth + 1) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [_serialize(i, depth + 1) for i in o]
+        if hasattr(o, "__dict__"):
+            try:
+                return {k: _serialize(v, depth + 1) for k, v in vars(o).items()}
+            except Exception:
+                pass
+        return repr(o)
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_serialize(obj), f, indent=2, ensure_ascii=False, default=repr)
+        log.info(f"NVSky: debug dump written to {path}")
+    except Exception as e:
+        log.error(f"NVSky: debug dump failed: {e}")
+
 
 def _store_convo(convo, account_id: int, my_did: str, status: str):
     otherMembers = [
@@ -160,6 +250,29 @@ def _store_convo(convo, account_id: int, my_did: str, status: str):
         groupName = None
         locked = False
 
+    # Gave up on GUESSING admin/owner via log.info -- see debug_dump()
+    # above. This dumps the full convo + kind + members ONE TIME (only
+    # when a group's own member list is still empty in the local DB,
+    # i.e. first time this exact convo is ever synced) so the real
+    # shape can be read directly out of the JSON file instead of
+    # another round of field-name guessing. Remove this call once
+    # admin/owner detection (if it turns out to exist at all) is
+    # confirmed and hardcoded.
+    # CONFIRMED via debug_dump: role lives on member.kind.role (kind
+    # here is chat.bsky.actor.defs#groupConvoMember, e.g.
+    # {"role": "owner", "added_by": null, ...}) -- a member-level
+    # nested object, distinct from the convo-level "kind" above
+    # (chat.bsky.convo.defs#groupConvo/#directConvo). Both direct
+    # member.role (first guess) and log.info-only field dumps (second
+    # attempt) missed this because it's one level deeper than either
+    # checked.
+    isAdmin = False
+    if isGroup:
+        myMember = next((m for m in convo.members if m.did == my_did), None)
+        memberKind = getattr(myMember, "kind", None) if myMember is not None else None
+        role = str(getattr(memberKind, "role", "") or "").lower()
+        isAdmin = role in ("owner", "admin")
+
     lastMessage = convo.last_message
     lastText = getattr(lastMessage, "text", "") if lastMessage is not None else ""
     lastSentAt = getattr(lastMessage, "sent_at", None) if lastMessage is not None else None
@@ -170,11 +283,13 @@ def _store_convo(convo, account_id: int, my_did: str, status: str):
         "is_group": int(isGroup),
         "group_name": groupName,
         "locked": int(locked),
+        "is_admin": int(isAdmin),
         "last_message_text": lastText or "",
         "last_message_sent_at": lastSentAt,
         "unread_count": convo.unread_count or 0,
         "muted": bool(convo.muted),
         "status": status,
+        "unread_join_request_count": getattr(kind, "unread_join_request_count", 0) or 0,
     })
     db.replace_convo_members(account_id, convo.id, otherMembers)
 
@@ -254,8 +369,15 @@ def sync_convos(client, account_id: int, my_did: str, limit: int = 50):
                 _store_convo(convo, account_id, my_did, status)
                 _sync_convo_messages(dm, convo.id, account_id, convo.unread_count or 0)
             except Exception as e:
+                # No raw object dump here anymore -- a transient server
+                # error (502 etc) doesn't need one, and dumping the full
+                # ConvoView repr (deeply nested, 30KB+) straight into
+                # log.info was blocking NVDA's shared log lock long
+                # enough to freeze speech/the whole session, confirmed
+                # via a real capture. This path fires far more often
+                # now that background sync calls sync_convos every
+                # couple of minutes instead of only on manual F5.
                 log.error(f"NVSky: failed to sync a conversation: {e}")
-                log.info(f"NVSky: raw convo that failed = {convo!r}")
 def sync_convo_messages(client, account_id: int, convo_id: str, limit: int = 100):
     """Refreshes just ONE conversation's messages -- used after sending
     a message, and by the pop-out per-conversation tab's own Check for
@@ -313,10 +435,13 @@ def send_message(client, convo_id: str, text: str, reply_to_message_id: str = No
     from atproto_client.models.dot_dict import DotDict
 
     dm = get_chat_client(client).chat.bsky.convo
+    facets = build_facets(client, text)
     messageBody = {
         "text": text,
         "$type": "chat.bsky.convo.defs#messageInput",
     }
+    if facets:
+        messageBody["facets"] = facets
     if reply_to_message_id:
         messageBody["replyTo"] = {"messageId": reply_to_message_id}
     body = DotDict({
@@ -338,6 +463,19 @@ def mark_all_convos_read(client):
     exercised against a real server in this project before now --
     paste back any traceback."""
     get_chat_client(client).chat.bsky.convo.update_all_read(data={})
+
+
+def get_convo_availability(client, member_dids: list):
+    """LOW CONFIDENCE -- chat.bsky.convo.getConvoAvailability never
+    exercised. Guessed input {members: [...]} matching
+    get_convo_for_members' own shape. Used defensively -- if this
+    fails or the shape is wrong, callers just skip the pre-check and
+    proceed to the normal send/create flow anyway."""
+    response = get_chat_client(client).chat.bsky.convo.get_convo_availability(
+        params={"members": member_dids}
+    )
+    debug_dump(response, "convo_availability")
+    return response
 
 
 def get_or_create_convo_for_member(client, member_did: str):
@@ -362,6 +500,72 @@ def get_or_create_convo_for_member(client, member_did: str):
 
 def _group_ns(client):
     return get_chat_client(client).chat.bsky.group
+
+
+def create_join_link(client, convo_id: str, join_rule: str, require_approval: bool):
+    """LOW CONFIDENCE -- field names/enum guessed (joinRule:
+    "anyone"/"followedByOwner", requireApproval: bool). Real UI wording
+    ("Create or modify an invite link") suggests this upserts rather
+    than erroring if a link already exists. Raw-JSON bypass."""
+    from atproto_client.models.dot_dict import DotDict
+
+    response = _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.createJoinLink",
+        data=DotDict({"convoId": convo_id, "joinRule": join_rule, "requireApproval": require_approval}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    debug_dump(response.content, "create_join_link_result")
+    return response.content.get("joinLink") if isinstance(response.content, dict) else None
+
+
+def edit_join_link(client, convo_id: str, join_rule: str, require_approval: bool):
+    """LOW CONFIDENCE -- see create_join_link's docstring."""
+    from atproto_client.models.dot_dict import DotDict
+
+    response = _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.editJoinLink",
+        data=DotDict({"convoId": convo_id, "joinRule": join_rule, "requireApproval": require_approval}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    debug_dump(response.content, "edit_join_link_result")
+    return response.content.get("joinLink") if isinstance(response.content, dict) else None
+
+
+def enable_join_link(client, convo_id: str):
+    """LOW CONFIDENCE -- guessed input {convoId} only."""
+    from atproto_client.models.dot_dict import DotDict
+
+    response = _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.enableJoinLink", data=DotDict({"convoId": convo_id}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    debug_dump(response.content, "enable_join_link_result")
+    return response.content.get("joinLink") if isinstance(response.content, dict) else None
+
+
+def disable_join_link(client, convo_id: str):
+    """LOW CONFIDENCE -- guessed input {convoId} only."""
+    from atproto_client.models.dot_dict import DotDict
+
+    _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.disableJoinLink", data=DotDict({"convoId": convo_id}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+
+
+def edit_group(client, convo_id: str, name: str):
+    """Confirmed endpoint exists (edit_group). Field names (convoId/name)
+    guessed by analogy with every other group action -- unconfirmed.
+    Raw-JSON bypass since this almost certainly returns an updated
+    convo (same union-parsing risk as create_group)."""
+    from atproto_client.models.dot_dict import DotDict
+
+    response = _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.editGroup", data=DotDict({"convoId": convo_id, "name": name}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    debug_dump(response.content, "edit_group_result")
+    return response.content.get("convo") if isinstance(response.content, dict) else None
 
 
 def create_group(client, member_dids: list, name: str = None):
@@ -417,6 +621,88 @@ def remove_group_members(client, convo_id: str, member_dids: list):
         data=DotDict({"convoId": convo_id, "members": member_dids}),
         input_encoding="application/json", output_encoding="application/json",
     )
+
+
+def get_join_link_previews(client, codes: list):
+    """
+    LOW CONFIDENCE -- output items are a union (joinLinkPreviewView /
+    disabledJoinLinkPreviewView / invalidJoinLinkPreviewView), same
+    parsing risk as create_group, so raw-JSON bypass. Full preview has
+    name/owner/memberCount etc; disabled/invalid only has "code".
+    """
+    from atproto_client.models.dot_dict import DotDict
+
+    response = _group_ns(client)._client.invoke_query(
+        "chat.bsky.group.getJoinLinkPreviews", params=DotDict({"codes": codes}),
+        output_encoding="application/json",
+    )
+    debug_dump(response.content, "join_link_previews_raw")
+    previews = response.content.get("joinLinkPreviews", []) if isinstance(response.content, dict) else []
+    return previews
+
+
+def request_join_group(client, code: str):
+    """LOW CONFIDENCE -- chat.bsky.group.requestJoin never exercised;
+    "code" field name guessed from every other join-link endpoint's
+    naming. Paste back traceback/debug_dump("request_join_result")."""
+    from atproto_client.models.dot_dict import DotDict
+
+    response = _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.requestJoin", data=DotDict({"code": code}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    debug_dump(response.content, "request_join_result")
+    return response.content if isinstance(response.content, dict) else {}
+
+
+def list_join_requests(client, convo_id: str):
+    """LOW CONFIDENCE -- chat.bsky.group.listJoinRequests never
+    exercised; "convoId" param and "requests" output key guessed.
+    Pagination not implemented. Paste back debug_dump("join_requests")."""
+    from atproto_client.models.dot_dict import DotDict
+
+    response = _group_ns(client)._client.invoke_query(
+        "chat.bsky.group.listJoinRequests", params=DotDict({"convoId": convo_id}),
+        output_encoding="application/json",
+    )
+    debug_dump(response.content, "join_requests_raw")
+    requests_ = response.content.get("requests", []) if isinstance(response.content, dict) else []
+    return requests_
+
+
+def approve_join_request(client, convo_id: str, member_did: str):
+    """Confirmed input schema (convoId, member). Output has "convo" --
+    raw-JSON bypass like create_group, same union-parsing risk."""
+    from atproto_client.models.dot_dict import DotDict
+
+    response = _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.approveJoinRequest",
+        data=DotDict({"convoId": convo_id, "member": member_did}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    return response.content.get("convo") if isinstance(response.content, dict) else None
+
+
+def reject_join_request(client, convo_id: str, member_did: str):
+    """LOW CONFIDENCE -- rejectJoinRequest itself unconfirmed, mirrors
+    approve_join_request's input shape. Paste back traceback."""
+    from atproto_client.models.dot_dict import DotDict
+
+    _group_ns(client)._client.invoke_procedure(
+        "chat.bsky.group.rejectJoinRequest",
+        data=DotDict({"convoId": convo_id, "member": member_did}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+
+
+def withdraw_join_request(client, convo_id: str):
+    """Confirmed schema (input: convoId only, empty output)."""
+    get_chat_client(client).chat.bsky.group.withdraw_join_request(data={"convo_id": convo_id})
+
+
+def mark_join_requests_read(client, convo_id: str):
+    """Confirmed schema (input: convoId only, empty output)."""
+    get_chat_client(client).chat.bsky.group.update_join_requests_read(data={"convo_id": convo_id})
 
 
 def mark_message_read(client, convo_id: str, message_id: str):
@@ -748,6 +1034,401 @@ def _store_resolved_post(post, account_id: int):
     })
 
 
+def search_posts_hydrated(
+    client, account_id: int, query: str, sort: str = "latest", cursor: str = None, limit: int = 25,
+    author: str = None, since: str = None, until: str = None, lang: str = None,
+):
+    """Search + hydrate into the local posts cache via
+    _store_resolved_post (same helper resolve_posts uses for
+    notifications) -- Post action (Alt+A)/React/etc. then work on
+    search results exactly like any other post, no separate converter
+    needed. Returns (uris, cursor) -- caller reads db.get_post(uri) per
+    result to build display dicts. LOW CONFIDENCE: author/since/until/
+    lang param names recalled from lexicon knowledge, never tested."""
+    params = {"q": query, "sort": sort, "cursor": cursor, "limit": limit}
+    if author:
+        params["author"] = author
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+    if lang:
+        params["lang"] = [lang]
+    response = client.app.bsky.feed.search_posts(params=params)
+    uris = []
+    for post in response.posts:
+        try:
+            _store_resolved_post(post, account_id)
+            uris.append(post.uri)
+        except Exception as e:
+            log.error(f"NVSky: failed to store a search result post: {e}")
+    return uris, response.cursor
+
+
+def follow_starter_pack_members(client, full) -> int:
+    """Follows every profile in list_items_sample. LOW CONFIDENCE on
+    field names (same as get_starter_pack_full). Returns count
+    actually followed; skips ones already followed (viewer.following set)."""
+    count = 0
+    for item in getattr(full, "list_items_sample", None) or []:
+        subject = item.subject
+        viewer = getattr(subject, "viewer", None)
+        if viewer and getattr(viewer, "following", None):
+            continue
+        client.app.bsky.graph.follow(data={"subject": subject.did})
+        count += 1
+    return count
+
+
+def sync_feed_generator_page(client, account_id: int, feed_uri: str, cursor: str = None, limit: int = 50) -> str:
+    """Same caching shape as sync_list_feed -- feed_key is the feed
+    generator's own at:// uri. Used by FeedPreviewTabWindow's real
+    "View feed" pagination (not a one-shot fetch anymore)."""
+    resp = client.app.bsky.feed.get_feed(params={"feed": feed_uri, "limit": limit, "cursor": cursor})
+    for item in resp.feed:
+        try:
+            _store_feed_item(item, account_id, feed_uri)
+        except Exception as e:
+            log.error(f"NVSky: failed to store a feed generator item: {e}")
+    return resp.cursor
+
+
+def sync_search_page(
+    client, account_id: int, feed_key: str, query: str, cursor: str = None, limit: int = 25,
+    author: str = None, since: str = None, until: str = None, lang: str = None,
+) -> str:
+    """Search results cached like any other feed under a synthetic
+    feed_key (see feedWindow._search_feed_key) -- gives real
+    "fetch older" pagination for a pinned search tab instead of a
+    one-shot 25 that got replaced on every refresh."""
+    params = {"q": query, "sort": "latest", "cursor": cursor, "limit": limit}
+    if author:
+        params["author"] = author
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+    if lang:
+        params["lang"] = [lang]
+    resp = client.app.bsky.feed.search_posts(params=params)
+    for post in resp.posts:
+        try:
+            _store_resolved_post(post, account_id)
+            db.upsert_feed_item(account_id, feed_key, post.uri, post.indexed_at)
+        except Exception as e:
+            log.error(f"NVSky: failed to store a search result item: {e}")
+    return resp.cursor
+
+
+def get_starter_pack_full(client, uri: str):
+    """LOW CONFIDENCE -- graph.get_starter_pack never exercised. Guessed
+    input {starterPack: uri} matching the usual single-record-by-uri
+    param shape elsewhere."""
+    response = client.app.bsky.graph.get_starter_pack(params={"starter_pack": uri})
+    return response.starter_pack
+
+
+def get_feed_preview(client, account_id: int, feed_uri: str, limit: int = 30) -> list:
+    """One-shot fetch (no cursor loop, no local feed-membership row --
+    see FeedPreviewTabWindow's docstring) via app.bsky.feed.getFeed,
+    hydrated through the same _store_resolved_post path search results use."""
+    response = client.app.bsky.feed.get_feed(params={"feed": feed_uri, "limit": limit})
+    uris = []
+    for item in response.feed:
+        try:
+            _store_resolved_post(item.post, account_id)
+            uris.append(item.post.uri)
+        except Exception as e:
+            log.error(f"NVSky: failed to store a feed preview post: {e}")
+    return uris
+
+
+def search_actors(client, query: str, cursor: str = None, limit: int = 25):
+    return client.app.bsky.actor.search_actors(params={"q": query, "cursor": cursor, "limit": limit})
+
+
+def search_starter_packs(client, query: str, cursor: str = None, limit: int = 25):
+    return client.app.bsky.graph.search_starter_packs(params={"q": query, "cursor": cursor, "limit": limit})
+
+
+def search_feeds(client, query: str, limit: int = 25):
+    """LOW CONFIDENCE -- no dedicated 'search feed generators' endpoint
+    in the SDK dump; get_popular_feed_generators is the closest match
+    and its "query" param is unconfirmed to actually filter by keyword
+    vs just being ignored (falling back to popular-only). Paste back
+    the result if search terms don't seem to affect what comes back."""
+    params = {"limit": limit}
+    if query:
+        params["query"] = query
+    return client.app.bsky.unspecced.get_popular_feed_generators(params=params)
+
+
+def _fix_field_info(obj):
+    """Shared by every savedFeedsPrefV2 read/write helper below --
+    atproto v0.0.69's ContentLabelPref.py_type holds a raw unresolved
+    pydantic FieldInfo instead of its string value, which breaks
+    model_dump() unless patched first."""
+    if obj is None:
+        return
+    try:
+        from pydantic.fields import FieldInfo
+        raw_type = getattr(obj, "py_type", None)
+        if isinstance(raw_type, FieldInfo):
+            default_type = raw_type.default
+            if default_type is not None:
+                object.__setattr__(obj, "py_type", default_type)
+    except Exception:
+        pass
+
+
+def _clean_dumped(value):
+    """Recursively fixes the pyType/py_type -> $type fallout left over
+    after model_dump() on a preferences object with the FieldInfo bug."""
+    if isinstance(value, dict):
+        pt1 = value.pop("pyType", None)
+        pt2 = value.pop("py_type", None)
+        real_type = value.get("$type") or pt1 or pt2
+        if real_type:
+            value["$type"] = real_type
+        for key in list(value.keys()):
+            value[key] = _clean_dumped(value[key])
+        return value
+    if isinstance(value, list):
+        for i in range(len(value)):
+            value[i] = _clean_dumped(value[i])
+        return value
+    return value
+
+
+class _RawJsonModel:
+    """Prevents atproto's put_preferences from rehydrating an
+    already-clean payload back into a Pydantic model (which re-triggers
+    the same FieldInfo bug a second time) by handing invoke_procedure()
+    something that already looks serialized."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def model_dump_json(self, exclude_none=True, by_alias=True, **kwargs):
+        return json.dumps(self._payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _get_cleaned_preferences(client) -> list:
+    """Fetches app.bsky.actor.getPreferences and returns it as a list
+    of plain, FieldInfo-safe dicts. Every savedFeedsPrefV2 read/write
+    helper starts from this."""
+    try:
+        prefs_response = client.app.bsky.actor.get_preferences()
+    except Exception as e:
+        log.error("NVSky: getPreferences failed: %s", e, exc_info=True)
+        raise
+
+    for pref in prefs_response.preferences:
+        _fix_field_info(pref)
+        try:
+            for attr_name in dir(pref):
+                if attr_name.startswith("_"):
+                    continue
+                try:
+                    attr_value = getattr(pref, attr_name, None)
+                except Exception:
+                    continue
+                if isinstance(attr_value, list):
+                    for item in attr_value:
+                        _fix_field_info(item)
+        except Exception:
+            pass
+
+    prefs = []
+    try:
+        for pref in prefs_response.preferences:
+            dumped = pref.model_dump(mode="json", by_alias=True, exclude_none=True)
+            prefs.append(_clean_dumped(dumped))
+    except Exception as e:
+        log.error("NVSky: failed to serialize preferences: %s", e, exc_info=True)
+        debug_dump({"type": type(pref).__name__, "repr": repr(pref)}, "get_preferences_dump_failure")
+        raise
+    return prefs
+
+
+def _put_preferences(client, prefs: list):
+    """Sends `prefs` (a list of plain dicts, as returned by
+    _get_cleaned_preferences) back via the low-level putPreferences
+    procedure -- NOT client.app.bsky.actor.put_preferences(), which
+    internally calls get_or_create() and rehydrates the payload into a
+    fresh Pydantic model before serializing, hitting the FieldInfo bug
+    again regardless of how clean the input dict was."""
+    payload = {"preferences": prefs}
+    try:
+        raw_json_model = _RawJsonModel(payload)
+        raw_client = client.app.bsky.actor._client
+        raw_client.invoke_procedure(
+            "app.bsky.actor.putPreferences",
+            data=raw_json_model,
+            input_encoding="application/json",
+            output_encoding="application/json",
+        )
+    except Exception as e:
+        log.error("NVSky: putPreferences failed: %s", e, exc_info=True)
+        debug_dump(payload, "put_preferences_failed")
+        raise
+
+
+def _find_saved_feeds_pref_v2(prefs: list, create_if_missing: bool = False) -> dict:
+    saved_feeds_pref = next(
+        (p for p in prefs if p.get("$type") == "app.bsky.actor.defs#savedFeedsPrefV2"),
+        None,
+    )
+    if saved_feeds_pref is None and create_if_missing:
+        saved_feeds_pref = {"$type": "app.bsky.actor.defs#savedFeedsPrefV2", "items": []}
+        prefs.append(saved_feeds_pref)
+    if saved_feeds_pref is not None and not isinstance(saved_feeds_pref.get("items"), list):
+        saved_feeds_pref["items"] = []
+    return saved_feeds_pref
+
+
+def add_feed_to_saved(client, feed_uri: str) -> bool:
+    if not feed_uri:
+        return False
+
+    prefs = _get_cleaned_preferences(client)
+    saved_feeds_pref = _find_saved_feeds_pref_v2(prefs, create_if_missing=True)
+    items = saved_feeds_pref["items"]
+
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "feed" and item.get("value") == feed_uri:
+            return False
+
+    fake_tid = "".join(random.choices(string.ascii_lowercase + "234567", k=13))
+    items.append({
+        "$type": "app.bsky.actor.defs#savedFeed",
+        "id": fake_tid,
+        "type": "feed",
+        "value": feed_uri,
+        "pinned": False,
+    })
+
+    # Keep the legacy V1 pref in sync too, same as before.
+    saved_feeds_pref_v1 = next(
+        (p for p in prefs if p.get("$type") == "app.bsky.actor.defs#savedFeedsPref"), None,
+    )
+    if saved_feeds_pref_v1 is not None:
+        saved_list = saved_feeds_pref_v1.setdefault("saved", [])
+        if feed_uri not in saved_list:
+            saved_list.append(feed_uri)
+
+    _put_preferences(client, prefs)
+    return True
+
+
+def get_saved_feeds_pref(client) -> list:
+    """Returns the raw savedFeedsPrefV2 `items` list (each a dict with
+    id/type/value/pinned) -- empty list if the pref doesn't exist yet.
+    `type` is "feed" for a custom feed generator, "timeline" for the
+    default Following feed, or "list" for a list-as-feed; the Feed
+    manager settings panel only lets the user manage "feed" entries."""
+    prefs = _get_cleaned_preferences(client)
+    saved_feeds_pref = _find_saved_feeds_pref_v2(prefs, create_if_missing=False)
+    if saved_feeds_pref is None:
+        return []
+    return list(saved_feeds_pref["items"])
+
+
+def remove_feed_from_saved(client, feed_uri: str) -> bool:
+    prefs = _get_cleaned_preferences(client)
+    saved_feeds_pref = _find_saved_feeds_pref_v2(prefs, create_if_missing=False)
+    if saved_feeds_pref is None:
+        return False
+    items = saved_feeds_pref["items"]
+    newItems = [i for i in items if not (isinstance(i, dict) and i.get("type") == "feed" and i.get("value") == feed_uri)]
+    if len(newItems) == len(items):
+        return False
+    saved_feeds_pref["items"] = newItems
+
+    saved_feeds_pref_v1 = next(
+        (p for p in prefs if p.get("$type") == "app.bsky.actor.defs#savedFeedsPref"), None,
+    )
+    if saved_feeds_pref_v1 is not None:
+        saved_list = saved_feeds_pref_v1.get("saved")
+        if isinstance(saved_list, list) and feed_uri in saved_list:
+            saved_list.remove(feed_uri)
+
+    _put_preferences(client, prefs)
+    return True
+
+
+def set_feed_pinned(client, feed_uri: str, pinned: bool) -> bool:
+    prefs = _get_cleaned_preferences(client)
+    saved_feeds_pref = _find_saved_feeds_pref_v2(prefs, create_if_missing=False)
+    if saved_feeds_pref is None:
+        return False
+    found = False
+    for item in saved_feeds_pref["items"]:
+        if isinstance(item, dict) and item.get("type") == "feed" and item.get("value") == feed_uri:
+            item["pinned"] = pinned
+            found = True
+    if not found:
+        return False
+    _put_preferences(client, prefs)
+    return True
+
+
+def reorder_saved_feeds(client, ordered_feed_uris: list) -> bool:
+    """`ordered_feed_uris` is the desired new relative order for the
+    "feed"-type items only -- "timeline"/"list" items keep their
+    existing absolute slot in the items array, only the feed-type
+    slots get refilled in the new order, so the overall list length
+    and non-feed positions never change."""
+    prefs = _get_cleaned_preferences(client)
+    saved_feeds_pref = _find_saved_feeds_pref_v2(prefs, create_if_missing=False)
+    if saved_feeds_pref is None:
+        return False
+    items = saved_feeds_pref["items"]
+
+    byUri = {}
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "feed":
+            byUri[item.get("value")] = item
+
+    newOrderedFeeds = [byUri[u] for u in ordered_feed_uris if u in byUri]
+    if len(newOrderedFeeds) != len(byUri):
+        log.error("NVSky: reorder_saved_feeds -- uri list didn't match existing feed items, aborting")
+        return False
+
+    it = iter(newOrderedFeeds)
+    newItems = [next(it) if isinstance(item, dict) and item.get("type") == "feed" else item for item in items]
+    saved_feeds_pref["items"] = newItems
+
+    _put_preferences(client, prefs)
+    return True
+
+
+def get_feed_generators_info(client, uris: list) -> dict:
+    """Batch-resolves feed generator URIs to display info (display_name/
+    creator_handle/description) for the Feed manager settings panel.
+    LOW CONFIDENCE -- first use of app.bsky.feed.getFeedGenerators in
+    NVSky, paste back the traceback if this errors. Chunks into
+    batches of 25 (getPosts' documented max, assumed to apply here too
+    since no separate limit is documented for this endpoint)."""
+    info = {}
+    uris = [u for u in uris if u]
+    for i in range(0, len(uris), 25):
+        chunk = uris[i:i + 25]
+        try:
+            resp = client.app.bsky.feed.get_feed_generators(params={"feeds": chunk})
+        except Exception as e:
+            log.error("NVSky: getFeedGenerators failed: %s", e, exc_info=True)
+            continue
+        for feedGen in resp.feeds:
+            creator = getattr(feedGen, "creator", None)
+            info[feedGen.uri] = {
+                "display_name": feedGen.display_name or "Feed",
+                "creator_handle": creator.handle if creator else "",
+                "description": feedGen.description or "",
+            }
+    return info
+
+    
 def resolve_posts(client, account_id: int, uris: list) -> dict:
     """Batch-resolves post URIs (a notification's actionable post) to
     their text + author handle for display, AND fully hydrates each
@@ -879,7 +1560,63 @@ def _store_notification(notif, account_id: int, resolvedSubjects: dict):
     })
 
 
+MAX_BLOB_BYTES = 1_000_000  # Bluesky's hard limit on any single blob
+
+
+def _compress_image_for_blob(image_path: str, max_bytes: int = MAX_BLOB_BYTES) -> str:
+    """Bluesky rejects any blob over max_bytes -- hit this for an
+    auto-fetched link-preview thumbnail (1024x576 PNG, 1,032,450 bytes,
+    just over the 1,000,000 limit) but the same cap applies to avatar/
+    banner/attached images too, so this is called from the one shared
+    upload path (_upload_blob_dict) rather than patched per call site.
+    Returns image_path unchanged if it's already small enough or if
+    Pillow/compression isn't available; otherwise re-encodes as JPEG,
+    lowering quality and then dimensions until it fits, and returns a
+    NEW temp file path (the original at image_path is left untouched)."""
+    try:
+        if os.path.getsize(image_path) <= max_bytes:
+            return image_path
+    except OSError:
+        return image_path
+
+    try:
+        from PIL import Image
+    except ImportError:
+        log.error("NVSky: Pillow unavailable, cannot shrink oversized image for upload")
+        return image_path
+
+    try:
+        img = Image.open(image_path)
+        img.load()
+    except Exception as e:
+        log.error(f"NVSky: could not open oversized image to shrink it: {e}")
+        return image_path
+
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+
+    fd, out_path = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+
+    quality = 85
+    scale = 1.0
+    while True:
+        working = img if scale >= 1.0 else img.resize(
+            (max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS,
+        )
+        working.save(out_path, "JPEG", quality=quality, optimize=True)
+        if os.path.getsize(out_path) <= max_bytes or scale < 0.1:
+            break
+        if quality > 40:
+            quality -= 15
+        else:
+            scale *= 0.8
+
+    return out_path
+
+
 def _upload_blob_dict(client, image_path: str) -> dict:
+    image_path = _compress_image_for_blob(image_path)
     with open(image_path, "rb") as f:
         image_bytes = f.read()
     upload = client.com.atproto.repo.upload_blob(image_bytes)
@@ -1114,9 +1851,10 @@ def create_post(client, text: str, attachments: list = None, reply_ref: dict = N
     if embed:
         record["embed"] = embed
 
-    client.com.atproto.repo.create_record(
+    resp = client.com.atproto.repo.create_record(
         data={"repo": client.me.did, "collection": "app.bsky.feed.post", "record": record}
     )
+    return {"uri": resp.uri, "cid": resp.cid, "created_at": record["createdAt"], "text": text}
 
 
 
@@ -1247,7 +1985,10 @@ def get_followers(client, did: str, page_limit: int = 100, max_pages: int = 100)
     for _ in range(max_pages):
         resp = client.get_followers(did, limit=page_limit, cursor=cursor)
         results.extend(
-            {"did": f.did, "handle": f.handle, "display_name": getattr(f, "display_name", None)}
+            {
+                "did": f.did, "handle": f.handle, "display_name": getattr(f, "display_name", None),
+                "description": getattr(f, "description", None),
+            }
             for f in resp.followers
         )
         cursor = resp.cursor
@@ -1263,7 +2004,10 @@ def get_follows(client, did: str, page_limit: int = 100, max_pages: int = 100) -
     for _ in range(max_pages):
         resp = client.get_follows(did, limit=page_limit, cursor=cursor)
         results.extend(
-            {"did": f.did, "handle": f.handle, "display_name": getattr(f, "display_name", None)}
+            {
+                "did": f.did, "handle": f.handle, "display_name": getattr(f, "display_name", None),
+                "description": getattr(f, "description", None),
+            }
             for f in resp.follows
         )
         cursor = resp.cursor
@@ -1333,9 +2077,9 @@ def _post_view_to_dict(post) -> dict:
 def get_author_feed(client, did: str, page_limit: int = 50, max_pages: int = 2) -> list:
     """
     A user's own recent posts (most recent first). NOT persisted to the
-    cache DB, and NOT lazy-loaded yet (fetches up to page_limit *
-    max_pages posts and stops) -- a fuller version with lazy-load
-    belongs to the later Multi-tab work.
+    cache DB -- kept only for callers that just want a quick read-only
+    snapshot. For a real cached/lazy-loadable view, use
+    sync_author_feed_page below instead (UserTimelineTabWindow).
     """
     results = []
     cursor = None
@@ -1346,6 +2090,25 @@ def get_author_feed(client, did: str, page_limit: int = 50, max_pages: int = 2) 
         if not cursor:
             break
     return results
+
+
+def sync_author_feed_page(client, account_id: int, did: str, cursor: str = None, limit: int = 50) -> str:
+    """
+    Syncs one page of a user's own post timeline into the feed_items/
+    posts cache under feed_key f"user_timeline:{did}" -- same shape as
+    sync_timeline/sync_list_feed, lets UserTimelineTabWindow reuse
+    FeedListMixin's cache-first/lazy-load machinery unchanged. Unlike
+    get_author_feed above, resp.feed items here are the same
+    FeedViewPost shape _store_feed_item already expects (reason/reply/
+    post), so no separate conversion is needed.
+    """
+    resp = client.get_author_feed(actor=did, limit=limit, cursor=cursor)
+    for item in resp.feed:
+        try:
+            _store_feed_item(item, account_id, f"user_timeline:{did}")
+        except Exception as e:
+            log.error(f"NVSky: failed to store a user timeline item: {e}")
+    return resp.cursor
 
 
 def _fetch_thread_json(post_uri: str, depth: int = 25, parent_height: int = 100) -> dict:
@@ -1658,50 +2421,44 @@ def unblock_actor(client, block_uri: str):
 MUTED_WORDS_PREF_TYPE = "app.bsky.actor.defs#mutedWordsPref"
 
 def get_muted_words(client) -> list:
-    """Returns the account's muted words/tags as plain dicts:
-    {"id", "value", "targets": ["content", "tag"]}."""
-    resp = client.app.bsky.actor.get_preferences()
-    for pref in resp.preferences:
-        if getattr(pref, "$type", "") == MUTED_WORDS_PREF_TYPE:
-            items = getattr(pref, "items", []) or []
-            return [
-                {
-                    "id": getattr(item, "id", None),
-                    "value": getattr(item, "value", ""),
-                    "targets": list(getattr(item, "targets", []) or []),
-                }
-                for item in items
-            ]
-    return []
-
+    """
+    Returns the account's muted words/tags as plain dicts:
+    {"id", "value", "targets": ["content", "tag"]}. Uses the same
+    raw-JSON-bypass helper as the saved-feeds prefs
+    (_get_cleaned_preferences) instead of the typed
+    client.app.bsky.actor.get_preferences() call this used to make --
+    confirmed via a real 168-error pydantic validation traceback that
+    the typed call chokes on the SAME FieldInfo/pyType bug across
+    EVERY preference type on the account, not just muted words.
+    """
+    prefs = _get_cleaned_preferences(client)
+    pref = next((p for p in prefs if p.get("$type") == MUTED_WORDS_PREF_TYPE), None)
+    if pref is None:
+        return []
+    items = pref.get("items") or []
+    return [
+        {
+            "id": item.get("id"),
+            "value": item.get("value", ""),
+            "targets": list(item.get("targets") or []),
+        }
+        for item in items
+    ]
 
 def _save_muted_words(client, words: list):
     """
     Writes `words` back as the account's mutedWordsPref, preserving
-    every OTHER preference type untouched. EXPERIMENTAL: reconstructs
-    unrelated preference items via model_dump() -- NOT the raw-dict
-    style used elsewhere in this file for NEW records, because these
-    are already-valid objects the SDK itself just parsed from a real
-    response, not new ones being constructed from scratch (a much
-    lower-risk case than the embed/Record union bug this file otherwise
-    routes around). Any single preference item that still fails to dump
-    is skipped and logged rather than aborting the whole save -- worst
-    case that one unrelated setting resets to default, not a hard
-    failure of muted-word editing.
+    every OTHER preference type untouched -- via the same raw-JSON
+    round trip _put_preferences already uses for saved feeds, instead
+    of the typed get_preferences()/put_preferences() calls this used
+    to make. See get_muted_words' docstring for why: the typed path
+    fails hard (168 pydantic validation errors) on the account's OTHER
+    preference types, not just muted words, so it can never be trusted
+    to round-trip safely.
     """
-    import time
-
-    resp = client.app.bsky.actor.get_preferences()
-    rawPrefs = []
-    for pref in resp.preferences:
-        if getattr(pref, "$type", "") == MUTED_WORDS_PREF_TYPE:
-            continue  # rebuilt fresh below
-        try:
-            rawPrefs.append(pref.model_dump(exclude_none=True, by_alias=True))
-        except Exception as e:
-            log.info(f"NVSky: skipped re-saving one unrelated preference item: {e}")
-
-    rawPrefs.append({
+    prefs = _get_cleaned_preferences(client)
+    prefs = [p for p in prefs if p.get("$type") != MUTED_WORDS_PREF_TYPE]
+    prefs.append({
         "$type": MUTED_WORDS_PREF_TYPE,
         "items": [
             {
@@ -1713,8 +2470,7 @@ def _save_muted_words(client, words: list):
             for w in words
         ],
     })
-
-    client.app.bsky.actor.put_preferences(data={"preferences": rawPrefs})
+    _put_preferences(client, prefs)
 
 
 def add_muted_word(client, value: str, targets: list = None):

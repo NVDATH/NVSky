@@ -47,12 +47,11 @@ import wx
 
 import gui
 import ui as nvdaUi
-from gui.settingsDialogs import NVDASettingsDialog
+from logHandler import log
 
 from . import db
 from . import chatWindow
 from . import uiutil
-from .settings import NVSkySettingsPanel
 from .compose import ComposeDialog
 from . import client
 
@@ -205,11 +204,8 @@ class MainWindow(wx.Frame):
                 return
 
     def onSettings(self, evt=None):
-        # EXPERIMENTAL -- first use of gui.mainFrame.popupSettingsDialog
-        # from inside NVSky's own UI (YoutubePlus does the same thing,
-        # from a gesture rather than a button, but should be the same
-        # call) -- paste back the traceback if this errors.
-        gui.mainFrame.popupSettingsDialog(NVDASettingsDialog, NVSkySettingsPanel)
+        from . import open_settings_dialog
+        open_settings_dialog()
 
     # ---------------- tab management ----------------
 
@@ -257,6 +253,74 @@ class MainWindow(wx.Frame):
 
     def getOpenTabs(self):
         return [self.notebook.GetPage(i) for i in range(self.notebook.GetPageCount())]
+
+    def moveCurrentTab(self, delta):
+        index = self.notebook.GetSelection()
+        if index == wx.NOT_FOUND:
+            return
+        newIndex = index + delta
+        if newIndex < 0 or newIndex >= self.notebook.GetPageCount():
+            nvdaUi.message("Can't move the tab further in that direction.")
+            return
+        panel = self.notebook.GetPage(index)
+        label = self.notebook.GetPageText(index)
+        # RemovePage() auto-selects a neighboring tab and fires
+        # EVT_NOTEBOOK_PAGE_CHANGED for IT first, then InsertPage(select=True)
+        # fires again for the real target -- two real announcements back
+        # to back. Suppress both via the existing flag onPageChanged
+        # already checks, then trigger onTabActivated manually once.
+        self._activationSuppressed = True
+        try:
+            self.notebook.RemovePage(index)
+            self.notebook.InsertPage(newIndex, panel, label, select=True)
+        finally:
+            self._activationSuppressed = False
+        onActivated = getattr(panel, "onTabActivated", None)
+        if callable(onActivated):
+            onActivated()
+        self._persistTabOrder()
+
+    def _persistTabOrder(self):
+        # One combined, interleaved order for every tab (permanent AND
+        # temp together) -- see db.get_tab_order's docstring for why
+        # this replaced the old split scheme.
+        account = db.get_active_account()
+        if account is None:
+            return
+        order = []
+        for i in range(self.notebook.GetPageCount()):
+            identity = self._getTabIdentity(self.notebook.GetPage(i))
+            if identity:
+                order.append([identity["kind"], identity["key"]])
+        db.set_tab_order(account["id"], order)
+
+    def notifyConvoChanged(self, convoId, sourcePanel=None):
+        # Cross-tab live sync -- called by chatWindow.py's
+        # _ChatMessagePanelMixin._notifyConvoChanged after any local
+        # state change (send/react/delete/mark-read/lock) to a
+        # conversation. Every OTHER open panel (skips sourcePanel, which
+        # already updated its own UI) gets a chance to re-render from
+        # the now-fresh local DB -- cheap, no network call. Covers
+        # ChatWindow (has both hooks) and any ConvoTabWindow(s) for the
+        # same convoId (only has _reloadMessagesIfCurrent).
+        for panel in self.getOpenTabs():
+            if panel is sourcePanel:
+                continue
+            reload = getattr(panel, "_reloadMessagesIfCurrent", None)
+            if reload:
+                try:
+                    reload(convoId, moveFocus=False)
+                except TypeError:
+                    # ChatWindow's version has no moveFocus param -- it
+                    # never grabs real OS focus in _showMessages anyway
+                    # (Focus()/Select() on a ListCtrl that doesn't
+                    # already have focus don't steal it), unlike
+                    # ConvoTabWindow's _loadMessages, which does via an
+                    # explicit SetFocus().
+                    reload(convoId)
+            refreshLabel = getattr(panel, "_refreshConvoLabel", None)
+            if refreshLabel:
+                refreshLabel(convoId)
 
     def _updateRemoveTabButton(self):
         index = self.notebook.GetSelection()
@@ -364,6 +428,23 @@ class MainWindow(wx.Frame):
         self._activationSuppressed = False
         self._updateRemoveTabButton()
         wx.CallAfter(self._focusPanel, self.notebook.GetPage(index))
+
+    def focusTabByIdentity(self, identity):
+        """
+        Dedup helper for opening a "browse view" tab (thread, user
+        timeline, followers/following) that shouldn't be opened twice
+        for the same target. Returns True and switches to it if a tab
+        with this exact identity is already open; False otherwise
+        (caller should then create it). Unlike findTabIndexByIdentity,
+        this has NO fallback to index 0 -- a miss must stay a miss.
+        """
+        if not identity:
+            return False
+        for i in range(self.notebook.GetPageCount()):
+            if self._getTabIdentity(self.notebook.GetPage(i)) == identity:
+                self.notebook.SetSelection(i)
+                return True
+        return False
 
     def findTabIndexByIdentity(self, identity):
         """
@@ -517,6 +598,9 @@ class MainWindow(wx.Frame):
         if evt.ControlDown() and keyCode == ord("W"):
             self.removeCurrentTab()
             return
+        if evt.ControlDown() and keyCode == ord("P"):
+            self.onSettings()
+            return
         if evt.ControlDown() and keyCode == wx.WXK_F2:
             self.renameCurrentTab()
             return
@@ -539,6 +623,12 @@ class MainWindow(wx.Frame):
             return
         if evt.ControlDown() and keyCode == ord("N"):
             self.onNewPost()
+            return
+        if evt.ControlDown() and evt.ShiftDown() and keyCode == wx.WXK_PAGEUP:
+            self.moveCurrentTab(-1)
+            return
+        if evt.ControlDown() and evt.ShiftDown() and keyCode == wx.WXK_PAGEDOWN:
+            self.moveCurrentTab(1)
             return
 
         evt.Skip()

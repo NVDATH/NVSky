@@ -131,6 +131,44 @@ def _message_text(post: dict) -> str:
     return uiutil.single_line(text)
 
 
+class RemovableTabMixin:
+    """
+    Shared behavior for removable temp tabs that (a) show a simple
+    "<TAB_NAME> - NVSky" window title, and (b) jump back to whichever
+    permanent tab they were opened FROM when closed via Ctrl+W. Was
+    byte-for-byte duplicated across ConvoTabWindow (chatWindow.py),
+    ListTabWindow, FeedPreviewTabWindow, UserListTabWindow,
+    UserTimelineTabWindow, and ThreadTabWindow before this.
+
+    A host class must set self._originTabKey (str or None) before use,
+    and call self._jumpBackToOrigin() from its own onTabRemoved().
+    """
+
+    def _updateTitle(self):
+        notebook = self.GetParent()
+        index = notebook.FindPage(self)
+        if index != wx.NOT_FOUND:
+            notebook.SetPageText(index, self.TAB_NAME)
+            if index == notebook.GetSelection():
+                self.GetTopLevelParent().SetTitle(f"{self.TAB_NAME} - NVSky")
+
+    def _jumpBackToOrigin(self):
+        if not self._originTabKey:
+            return
+        mainWindow = self.GetTopLevelParent()
+        for panel in mainWindow.getOpenTabs():
+            identity = mainWindow._getTabIdentity(panel)
+            if identity and identity.get("key") == self._originTabKey:
+                mainWindow.notebook.SetSelection(mainWindow.notebook.FindPage(panel))
+                break
+
+    def onTabRenamed(self, newName):
+        # Not user-renameable in the UI currently -- no-op stub so
+        # MainWindow.renameCurrentTab's getattr(...) check stays
+        # consistent, in case that changes later.
+        pass
+
+
 class UserActionMixin:
     """
     Shared "act on a user" menu + implementations, mixed into any dialog
@@ -163,64 +201,78 @@ class UserActionMixin:
         self.PopupMenu(menu)
         menu.Destroy()
 
-    def showTimeline(self, did, handle):
-        _announce_now(f"Loading timeline for @{handle}, please wait...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                posts = client.get_author_feed(atprotoClient, did)
-                error = None
-            except Exception as e:
-                posts = None
-                error = str(e)
-            wx.CallAfter(self._onTimelineReady, did, handle, posts, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onTimelineReady(self, did, handle, posts, error):
-        if error:
-            nvdaUi.message(f"Could not load timeline: {error}")
+    def showTimeline(self, did, handle, display_name=None):
+        # Opens (or focuses an already-open) UserTimelineTabWindow --
+        # replaces the old UserTimelineDialog popup. Needs the real
+        # MainWindow, same reasoning as _openUserListTab below.
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            nvdaUi.message("Open NVSky's main window first.")
             return
-        gui.mainFrame.prePopup()
-        dlg = UserTimelineDialog(self, did, handle, posts or [])
-        dlg.Show()
+
+        identity = {"kind": "user_timeline", "key": did}
+        if mainWindow.focusTabByIdentity(identity):
+            return
+
+        activeIndex = mainWindow.notebook.GetSelection()
+        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
+        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
+        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+
+        ownerLabel = self._displayLabel(handle, display_name)
+        tab = UserTimelineTabWindow(mainWindow.notebook, did, ownerLabel, origin_key=originKey)
+        mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
+        account = db.get_active_account()
+        if account is not None:
+            db.add_open_temp_tab(account["id"], {
+                "type": "user_timeline", "key": did, "did": did,
+                "owner_label": ownerLabel, "origin_key": originKey,
+            })
 
     def showFollowers(self, did, handle=None, display_name=None):
-        self._showUserList("followers", did, handle, display_name)
+        self._openUserListTab("followers", did, handle, display_name)
 
     def showFollowing(self, did, handle=None, display_name=None):
-        self._showUserList("following", did, handle, display_name)
+        self._openUserListTab("following", did, handle, display_name)
 
-    def _showUserList(self, kind, did, handle=None, display_name=None):
-        nvdaUi.message(f"Loading {kind}, please wait...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                if kind == "followers":
-                    users = client.get_followers(atprotoClient, did)
-                else:
-                    users = client.get_follows(atprotoClient, did)
-                error = None
-            except Exception as e:
-                users = None
-                error = str(e)
-            wx.CallAfter(self._onUserListFetched, kind, users, error, handle, display_name)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onUserListFetched(self, kind, users, error, handle, display_name):
-        if error:
-            nvdaUi.message(f"Could not load {kind}: {error}")
+    def _openUserListTab(self, kind, did, handle=None, display_name=None):
+        # Opens (or focuses an already-open) UserListTabWindow --
+        # replaces the old UserListDialog popup. Needs the real
+        # MainWindow, not whatever dialog this mixin happens to be
+        # mixed into (e.g. ManageGroupMembersDialog) -- falls back to
+        # a message if MainWindow isn't open at all.
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            nvdaUi.message("Open NVSky's main window first.")
             return
-        gui.mainFrame.prePopup()
+
+        identity = {"kind": "user_list", "key": f"{kind}:{did}"}
+        if mainWindow.focusTabByIdentity(identity):
+            return
+
+        # origin_key only set when opened from a PERMANENT tab -- a
+        # removable-tab origin just lets wx.Notebook auto-select
+        # whatever's next when this tab closes, no special fallback.
+        activeIndex = mainWindow.notebook.GetSelection()
+        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
+        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
+        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+
         ownerLabel = self._displayLabel(handle, display_name)
-        title = f"{kind.capitalize()} of {ownerLabel}"
-        dlg = UserListDialog(self, title, users or [])
-        dlg.Show()
+        tab = UserListTabWindow(mainWindow.notebook, kind, did, ownerLabel, origin_key=originKey)
+        mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
+        account = db.get_active_account()
+        if account is not None:
+            db.add_open_temp_tab(account["id"], {
+                "type": "user_list",
+                "key": f"{kind}:{did}",
+                "list_kind": kind,
+                "did": did,
+                "owner_label": ownerLabel,
+                "origin_key": originKey,
+            })
 
     def _displayLabel(self, handle, display_name=None):
         mode = db.get_ui_state("column1_display") or COLUMN_DISPLAY_NAME
@@ -343,6 +395,77 @@ class UserActionMixin:
             return
         if message:
             nvdaUi.message(message)
+
+
+class UserListMixin:
+    """
+    Shared "browsable list of users" render/focus/action behavior --
+    used by UserListTabWindow (followers/following) and, later,
+    Explore's People results. No local DB cache/pagination like
+    FeedListMixin -- always a single fresh network fetch, matching what
+    the old UserListDialog already did.
+
+    A host class must set self._users (list of dicts with did/handle,
+    optionally display_name/description), self.userList, self.statusBar
+    before render, and implement self._userListLabel() -> str.
+    """
+
+    def _buildUserListColumns(self):
+        self.userList.InsertColumn(0, "Handle", width=180)
+        self.userList.InsertColumn(1, "Display name", width=180)
+        self.userList.InsertColumn(2, "Bio", width=300)
+
+    def _insertUserRow(self, index, user):
+        self.userList.InsertItem(index, f'@{user["handle"]}')
+        self.userList.SetItem(index, 1, user.get("display_name") or "")
+        self.userList.SetItem(index, 2, (user.get("description") or "").replace("\n", " "))
+
+    def _renderUsers(self, target_index=None):
+        previouslyFocused = self.userList.GetFocusedItem()
+        self.userList.Freeze()
+        try:
+            self.userList.DeleteAllItems()
+            for i, user in enumerate(self._users):
+                self._insertUserRow(i, user)
+            if not self._users:
+                index = None
+            elif target_index is not None:
+                index = max(0, min(target_index, len(self._users) - 1))
+            elif previouslyFocused != -1:
+                index = min(previouslyFocused, len(self._users) - 1)
+            else:
+                index = 0
+            if index is not None:
+                self.userList.Focus(index)
+                self.userList.Select(index)
+                self.userList.EnsureVisible(index)
+        finally:
+            self.userList.Thaw()
+        if hasattr(self, "statusBar"):
+            self.statusBar.SetStatusText(self._userListLabel())
+
+    def _getFocusedUser(self):
+        index = self.userList.GetFocusedItem()
+        if 0 <= index < len(self._users):
+            return self._users[index]
+        return None
+
+    def onUserAction(self, evt=None):
+        user = self._getFocusedUser()
+        if user is None:
+            nvdaUi.message("No user selected.")
+            return
+        self.showUserActionMenu(user["did"], user["handle"], user.get("display_name"))
+
+    def onUserListCharHook(self, evt):
+        keyCode = evt.GetKeyCode()
+        if evt.AltDown() and keyCode == ord("U"):
+            self.onUserAction()
+            return
+        if keyCode == wx.WXK_F5 and not evt.ShiftDown() and not evt.ControlDown():
+            self.onCheckForUpdates(None)
+            return
+        evt.Skip()
 
 
 class EmbedViewMixin:
@@ -477,8 +600,8 @@ class EmbedViewMixin:
     @uiutil.safe_ui_callback
     def _onActionDone(self, message, error):
         def announce_immediately(text):
-            speech.cancelSpeech()  # ตัดบท/หยุดเสียงที่กำลังอ่านข้อความใน ListCtrl ทันที
-            nvdaUi.message(text)   # พูดข้อความของเราแทนทันที
+            speech.cancelSpeech()  # เธ•เธฑเธ”เธเธ—/เธซเธขเธธเธ”เน€เธชเธตเธขเธเธ—เธตเนเธเธณเธฅเธฑเธเธญเนเธฒเธเธเนเธญเธเธงเธฒเธกเนเธ ListCtrl เธ—เธฑเธเธ—เธต
+            nvdaUi.message(text)   # เธเธนเธ”เธเนเธญเธเธงเธฒเธกเธเธญเธเน€เธฃเธฒเนเธ—เธเธ—เธฑเธเธ—เธต
 
         if error:
             log.error(f"NVSky: action failed: {error}")
@@ -592,6 +715,17 @@ class FeedListMixin:
         else:
             self.SetTitle(f"{self.TAB_NAME} - NVSky - {accountLabel}")
 
+    def onAccountChanged(self):
+        # Called by GlobalPlugin._rebuildTabs (see __init__.py) when
+        # the active account changes while MainWindow is already open --
+        # self._account was otherwise only ever set once, at __init__,
+        # confirmed via testing to be the reason a freshly-added account
+        # (after removing the only existing one) never showed up in an
+        # already-open MainWindow.
+        self._account = db.get_active_account()
+        self._updateTitle()
+        self._loadFromCache(reset=True)
+
     def _updateStatusBar(self):
         # _tracksUnread=False (set by e.g. SavedWindow) skips the unread
         # count entirely -- a saved-posts list is a personal reference
@@ -650,6 +784,71 @@ class FeedListMixin:
         self.postList.InsertColumn(1, "Author", width=180)
         self.postList.InsertColumn(2, "Message", width=330)
         self.postList.InsertColumn(3, "Posted", width=140)
+
+    def _buildStandardFeedSizer(self, extra_top=None, extra_action_widgets=None):
+        """
+        Standard feed-tab layout: optional extra_top row above postList,
+        postList itself, Post action/User action buttons (+ optional
+        extra_action_widgets after them), statusBar. Calls self.SetSizer().
+        Was byte-for-byte duplicated across SavedWindow/ListTabWindow/
+        FeedPreviewTabWindow/FeedWindow before this (see plan-13.md).
+        extra_top: a wx.Sizer to place above postList (e.g. FeedWindow's
+        filter-choice row).
+        extra_action_widgets: list of wx.Window added to the action row
+        after userActionButton (e.g. "Add to my feeds").
+        """
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        if extra_top is not None:
+            sizer.Add(extra_top, flag=wx.ALL, border=10)
+
+        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
+        self._buildFeedListColumns()
+        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+
+        actionRow = wx.BoxSizer(wx.HORIZONTAL)
+        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
+        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
+        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
+        actionRow.Add(self.userActionButton)
+        if extra_action_widgets:
+            for widget in extra_action_widgets:
+                actionRow.Add(widget, flag=wx.LEFT, border=5)
+        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+
+        self.statusBar = wx.StatusBar(self)
+        sizer.Add(self.statusBar, flag=wx.EXPAND)
+
+        self.SetSizer(sizer)
+
+    def _bindStandardFeedEvents(self):
+        """Binds Post action/User action buttons and postList's focus/
+        activate/char-hook to the standard handler names every host
+        already implements identically. Call after any host-specific
+        binds (e.g. FeedWindow's filterChoice) so those aren't affected."""
+        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
+        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
+        self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
+        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onItemActivated)
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+
+    def _finishStandardFeedInit(self, sync_if_empty=False):
+        """Standard __init__ tail: title, cache load, no-account message,
+        focus-position restore, optional initial sync-if-empty. Call last,
+        after self._feedKey (and anything _syncPage/_dbGetPage need) is
+        already set."""
+        self._updateTitle()
+        self._loadFromCache(reset=True)
+
+        if self._account is None:
+            nvdaUi.message("No active account. Log in from Settings first.")
+            return
+
+        self._restoreFocusPosition(moveFocus=False)
+        if sync_if_empty:
+            self._syncIfCacheEmpty()
+        if getattr(self, "TAB_KEY", None) == "home":
+            db.set_home_active_filter(self._account["id"], self._feedKey)
 
     def _insertRow(self, index: int, post: dict, mode: str):
         # Shared by every FeedListMixin host except NotificationsWindow
@@ -773,6 +972,15 @@ class FeedListMixin:
         Real focus for the initially-selected tab is granted once,
         later, by MainWindow.addTab()'s wx.CallAfter; for tab switches,
         by onTabActivated() below (moveFocus defaults to True there).
+
+        SetFocus() BEFORE Focus()/Select() when moveFocus=True -- same
+        fix as chatWindow.py's ConvoTabWindow._loadMessages. Confirmed
+        by testing: calling Select() while the ListCtrl doesn't have
+        real OS focus yet doesn't fully register the selection with
+        the native control (GetSelectedItemCount() stayed 0 until the
+        user pressed an arrow key, breaking Alt+U/Alt+A right after a
+        tab first opens/activates). Granting real focus first, then
+        selecting, avoids that race.
         """
         savedUri = db.get_ui_state(self._focusStateKey())
 
@@ -783,17 +991,44 @@ class FeedListMixin:
                     targetIndex = i
                     break
 
+        if moveFocus:
+            self.postList.SetFocus()
+            # SetFocus() doesn't take effect synchronously -- the
+            # native control doesn't fully "have" real OS focus until
+            # the event loop processes it. Selecting a non-zero index
+            # immediately after, in the same call, raced that and left
+            # GetSelectedItemCount() reporting 0 until an arrow key
+            # forced a real focus-changed event. Index 0 happened to
+            # look unaffected only because it's already the ListCtrl's
+            # natural default focused row from insertion, not because
+            # this race didn't apply to it. wx.CallAfter defers the
+            # actual selection until after focus has genuinely landed.
+            wx.CallAfter(self._applyFocusPosition, targetIndex)
+        else:
+            self._applyFocusPosition(targetIndex)
+
+    def _applyFocusPosition(self, targetIndex):
         self._suppressFocusEvents = True
         try:
             if self._posts:
+                # Select() only ADDS to the selection, it never clears
+                # anything else already selected -- confirmed root
+                # cause of Alt+U/Alt+A wrongly reporting multiple posts
+                # selected right after a tab opens/activates: _render()
+                # falls back to Select(0) when it can't find a saved
+                # focus target yet, then this method selects the real
+                # target on top of that without ever clearing index 0
+                # first. Same fix already used by
+                # uiutil.move_focus_and_check_announce and
+                # _jumpToUserPost for the identical class of bug.
+                for i in range(self.postList.GetItemCount()):
+                    if i != targetIndex and self.postList.GetItemState(i, wx.LIST_STATE_SELECTED):
+                        self.postList.SetItemState(i, 0, wx.LIST_STATE_SELECTED)
                 self.postList.Focus(targetIndex)
                 self.postList.Select(targetIndex)
                 self.postList.EnsureVisible(targetIndex)
         finally:
             self._suppressFocusEvents = False
-
-        if moveFocus:
-            self.postList.SetFocus()
 
     def _focusStateKey(self) -> str:
         return f"lastFocus:{self._feedKey}:{self._account['id']}"
@@ -833,11 +1068,35 @@ class FeedListMixin:
         self._loadMore()
 
     def _focusNextUnread(self):
-        for i in range(len(self._posts)):
+        # Same root cause and fix as chatWindow.py's
+        # _focusNextUnreadMessage: moving focus alone doesn't reliably
+        # mark the row read, since EVT_LIST_ITEM_FOCUSED only fires when
+        # the focused index actually changes -- landing on an already-
+        # focused unread row (e.g. right after opening the tab) was a
+        # no-op state change, so Space appeared to do nothing. Shared
+        # here in FeedListMixin fixes it for every host at once (Home,
+        # Saved, Lists, Notifications, ListTabWindow).
+        #
+        # Must also always progress OLDEST-unread-first chronologically
+        # regardless of Settings > Display sort order -- self._posts'
+        # array order follows the on-screen display order (see
+        # _applySortOrder), so a plain forward scan picked the NEWEST
+        # unread item first whenever newest-first was set (jumping to
+        # the top, then working backward), backwards from the intended
+        # "catch up from where you left off" behavior. Same fix as
+        # chatWindow.py's _focusNextUnreadMessage.
+        newestFirst = db.get_ui_state("sort_order") != "oldest_first"
+        indices = range(len(self._posts) - 1, -1, -1) if newestFirst else range(len(self._posts))
+        for i in indices:
             if not self._posts[i].get("is_read"):
-                self.postList.Focus(i)
-                self.postList.Select(i)
-                self.postList.EnsureVisible(i)
+                post = self._posts[i]
+                if uiutil.move_focus_and_check_announce(self.postList, i):
+                    columnCount = self.postList.GetColumnCount()
+                    parts = [self.postList.GetItemText(i, col) for col in range(columnCount)]
+                    nvdaUi.message(", ".join(p for p in parts if p))
+                self._markItemRead(post)
+                post["is_read"] = 1
+                self._updateStatusBar()
                 return
         nvdaUi.message("No unread posts.")
 
@@ -947,6 +1206,41 @@ class FeedListMixin:
         after = self._dbGetPage(limit=1)
         newTopUri = after[0]["uri"] if after else None
         return newTopUri != oldTopUri
+
+    def _syncIfCacheEmpty(self):
+        """Call after _loadFromCache() wherever a feed_key can be
+        genuinely brand new with zero cached posts (a fresh
+        FeedPreviewTabWindow/ListTabWindow, or a Home filter switched
+        to a feed that's never been viewed before) -- there's nothing
+        at all to show otherwise, so this does ONE silent background
+        sync instead of leaving the list empty until the user manually
+        presses refresh. Deliberately NOT called from every tab's
+        __init__/onFilterChanged unconditionally -- Home's "Following"/
+        "Discover", Notifications, Saved, and Explore's own search are
+        expected to already have history and stay cache-first/manual-
+        refresh like the rest of the app; auto-syncing them too would
+        fight that design (see FeedWindow.onFilterChanged's own note
+        about not re-fetching on every filter switch)."""
+        if self._account is None or self._posts:
+            return
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                self._syncPage(atprotoClient, None, PAGE_SIZE)
+                error = None
+            except Exception as e:
+                error = str(e)
+            wx.CallAfter(self._onInitialSyncDone, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onInitialSyncDone(self, error):
+        if error:
+            log.error(f"NVSky: initial sync for a new/empty feed failed: {error}")
+            return
+        self._loadFromCache(reset=True)
 
     def _reloadAfterBulkCheck(self, moveFocus=True):
         # Main-thread only -- called back by checkAllOpenTabs for every
@@ -1192,232 +1486,164 @@ class ProfileDialog(UserActionMixin, wx.Dialog):
         gui.mainFrame.postPopup()
         self.Destroy()
 
-class UserListDialog(UserActionMixin, wx.Dialog):
+class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Panel):
     """
-    Interactive followers/following list -- this shows users only (no
-    posts), so it exposes a single "User action" entry point instead of
-    separate view/actions buttons. Enter, Alt+U, or the button all open
-    the same user action menu for the selected row, which can itself
-    open another UserListDialog and so on -- each dialog pairs its own
-    prePopup/postPopup, so this nests safely to any depth.
+    Browsable user-list tab -- replaces the old UserListDialog and
+    covers three kinds: "followers"/"following" (fixed to one account's
+    did) and "search" (a people-search query, opened via Explore's
+    "Open in new tab"). F5 re-fetches from the network -- no local
+    cache/pagination, same fetch-once-per-refresh behavior the old
+    dialog had. Not persisted differently by kind -- all three
+    persist/restore the same way as any other temp tab.
     """
 
-    def __init__(self, parent, title, users):
-        super().__init__(parent, title=title, size=(500, 400))
-        self._users = users
+    _KIND_LABELS = {"followers": "followers", "following": "following", "search": "search results"}
+
+    def __init__(self, parent, kind, target, owner_label=None, origin_key=None):
+        super().__init__(parent)
+        self._account = db.get_active_account()
+        self._kind = kind  # "followers" / "following" / "search"
+        self._target = target  # did for followers/following, query for search
+        if kind in ("followers", "following"):
+            self.TAB_NAME = f"{kind.capitalize()} of {owner_label}"
+        else:
+            self.TAB_NAME = f"People search: {target}"
+        self.TAB_TEMP_TYPE = "user_list"
+        self.TAB_TEMP_KEY = f"{kind}:{target}"
+        self._originTabKey = origin_key
+        self._users = []
 
         sizer = wx.BoxSizer(wx.VERTICAL)
-
         self.userList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.userList.InsertColumn(0, "Handle", width=220)
-        self.userList.InsertColumn(1, "Display name", width=220)
-        for i, u in enumerate(users):
-            self.userList.InsertItem(i, f'@{u["handle"]}')
-            self.userList.SetItem(i, 1, u.get("display_name") or "")
+        self._buildUserListColumns()
         sizer.Add(self.userList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
-        buttonRow = wx.BoxSizer(wx.HORIZONTAL)
-        userActionButton = wx.Button(self, label="User action")
-        closeBtn = wx.Button(self, label="&Close")
-        buttonRow.Add(userActionButton, flag=wx.RIGHT, border=5)
-        buttonRow.Add(closeBtn)
-        sizer.Add(buttonRow, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
+        actionRow = wx.BoxSizer(wx.HORIZONTAL)
+        self.userActionButton = wx.Button(self, label="&User action... (Alt+U)")
+        actionRow.Add(self.userActionButton)
+        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
+        self.statusBar = wx.StatusBar(self)
+        sizer.Add(self.statusBar, flag=wx.EXPAND)
         self.SetSizer(sizer)
-        self.CentreOnScreen()
 
-        userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.userList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onUserAction)  # Enter key
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
+        self.userList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onUserAction)
+        self.Bind(wx.EVT_CHAR_HOOK, self.onUserListCharHook)
 
-        if users:
-            self.userList.Focus(0)
-            self.userList.Select(0)
+        self._pendingIsInitial = True
+        cached = db.get_user_list_cache(self._account["id"], self.TAB_TEMP_KEY) if self._account else None
+        self._hadInitialCache = cached is not None
+        if cached is not None:
+            self._users = cached
+            self._renderUsers()
+        else:
+            self.statusBar.SetStatusText("Loading, please wait...")
+        self._fetch()
+
+    def onTabActivated(self):
+        nvdaUi.message(f"{self.TAB_NAME} tab")
         self.userList.SetFocus()
 
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
+    def onTabRemoved(self):
+        if self._account is not None:
+            db.remove_open_temp_tab(self._account["id"], "user_list", self.TAB_TEMP_KEY)
+            db.delete_user_list_cache(self._account["id"], self.TAB_TEMP_KEY)
+        self._jumpBackToOrigin()
+
+    def _userListLabel(self):
+        return f"{self.TAB_NAME} -- {len(self._users)} total"
+
+    def onCheckForUpdates(self, evt=None):
+        if self._account is None:
+            nvdaUi.message("No active account.")
             return
-        if evt.AltDown() and evt.GetKeyCode() == ord("U"):
-            self.onUserAction(evt)
-            return
-        evt.Skip()
+        nvdaUi.message(f"Loading {self._KIND_LABELS[self._kind]}, please wait...")
+        self._pendingIsInitial = False
+        self._fetch()
 
-    def onClose(self, evt):
-        gui.mainFrame.postPopup()
-        self.Destroy()
-
-    def _getSelectedUser(self):
-        index = self.userList.GetFocusedItem()
-        if 0 <= index < len(self._users):
-            return self._users[index]
-        return None
-
-    def onUserAction(self, evt):
-        user = self._getSelectedUser()
-        if user is None:
-            return
-        self.showUserActionMenu(user["did"], user["handle"], user.get("display_name"))
-
-class UserTimelineDialog(UserActionMixin, EmbedViewMixin, wx.Dialog):
-    """
-    Read-only view of one user's recent posts. Data is fetched BEFORE
-    this dialog is constructed (see UserActionMixin.showTimeline/
-    _onTimelineReady) -- same reasoning as ThreadDialog. No lazy-load
-    yet -- just the most recent batch; a fuller version belongs to the
-    later Multi-tab work.
-    """
-
-    def __init__(self, parent, did, handle, posts):
-        self._did = did
-        self._handle = handle
-        self._posts = posts
-        super().__init__(parent, title=f"Timeline of @{handle} - NVSky", size=(800, 500),
-                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.postList.InsertColumn(0, "Message", width=420)
-        self.postList.InsertColumn(1, "Posted", width=140)
-        self.postList.InsertColumn(2, "Embed", width=140)
-        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        closeBtn = wx.Button(self, label="&Close")
-        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(closeBtn)
-        sizer.Add(actionRow, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
-
-        self.SetSizer(sizer)
-        self.CentreOnScreen()
-
-        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        for i, post in enumerate(self._posts):
-            self.postList.InsertItem(i, _message_text(post))
-            self.postList.SetItem(i, 1, _format_post_time(post.get("indexed_at")))
-            self.postList.SetItem(i, 2, _describe_embed(post.get("embed_json")))
-
-        if self._posts:
-            self.postList.Focus(0)
-            self.postList.Select(0)
-        self.postList.SetFocus()
-
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        if evt.AltDown() and evt.GetKeyCode() == ord("A"):
-            self.onPostAction(evt)
-            return
-        if evt.AltDown() and evt.GetKeyCode() == ord("U"):
-            self.onUserAction(evt)
-            return
-        evt.Skip()
-
-    def onClose(self, evt):
-        gui.mainFrame.postPopup()
-        self.Destroy()
-
-    def _getFocusedPost(self):
-        index = self.postList.GetFocusedItem()
-        if 0 <= index < len(self._posts):
-            return self._posts[index]
-        return None
-
-    def onUserAction(self, evt=None):
-        self.showUserActionMenu(self._did, self._handle)
-
-    def onPostAction(self, evt=None):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-
-        menu = wx.Menu()
-        isLiked = bool(post.get("viewer_like_uri"))
-        self._addMenuItem(menu, "Unlike" if isLiked else "Like", lambda: self._togglePostLike(post))
-        menu.AppendSeparator()
-
-        copyMenu = wx.Menu()
-        self._addMenuItem(copyMenu, "Copy post text", lambda: self._copyPostText(post))
-        self._addMenuItem(copyMenu, "Copy link to post", lambda: self._copyPostLink(post))
-        menu.AppendSubMenu(copyMenu, "Copy...")
-
-        embedMenu = self._buildViewEmbedMenu(post)
-        if embedMenu is not None:
-            menu.AppendSubMenu(embedMenu, "Embed...")
-
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _togglePostLike(self, post):
+    def _fetch(self):
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
-                if post.get("viewer_like_uri"):
-                    client.unlike_post(atprotoClient, post["viewer_like_uri"])
-                    post["viewer_like_uri"] = None
-                    message = "Unliked."
+                if self._kind == "followers":
+                    users = client.get_followers(atprotoClient, self._target)
+                elif self._kind == "following":
+                    users = client.get_follows(atprotoClient, self._target)
                 else:
-                    like_uri = client.like_post(atprotoClient, post["uri"], post["cid"])
-                    post["viewer_like_uri"] = like_uri
-                    message = "Liked."
+                    response = client.search_actors(atprotoClient, self._target)
+                    users = [
+                        {
+                            "did": a.did, "handle": a.handle,
+                            "display_name": getattr(a, "display_name", None),
+                            "description": getattr(a, "description", None),
+                        }
+                        for a in response.actors
+                    ]
                 error = None
             except Exception as e:
+                users = None
                 error = str(e)
-                message = None
-            wx.CallAfter(self._onActionDone, message, error)
+            wx.CallAfter(self._onFetchDone, users, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _copyPostText(self, post):
-        self._copyToClipboard(post.get("text", ""))
-        _announce_now("Post text copied to clipboard.")
+    @uiutil.safe_ui_callback
+    def _onFetchDone(self, users, error):
+        label = self._KIND_LABELS[self._kind]
+        isInitial = self._pendingIsInitial
+        self._pendingIsInitial = False
+        if error:
+            if not self._users:
+                nvdaUi.message(f"Could not load {label}: {error}")
+                self.statusBar.SetStatusText(f"Could not load {label}.")
+            else:
+                nvdaUi.message(f"Could not refresh {label}: {error}")
+            return
 
-    def _copyPostLink(self, post):
-        handle = post.get("handle") or post.get("author_did")
-        rkey = post["uri"].rsplit("/", 1)[-1]
-        url = f"https://bsky.app/profile/{handle}/post/{rkey}"
-        self._copyToClipboard(url)
-        _announce_now("Post URL copied to clipboard.")
+        users = users or []
+        changed = users != self._users
+        self._users = users
+        if self._account is not None:
+            db.set_user_list_cache(self._account["id"], self.TAB_TEMP_KEY, users)
 
-class ThreadDialog(UserActionMixin, EmbedViewMixin, wx.Dialog):
+        # Cache-first pattern (same convention as FeedManagerPanel in
+        # settings.py): a silent background refresh that found no
+        # changes doesn't re-render or re-announce -- the cached view
+        # already shown at open is still accurate. First-ever load, a
+        # manual F5, or a background refresh that DID find changes
+        # renders and announces normally.
+        if not (isInitial and self._hadInitialCache and not changed):
+            self._renderUsers()
+            nvdaUi.message(f"{len(self._users)} {label} loaded.")
+
+class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     """
-    Read-only view of a post's full thread. Data is fetched BEFORE this
-    dialog is constructed (see FeedWindow._openThread/_onThreadReady) --
-    building an empty dialog first and populating it after Show() was
-    tried earlier and caused a focus glitch (the list starts truly
-    empty/title-less, then gets rebuilt under the user right as they
-    land on it). Same reduced Post-action set as UserTimelineDialog
-    (Like, Copy, Embed) -- Reply/Repost/Quote parity is deferred to the
-    Multi-tab work, same as there.
+    Full thread view, popped into its own removable tab -- replaces
+    ThreadDialog. NOT a FeedListMixin host: a thread is a tree
+    (ancestors + depth-first replies), not chronological pagination,
+    so there's no "load older" -- F5 always re-fetches the WHOLE thread
+    fresh (a genuinely new reply from someone else can appear this
+    way). Cache-first on open via db.get_user_list_cache/
+    set_user_list_cache under key f"thread:{root_uri}" -- same
+    convention UserListTabWindow uses, just reused here rather than a
+    separate helper since the shape (a plain list of dicts) is
+    identical.
+
+    Same reduced Post-action set as before conversion (Like, Copy,
+    Embed) -- Reply/Repost/Quote parity still deferred.
     """
 
-    def __init__(self, parent, posts, target_index):
+    def __init__(self, parent, root_uri, posts, target_index, origin_key=None):
+        super().__init__(parent)
+        self._account = db.get_active_account()
+        self._rootUri = root_uri
+        self.TAB_TEMP_TYPE = "thread"
+        self.TAB_TEMP_KEY = root_uri
+        self._originTabKey = origin_key
         self._posts = posts
-        title = "Thread - NVSky"
-        if posts:
-            firstPost = posts[0]
-            preview = firstPost.get("text", "")
-            if len(preview) > 60:
-                preview = preview[:60] + "..."
-            label = self._displayLabel(firstPost.get("handle"), firstPost.get("display_name"))
-            title = f"Thread: {label}: {preview} - NVSky"
-
-        super().__init__(parent, title=title, size=(800, 500),
-                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self._targetUri = posts[target_index]["uri"] if posts and target_index < len(posts) else root_uri
+        self.TAB_NAME = self._makeTabName(posts)
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -1431,50 +1657,131 @@ class ThreadDialog(UserActionMixin, EmbedViewMixin, wx.Dialog):
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
         self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
         self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        closeBtn = wx.Button(self, label="&Close")
         actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(closeBtn)
-        sizer.Add(actionRow, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
+        actionRow.Add(self.userActionButton)
+        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
+        self.statusBar = wx.StatusBar(self)
+        sizer.Add(self.statusBar, flag=wx.EXPAND)
         self.SetSizer(sizer)
-        self.CentreOnScreen()
 
         self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
         self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
+        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onPostAction)
         self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
-        for i, post in enumerate(self._posts):
-            depth = post.get("_thread_depth", 0)
-            prefix = "> " * depth
-            self.postList.InsertItem(i, self._displayLabel(post.get("handle"), post.get("display_name")))
-            self.postList.SetItem(i, 1, prefix + _message_text(post))
-            self.postList.SetItem(i, 2, _format_post_time(post.get("indexed_at")))
-            self.postList.SetItem(i, 3, _describe_embed(post.get("embed_json")))
+        self._renderThread(target_index=target_index)
 
-        if self._posts:
-            focusIndex = min(target_index, len(self._posts) - 1)
-            self.postList.Focus(focusIndex)
-            self.postList.Select(focusIndex)
+    def _makeTabName(self, posts):
+        if not posts:
+            return "Thread"
+        firstPost = posts[0]
+        preview = firstPost.get("text", "")
+        if len(preview) > 40:
+            preview = preview[:40] + "..."
+        label = self._displayLabel(firstPost.get("handle"), firstPost.get("display_name"))
+        return f"Thread: {label}: {preview}"
+
+    def onTabActivated(self):
+        nvdaUi.message(f"{self.TAB_NAME} tab")
         self.postList.SetFocus()
 
+    def onTabRemoved(self):
+        if self._account is not None:
+            db.remove_open_temp_tab(self._account["id"], "thread", self._rootUri)
+            db.delete_user_list_cache(self._account["id"], f"thread:{self._rootUri}")
+        self._jumpBackToOrigin()
+
     def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
+        keyCode = evt.GetKeyCode()
+        if keyCode == wx.WXK_F5 and not evt.ShiftDown() and not evt.ControlDown():
+            self.onCheckForUpdates(None)
             return
-        if evt.AltDown() and evt.GetKeyCode() == ord("A"):
-            self.onPostAction(evt)
+        if evt.AltDown() and keyCode == ord("A"):
+            self.onPostAction()
             return
-        if evt.AltDown() and evt.GetKeyCode() == ord("U"):
-            self.onUserAction(evt)
+        if evt.AltDown() and keyCode == ord("U"):
+            self.onUserAction()
             return
         evt.Skip()
 
-    def onClose(self, evt):
-        gui.mainFrame.postPopup()
-        self.Destroy()
+    def _renderThread(self, target_index=None):
+        # Keeps whichever post is currently focused (by uri) unless
+        # target_index is given explicitly -- mirrors the "stay on the
+        # same message" principle used elsewhere (e.g. ChatWindow.
+        # _showMessages), since a re-fetch can insert a genuinely new
+        # reply anywhere in the list.
+        previousUri = None
+        if target_index is None:
+            focused = self._getFocusedPost()
+            if focused is not None:
+                previousUri = focused["uri"]
+
+        self.postList.Freeze()
+        try:
+            self.postList.DeleteAllItems()
+            for i, post in enumerate(self._posts):
+                depth = post.get("_thread_depth", 0)
+                prefix = "> " * depth
+                self.postList.InsertItem(i, self._displayLabel(post.get("handle"), post.get("display_name")))
+                self.postList.SetItem(i, 1, prefix + _message_text(post))
+                self.postList.SetItem(i, 2, _format_post_time(post.get("indexed_at")))
+                self.postList.SetItem(i, 3, _describe_embed(post.get("embed_json")))
+
+            if self._posts:
+                if target_index is not None:
+                    focusIndex = min(target_index, len(self._posts) - 1)
+                else:
+                    lookupUri = previousUri or self._targetUri
+                    focusIndex = next(
+                        (i for i, p in enumerate(self._posts) if p["uri"] == lookupUri), None
+                    )
+                    if focusIndex is None:
+                        focusIndex = min(
+                            next((i for i, p in enumerate(self._posts) if p["uri"] == self._targetUri), 0),
+                            len(self._posts) - 1,
+                        )
+                for i in range(self.postList.GetItemCount()):
+                    if i != focusIndex and self.postList.GetItemState(i, wx.LIST_STATE_SELECTED):
+                        self.postList.SetItemState(i, 0, wx.LIST_STATE_SELECTED)
+                self.postList.Focus(focusIndex)
+                self.postList.Select(focusIndex)
+                self.postList.EnsureVisible(focusIndex)
+        finally:
+            self.postList.Thaw()
+
+        self.statusBar.SetStatusText(f"{self.TAB_NAME} -- {len(self._posts)} posts")
+
+    def onCheckForUpdates(self, evt=None):
+        if self._account is None:
+            nvdaUi.message("No active account.")
+            return
+        nvdaUi.message("Loading thread, please wait...")
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                posts, targetIndex = client.get_thread(atprotoClient, self._targetUri)
+                error = None
+            except Exception as e:
+                posts, targetIndex = None, 0
+                error = str(e)
+            wx.CallAfter(self._onRefreshDone, posts, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onRefreshDone(self, posts, error):
+        if error:
+            nvdaUi.message(f"Could not refresh thread: {error}")
+            return
+        self._posts = posts or []
+        self.TAB_NAME = self._makeTabName(self._posts)
+        self._updateTitle()
+        self._renderThread()
+        if self._account is not None:
+            db.set_user_list_cache(self._account["id"], f"thread:{self._rootUri}", self._posts)
+        nvdaUi.message(f"{len(self._posts)} posts in thread.")
 
     def _getFocusedPost(self):
         index = self.postList.GetFocusedItem()
@@ -1925,7 +2232,24 @@ class ItemActionMixin:
         })
 
     def _openThread(self, post):
+        # Opens (or focuses an already-open) ThreadTabWindow -- replaces
+        # the old ThreadDialog popup. The dedup identity is the THREAD
+        # ROOT's uri, not post["uri"] itself -- opening from any reply
+        # within the same thread should land on the same tab. The root
+        # uri isn't known yet without fetching the thread first, so the
+        # dedup check happens after fetch, in _onThreadFetchedForOpen.
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            nvdaUi.message("Open NVSky's main window first.")
+            return
+
         _announce_now("Loading thread, please wait...")
+
+        activeIndex = mainWindow.notebook.GetSelection()
+        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
+        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
+        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
 
         def worker():
             try:
@@ -1935,18 +2259,38 @@ class ItemActionMixin:
             except Exception as e:
                 posts, targetIndex = None, 0
                 error = str(e)
-            wx.CallAfter(self._onThreadReady, posts, targetIndex, error)
+            wx.CallAfter(self._onThreadFetchedForOpen, posts, targetIndex, error, originKey)
 
         threading.Thread(target=worker, daemon=True).start()
 
     @uiutil.safe_ui_callback
-    def _onThreadReady(self, posts, targetIndex, error):
+    def _onThreadFetchedForOpen(self, posts, targetIndex, error, originKey):
         if error:
             nvdaUi.message(f"Could not load thread: {error}")
             return
-        gui.mainFrame.prePopup()
-        dlg = ThreadDialog(self, posts or [], targetIndex)
-        dlg.Show()
+        posts = posts or []
+        rootUri = posts[0]["uri"] if posts else None
+        if rootUri is None:
+            nvdaUi.message("Could not load thread: no root post found.")
+            return
+
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            return
+
+        identity = {"kind": "thread", "key": rootUri}
+        if mainWindow.focusTabByIdentity(identity):
+            return
+
+        tab = ThreadTabWindow(mainWindow.notebook, rootUri, posts, targetIndex, origin_key=originKey)
+        mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
+        account = db.get_active_account()
+        if account is not None:
+            db.set_user_list_cache(account["id"], f"thread:{rootUri}", posts)
+            db.add_open_temp_tab(account["id"], {
+                "type": "thread", "key": rootUri, "root_uri": rootUri, "origin_key": originKey,
+            })
 
     def _toggleRepost(self, post):
         def worker():
@@ -1998,6 +2342,101 @@ class ItemActionMixin:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _markSelectedRead(self, read: bool):
+        # Lives here (not on FeedWindow) because it's called from
+        # _showBulkPostActionMenu and onItemActivated, both defined in
+        # this same mixin -- every host class (FeedWindow, Notifications,
+        # Saved, Lists, ListTabWindow, ExploreWindow, FeedPreviewTabWindow)
+        # needs it, not just FeedWindow. This has been fixed at least
+        # once before this session and apparently reverted/never
+        # actually applied -- if this crashes again with the same
+        # AttributeError, check whether something is re-adding a
+        # duplicate _markSelectedRead onto a specific host class further
+        # down the file, since Python uses whichever def executes last.
+        posts = self._getSelectedPosts()
+        for post in posts:
+            if read:
+                db.mark_post_read(post["uri"])
+                post["is_read"] = 1
+            else:
+                db.mark_post_unread(post["uri"])
+                post["is_read"] = 0
+        self._updateStatusBar()
+        _announce_now(f"Marked {len(posts)} posts as {'read' if read else 'unread'}.")
+
+
+class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
+    """
+    A user's own post timeline, popped into its own removable tab --
+    replaces UserTimelineDialog. Full FeedListMixin cache-first/
+    lazy-load machinery via client.sync_author_feed_page's feed_key
+    (f"user_timeline:{did}"). Not user-renameable.
+    """
+
+    SUPPORTS_FOCUS_NEXT_UNREAD = True
+    SUPPORTS_SELECT_ALL = True
+
+    def __init__(self, parent, did: str, owner_label: str, origin_key: str = None):
+        super().__init__(parent)
+
+        self._account = db.get_active_account()
+        self.TAB_NAME = f"Timeline of {owner_label}"
+        self._did = did
+        self.TAB_TEMP_TYPE = "user_timeline"
+        self.TAB_TEMP_KEY = did
+        self._feedKey = f"user_timeline:{did}"
+        self._originTabKey = origin_key
+        self._initFeedListState()
+
+        self._buildStandardFeedSizer()
+        self._bindStandardFeedEvents()
+        self._finishStandardFeedInit(sync_if_empty=True)
+
+    def onTabActivated(self):
+        self._render()
+        if self._account is not None:
+            nvdaUi.message(f"{self.TAB_NAME} tab")
+            self._restoreFocusPosition()
+
+    def onTabRemoved(self):
+        for value in vars(self).values():
+            if isinstance(value, wx.Timer):
+                value.Stop()
+        if self._account is not None:
+            db.remove_open_temp_tab(self._account["id"], "user_timeline", self._did)
+        self._jumpBackToOrigin()
+
+    def _getActionablePost(self):
+        post = self._getFocusedPost()
+        if post is None:
+            nvdaUi.message("No post selected.")
+        return post
+
+    def _insertRow(self, index: int, post: dict, mode: str):
+        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
+        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
+
+    def _dbGetPage(self, before_indexed_at=None, limit=None):
+        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
+
+    def _dbGetUnreadCount(self):
+        return db.get_unread_count(self._account["id"], self._feedKey)
+
+    def _syncPage(self, atprotoClient, cursor, limit):
+        return client.sync_author_feed_page(atprotoClient, self._account["id"], self._did, cursor=cursor, limit=limit)
+
+    def _markItemRead(self, post):
+        db.mark_post_read(post["uri"])
+
+    def onUserAction(self, evt=None):
+        post = self._getFocusedPost()
+        if post is None:
+            nvdaUi.message("No post selected.")
+            return
+        self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
+
 
 class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     TAB_KEY = "home"  # for MainWindow's remember-last-tab feature
@@ -2012,63 +2451,30 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         self._account = db.get_active_account()
         self.TAB_NAME = TAB_NAME
         self._feedKey = "home"  # switched by onFilterChanged() below
-        self._initFeedListState()  # also sets _jumpTargetDid/_jumpTargetHandle/_jumpingToUser now
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
+        # index -> (feed_key, feed_uri_or_None); feed_uri is None for
+        # the two built-in system feeds, set for a custom saved feed.
+        self._filterChoiceMap = {}
+        self._initFeedListState()
 
         toolbarRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.filterRadio = wx.RadioBox(
-            self, label="Feed filter", choices=["Following", "Discover"],
-            majorDimension=1, style=wx.RA_SPECIFY_ROWS,
-        )
-        toolbarRow.Add(self.filterRadio)
-        sizer.Add(toolbarRow, flag=wx.ALL, border=10)
+        filterLabel = wx.StaticText(self, label="Feed &filter:")
+        # wx.Choice, not RadioBox -- a saved feed can be added/removed/
+        # reordered from Settings > Feed manager while Home is open, and
+        # RadioBox can't add/remove choices after construction.
+        self.filterChoice = wx.Choice(self)
+        toolbarRow.Add(filterLabel, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
+        toolbarRow.Add(self.filterChoice)
 
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self._buildFeedListColumns()
-        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+        self._buildStandardFeedSizer(extra_top=toolbarRow)
 
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        self._buildFilterChoices()
+        self.filterChoice.Bind(wx.EVT_CHOICE, self.onFilterChanged)
+        self._bindStandardFeedEvents()
 
-        # No "Close" button here anymore -- Home is a permanent tab now,
-        # closing lives at the MainWindow level (Ctrl+W, no-op on
-        # non-closable tabs) rather than per-panel.
-        # Check for updates / New post used to have their own buttons
-        # here -- now toolbar-level buttons shared across every tab in
-        # MainWindow instead (see mainWindow.py), so this panel no
-        # longer needs its own copies. F5/Ctrl+N still work as keyboard
-        # shortcuts while this tab has focus, via onCharHook below --
-        # unrelated to the removed buttons.
-        self.statusBar = wx.StatusBar(self)
-        sizer.Add(self.statusBar, flag=wx.EXPAND)
-
-        self.SetSizer(sizer)
-
-        self.filterRadio.Bind(wx.EVT_RADIOBOX, self.onFilterChanged)
-        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
-        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onItemActivated)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        self._updateTitle()
-        self._loadFromCache(reset=True)
-
-        if self._account is None:
-            nvdaUi.message("No active account. Log in from Settings first.")
-        else:
-            # moveFocus=False -- this only restores the saved row
-            # position in the list, NOT real keyboard focus. Real focus
-            # is granted once, separately, by MainWindow.addTab()'s
-            # wx.CallAfter (this panel might not even be the tab meant
-            # to be visible yet, e.g. Notifications constructed right
-            # after Home during the same script_openFeed call).
-            self._restoreFocusPosition(moveFocus=False)
+        # No sync_if_empty here -- onFilterChanged() already calls
+        # _syncIfCacheEmpty() itself when switching filters; the
+        # initial Following/Discover load stays cache-first/manual F5.
+        self._finishStandardFeedInit()
 
     # ---------------- tab activation (replaces wx.Dialog's EVT_ACTIVATE) ----------------
 
@@ -2091,14 +2497,74 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
 
     # ---------------- filter ----------------
 
+    def _buildFilterChoices(self):
+        """Following/Discover, then every saved feed (Settings > Feed
+        manager), in the order the user set there. Preserves the
+        current selection by feed_key across a rebuild (e.g. after
+        refreshFeedFilterChoices()) when it still exists, falling back
+        to "Following" if the currently-selected custom feed was just
+        removed."""
+        previousFeedKey = self._feedKey
+        account = db.get_active_account()
+        savedFeeds = db.get_saved_feeds_cache(account["id"]) if account else []
+
+        self.filterChoice.Freeze()
+        try:
+            self.filterChoice.Clear()
+            self._filterChoiceMap = {}
+            self.filterChoice.Append("Following")
+            self._filterChoiceMap[0] = ("home", None)
+            self.filterChoice.Append("Discover")
+            self._filterChoiceMap[1] = ("discover", None)
+            for i, feed in enumerate(savedFeeds, start=2):
+                self.filterChoice.Append(feed["display_name"])
+                # feed_key == the raw feed uri, matching how
+                # client.sync_feed_generator_page's _store_feed_item
+                # actually keys its DB writes (confirmed by reading
+                # client.py) -- an earlier "feed:{uri}" prefix here
+                # meant _dbGetPage was reading a completely different
+                # cache entry than _syncPage ever wrote to, so a
+                # custom feed's cache always looked empty and forced a
+                # fresh server sync on every single filter switch.
+                self._filterChoiceMap[i] = (feed["uri"], feed["uri"])
+
+            selectIndex = 0
+            for index, (feedKey, _uri) in self._filterChoiceMap.items():
+                if feedKey == previousFeedKey:
+                    selectIndex = index
+                    break
+            self.filterChoice.SetSelection(selectIndex)
+            self._feedKey = self._filterChoiceMap[selectIndex][0]
+        finally:
+            self.filterChoice.Thaw()
+
+    def refreshFeedFilterChoices(self):
+        """Called from Settings > Feed manager (via get_main_window())
+        whenever the saved-feed list changes, so a newly added/removed/
+        reordered feed shows up in this dropdown immediately instead of
+        needing MainWindow reopened. Only rebuilds the dropdown itself
+        -- does NOT touch postList/re-sync, since the currently-viewed
+        feed (if not the one that changed) shouldn't be disturbed."""
+        self._buildFilterChoices()
+
     def onFilterChanged(self, evt):
-        feedKey = FILTER_INDEX_TO_FEED_KEY[self.filterRadio.GetSelection()]
+        index = self.filterChoice.GetSelection()
+        if index not in self._filterChoiceMap:
+            return
+        feedKey, _uri = self._filterChoiceMap[index]
         if feedKey == self._feedKey:
             return
 
         self._feedKey = feedKey
         self._loadFromCache(reset=True)
-        self.onCheckForUpdates(None)
+        # Show cache immediately; only actually hit the server if this
+        # feed has never been synced before (empty cache) -- switching
+        # back and forth between filters used to force a fresh
+        # re-fetch every single time, which is both slow and pointless
+        # once a feed already has a cache to show.
+        self._syncIfCacheEmpty()
+        if self._account is not None:
+            db.set_home_active_filter(self._account["id"], self._feedKey)
 
     # ---------------- loading (fetch/cache hooks for FeedListMixin) ----------------
 
@@ -2109,6 +2575,9 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         return db.get_unread_count(self._account["id"], self._feedKey)
 
     def _syncPage(self, atprotoClient, cursor, limit):
+        _feedKey, feedUri = self._filterChoiceMap.get(self.filterChoice.GetSelection(), (self._feedKey, None))
+        if feedUri:
+            return client.sync_feed_generator_page(atprotoClient, self._account["id"], feedUri, cursor=cursor, limit=limit)
         return client.sync_timeline(atprotoClient, self._account["id"], cursor=cursor, limit=limit, feed_key=self._feedKey)
 
     def _markItemRead(self, post):
@@ -2134,18 +2603,8 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         self._updateStatusBar()
         _announce_now(message)
 
-    def _markSelectedRead(self, read: bool):
-        posts = self._getSelectedPosts()
-        for post in posts:
-            if read:
-                db.mark_post_read(post["uri"])
-                post["is_read"] = 1
-            else:
-                db.mark_post_unread(post["uri"])
-                post["is_read"] = 0
-        self._updateStatusBar()
-        _announce_now(f"Marked {len(posts)} posts as {'read' if read else 'unread'}.")
-
+    # _markSelectedRead lives on ItemActionMixin now (used by every
+    # host class, not just FeedWindow) -- FeedWindow inherits it.
     # _postInvolvesUser/_jumpToUserPost/onNewPost moved to FeedListMixin
     # (see plan-09.md) so ListsWindow can share them via SUPPORTS_*
     # flags -- nothing left to define here, FeedWindow inherits them.
@@ -2231,6 +2690,831 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
     # above) -- Escape/Ctrl+W are still deliberately not handled here:
     # Home is a permanent tab now, so both bubble up to MainWindow.
 
+class StarterPackDetailsDialog(wx.Dialog):
+    """Read-only starter pack info, plus the same actions available
+    from the results-list context menu -- so the user doesn't have to
+    close this and reopen the menu separately."""
+
+    def __init__(self, parent, pack, full):
+        self._pack = pack
+        record = getattr(full, "record", None)
+        title = getattr(record, "name", None) or "Starter pack"
+        super().__init__(parent, title=f"{title} - Starter pack", size=(500, 420))
+
+        profiles = getattr(full, "list_items_sample", None) or []
+        lines = [
+            f"Name: {title}",
+            f"Creator: @{full.creator.handle}",
+            f"Description: {getattr(record, 'description', '') or '(none)'}",
+            f"Members: {len(profiles)}",
+        ]
+        if profiles:
+            lines.append("")
+            lines.append("People included:")
+            lines.extend(f"  @{item.subject.handle}" for item in profiles)
+        feeds = getattr(full, "feeds", None) or []
+        if feeds:
+            lines.append("")
+            lines.append("Feeds included:")
+            lines.extend(f"  {f.display_name}" for f in feeds)
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        textCtrl = wx.TextCtrl(self, value="\n".join(lines), style=wx.TE_MULTILINE | wx.TE_READONLY)
+        sizer.Add(textCtrl, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+
+        btnSizer = wx.BoxSizer(wx.HORIZONTAL)
+        followBtn = wx.Button(self, label="&Follow everyone in this pack")
+        openBtn = wx.Button(self, label="&Open on bsky.app")
+        closeBtn = wx.Button(self, label="&Close")
+        btnSizer.Add(followBtn, flag=wx.RIGHT, border=5)
+        btnSizer.Add(openBtn, flag=wx.RIGHT, border=5)
+        btnSizer.Add(closeBtn)
+        sizer.Add(btnSizer, flag=wx.ALIGN_CENTER | wx.ALL, border=10)
+
+        self.SetSizer(sizer)
+        self.CentreOnScreen()
+
+        followBtn.Bind(wx.EVT_BUTTON, lambda e: self._doFollow())
+        openBtn.Bind(wx.EVT_BUTTON, lambda e: self._doOpen())
+        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        self.Bind(wx.EVT_CLOSE, self.onClose)
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+
+    def _doFollow(self):
+        parent = self.GetParent()
+        pack = self._pack
+        self.Close()
+        parent._followStarterPack(pack)
+
+    def _doOpen(self):
+        parent = self.GetParent()
+        pack = self._pack
+        self.Close()
+        parent._openStarterPackInBrowser(pack)
+
+    def onCharHook(self, evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        evt.Skip()
+
+    def onClose(self, evt):
+        gui.mainFrame.postPopup()
+        self.Destroy()
+
+
+class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMixin, EmbedViewMixin, wx.Panel):
+    """Posts result type reuses FeedListMixin fully (search results
+    hydrated into the same posts cache via client.search_posts_hydrated,
+    same as notifications' resolve_posts -- Post action/React/Reply/
+    View thread all just work). People/Starter packs/Feeds are simpler
+    dedicated lists swapped in via Show/Hide, People reusing
+    UserActionMixin's menu the same way ManageGroupMembersDialog does.
+    _dbGetPage/_syncPage are unused stubs -- this never goes through
+    FeedListMixin's cache/pagination path, only _runSearch below."""
+
+    TAB_KEY = "explore"
+    SUPPORTS_SELECT_ALL = True
+    SUPPORTS_FOCUS_NEXT_UNREAD = True
+    RESULT_TYPES = ["Posts", "People", "Starter packs", "Feeds"]
+    SEARCH_DEBOUNCE_MS = 800
+
+    def _addAdvField(self, panel, sizer, label):
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(panel, label=label), flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
+        ctrl = wx.TextCtrl(panel)
+        row.Add(ctrl, proportion=1)
+        sizer.Add(row, flag=wx.EXPAND | wx.BOTTOM, border=5)
+        return ctrl
+
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        self._account = db.get_active_account()
+        self.TAB_NAME = "Explore"
+        self._feedKey = "explore"
+        self._tracksUnread = False
+        self._initFeedListState()
+        self._users = []
+        self._starterPacks = []
+        self._feeds = []
+        self._advExpanded = False
+        self._sourceQuery = None
+        self._filters = {}
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        searchRow = wx.BoxSizer(wx.HORIZONTAL)
+        searchLabel = wx.StaticText(self, label="&Search:")
+        self.searchText = wx.TextCtrl(self)
+        searchRow.Add(searchLabel, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
+        searchRow.Add(self.searchText, proportion=1)
+        sizer.Add(searchRow, flag=wx.EXPAND | wx.ALL, border=10)
+
+        self.typeRadio = wx.RadioBox(
+            self, label="Result type", choices=self.RESULT_TYPES, majorDimension=1, style=wx.RA_SPECIFY_ROWS
+        )
+        sizer.Add(self.typeRadio, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+
+        # LOW CONFIDENCE -- since/until/author/lang params never tested
+        # against a real server, recalled from general lexicon
+        # knowledge not a debug_dump. Only used for Posts.
+        # wx.CollapsiblePane instead of a checkbox -- it doesn't
+        # support native mnemonic dispatch, so the & in the label is
+        # cosmetic only; real Alt+V activation is wired up via a
+        # manual AcceleratorTable below (see onToggleAdvancedAccel).
+        # State text ("expanded"/"collapsed") is written into the
+        # label by hand rather than relying on any automatic
+        # accessible-state announcement.
+        # Plain wx.Button + wx.Panel instead of wx.CollapsiblePane --
+        # CollapsiblePane's internal child structure fires TWO
+        # accessibility events on Windows (its own UIA wrapper plus the
+        # underlying native disclosure triangle), which reads the
+        # label twice the first time focus lands on it -- confirmed
+        # unfixable from the wx/app side (see plan-13.md follow-up). A
+        # plain Button is a single atomic control and never has this.
+        self.advBtn = wx.Button(self, label="")
+        sizer.Add(self.advBtn, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+
+        self.advPanel = wx.Panel(self)
+        advSizer = wx.BoxSizer(wx.VERTICAL)
+        self.advFromText = self._addAdvField(self.advPanel, advSizer, "&From handle:")
+        self.advSinceText = self._addAdvField(self.advPanel, advSizer, "S&ince (YYYY-MM-DD):")
+        self.advUntilText = self._addAdvField(self.advPanel, advSizer, "&Until (YYYY-MM-DD):")
+        self.advLangText = self._addAdvField(self.advPanel, advSizer, "&Language:")
+        self.advPanel.SetSizer(advSizer)
+        sizer.Add(self.advPanel, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        self._setAdvExpanded(False, layout=False)
+        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
+        
+        self._buildFeedListColumns()
+        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+
+        self.peopleList = wx.ListCtrl(self, style=wx.LC_REPORT)
+        self.userList = self.peopleList  # UserListMixin operates on self.userList
+        self._buildUserListColumns()
+        sizer.Add(self.peopleList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+        self.peopleList.Hide()
+
+        self.starterPacksList = wx.ListCtrl(self, style=wx.LC_REPORT)
+        self.starterPacksList.InsertColumn(0, "Name", width=200)
+        self.starterPacksList.InsertColumn(1, "Creator", width=180)
+        self.starterPacksList.InsertColumn(2, "Description", width=300)
+        sizer.Add(self.starterPacksList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+        self.starterPacksList.Hide()
+
+        self.feedsResultList = wx.ListCtrl(self, style=wx.LC_REPORT)
+        self.feedsResultList.InsertColumn(0, "Name", width=200)
+        self.feedsResultList.InsertColumn(1, "Creator", width=180)
+        self.feedsResultList.InsertColumn(2, "Description", width=250)
+        self.feedsResultList.InsertColumn(3, "Likes", width=80)
+        sizer.Add(self.feedsResultList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+        self.feedsResultList.Hide()
+
+        actionRow = wx.BoxSizer(wx.HORIZONTAL)
+        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
+        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
+        self.resultActionButton = wx.Button(self, label="Action...")
+        self.openInTabButton = wx.Button(self, label="Open in new &tab")
+        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
+        actionRow.Add(self.userActionButton, flag=wx.RIGHT, border=5)
+        actionRow.Add(self.resultActionButton, flag=wx.RIGHT, border=5)
+        actionRow.Add(self.openInTabButton)
+        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+
+        self.statusBar = wx.StatusBar(self)
+        sizer.Add(self.statusBar, flag=wx.EXPAND)
+
+        self.SetSizer(sizer)
+
+        self._debounceTimer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.onDebounceTimer, self._debounceTimer)
+        self.searchText.Bind(wx.EVT_TEXT, self.onSearchTextChanged)
+        self.typeRadio.Bind(wx.EVT_RADIOBOX, self.onTypeChanged)
+        self.advBtn.Bind(wx.EVT_BUTTON, self.onAdvBtnClick)
+        self._advToggleId = wx.NewIdRef()
+        self.Bind(wx.EVT_MENU, self.onToggleAdvancedAccel, id=self._advToggleId)
+        # Bound to this panel, not a true top-level window -- per
+        # testing, Alt+V won't fire while focus is already deep inside
+        # the pane's own child fields (advFromText etc). Accepted
+        # limitation rather than plumbing this up to MainWindow.
+        self.SetAcceleratorTable(wx.AcceleratorTable([(wx.ACCEL_ALT, ord("V"), self._advToggleId)]))
+        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
+        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
+        self.resultActionButton.Bind(wx.EVT_BUTTON, self.onResultAction)
+        self.openInTabButton.Bind(wx.EVT_BUTTON, lambda e: self._openInNewTab())
+        self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
+        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onItemActivated)
+        self.peopleList.Bind(wx.EVT_CONTEXT_MENU, self.onPeopleContextMenu)
+        self.starterPacksList.Bind(wx.EVT_CONTEXT_MENU, self.onStarterPackContextMenu)
+        self.feedsResultList.Bind(wx.EVT_CONTEXT_MENU, self.onFeedResultContextMenu)
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+
+        self._updateTitle()
+        self._showResultListForType()
+        self._updateStatusBar()
+
+    def _setAdvExpanded(self, expanded, layout=True):
+        self._advExpanded = expanded
+        self.advPanel.Show(expanded)
+        status = "expanded" if expanded else "collapsed"
+        self.advBtn.SetLabel(f"Ad&vanced search ({status})")
+        if layout:
+            self.Layout()
+
+    def onAdvBtnClick(self, evt):
+        self._setAdvExpanded(not self._advExpanded)
+        if self._advExpanded:
+            self.advFromText.SetFocus()
+
+    def onToggleAdvancedAccel(self, evt):
+        if self._currentType() != "Posts":
+            return
+        self._setAdvExpanded(not self._advExpanded)
+        self.advBtn.SetFocus()
+        
+    def _restoreFocusPosition(self, moveFocus=True):
+        if self.FindFocus() is self.searchText:
+            return  # never steal focus while the user is actively typing
+        if not getattr(self, "_didInitialFocus", False):
+            self._didInitialFocus = True
+            if moveFocus:
+                self.searchText.SetFocus()
+            return
+        # Later calls (F5/refresh, debounced re-search) fall through to
+        # the normal FeedListMixin behavior (focus the result list) --
+        # only the very first ever call goes to the search box.
+        super()._restoreFocusPosition(moveFocus=moveFocus)
+
+    def onTabActivated(self):
+        nvdaUi.message(f"{self.TAB_NAME} tab")
+        self.searchText.SetFocus()
+
+    def onCheckForUpdates(self, evt):
+        self._runSearch()
+
+    # ---------------- FeedListMixin contract -- unused, search bypasses the cache path ----------------
+
+    def _dbGetPage(self, before_indexed_at=None, limit=None):
+        if not self._feedKey:
+            return []
+        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
+
+    def _dbGetUnreadCount(self):
+        return 0
+
+    def _syncPage(self, atprotoClient, cursor, limit):
+        # NOTE: guard on _sourceQuery, not _feedKey -- _feedKey is set
+        # to a fixed "explore" placeholder from __init__ (so
+        # _dbGetPage works before any search), so it's always truthy
+        # and never actually guards anything here. _sourceQuery is the
+        # real "has a Posts search actually run yet" signal; without
+        # this guard, Ctrl+F5's checkAllOpenTabs hit this on every
+        # untouched Explore tab and called search_posts(q=None).
+        if not self._sourceQuery:
+            return None
+        return client.sync_search_page(
+            atprotoClient, self._account["id"], self._feedKey, self._sourceQuery, cursor=cursor, limit=limit,
+            author=self._filters.get("author"), since=self._filters.get("since"),
+            until=self._filters.get("until"), lang=self._filters.get("lang"),
+        )
+
+    def _markItemRead(self, post):
+        db.mark_post_read(post["uri"])
+
+    def _getSelectedPosts(self):
+        indices = []
+        i = self.postList.GetFirstSelected()
+        while i != -1:
+            indices.append(i)
+            i = self.postList.GetNextSelected(i)
+        return [self._posts[i] for i in indices if 0 <= i < len(self._posts)]
+
+    def _render(self):
+        super()._render()
+        if self._currentType() == "Posts":
+            self._updateActionButtons()
+
+    # ---------------- search ----------------
+
+    def onSearchTextChanged(self, evt):
+        self._debounceTimer.Stop()
+        if self.searchText.GetValue().strip():
+            self._debounceTimer.StartOnce(self.SEARCH_DEBOUNCE_MS)
+
+    def onDebounceTimer(self, evt):
+        self._runSearch()
+
+    def onTypeChanged(self, evt):
+        self._showResultListForType()
+        self._runSearch()
+
+    def _currentType(self):
+        return self.RESULT_TYPES[self.typeRadio.GetSelection()]
+
+    def onCharHook(self, evt):
+        # Alt+A/Alt+U for non-Posts result types needs to route to
+        # onResultAction/onPeopleContextMenu instead of the generic
+        # ItemActionMixin.onCharHook's onPostAction()/onUserAction() --
+        # those act on self.postList's focused post regardless of
+        # which result list actually has focus, so Alt+A on a stale
+        # Posts search's leftover focused post was firing instead of
+        # the Feeds/Starter packs/People action shown on the "Action..."
+        # button's own label. Posts stays on the normal mixin path.
+        if self._currentType() != "Posts":
+            keyCode = evt.GetKeyCode()
+            if evt.AltDown() and keyCode == ord("A"):
+                self.onResultAction()
+                return
+            if evt.AltDown() and keyCode == ord("U") and self._currentType() == "People":
+                self.onResultAction()
+                return
+            # Alt+1-9 (announce Nth newest post) and Shift+F5 (fetch
+            # older posts) both read/act on self._posts unconditionally
+            # in the generic ItemActionMixin handler below, same class
+            # of bug Alt+A had -- self._posts is Posts-search-only here,
+            # so these would announce a stale/empty post instead of
+            # doing anything meaningful for People/Starter packs/Feeds
+            # results. Space and Ctrl+A don't need the same treatment,
+            # they already guard on self.FindFocus() is self.postList.
+            if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
+                self._announceNthResult(keyCode - ord("0"))
+                return
+            if keyCode == wx.WXK_F5 and evt.ShiftDown():
+                return
+        super().onCharHook(evt)
+
+    def _announceNthResult(self, n):
+        listCtrl, data = {
+            "People": (self.peopleList, self._users),
+            "Starter packs": (self.starterPacksList, self._starterPacks),
+            "Feeds": (self.feedsResultList, self._feeds),
+        }[self._currentType()]
+        if not (1 <= n <= len(data)):
+            nvdaUi.message(f"No item {n}.")
+            return
+        index = n - 1
+        parts = [listCtrl.GetItemText(index, col) for col in range(listCtrl.GetColumnCount())]
+        _announce_now(", ".join(p for p in parts if p))
+
+    def _showResultListForType(self):
+        resultType = self._currentType()
+        self.postList.Show(resultType == "Posts")
+        self.peopleList.Show(resultType == "People")
+        self.starterPacksList.Show(resultType == "Starter packs")
+        self.feedsResultList.Show(resultType == "Feeds")
+        self.advBtn.Show(resultType == "Posts")
+        if resultType != "Posts":
+            self._setAdvExpanded(False, layout=False)
+        self._updateActionButtons()
+
+    def _userListLabel(self):
+        return f"{len(self._users)} people found."
+
+    def _updateActionButtons(self):
+        resultType = self._currentType()
+        counts = {"Posts": len(self._posts), "People": len(self._users),
+                  "Starter packs": len(self._starterPacks), "Feeds": len(self._feeds)}
+        hasResults = counts.get(resultType, 0) > 0
+        self.postActionButton.Show(resultType == "Posts" and hasResults)
+        self.userActionButton.Show(resultType == "Posts" and hasResults)
+        self.resultActionButton.Show(resultType != "Posts" and hasResults)
+        self.openInTabButton.Show(resultType in ("Posts", "People") and hasResults)
+        labels = {"People": "User action... (Alt+U)", "Starter packs": "Pack action... (Alt+A)", "Feeds": "Feed action... (Alt+A)"}
+        if resultType in labels:
+            self.resultActionButton.SetLabel(labels[resultType])
+        self.Layout()
+
+    def onResultAction(self, evt=None):
+        resultType = self._currentType()
+        if resultType == "People":
+            self.onPeopleContextMenu(None)
+        elif resultType == "Starter packs":
+            self.onStarterPackContextMenu(None)
+        elif resultType == "Feeds":
+            self.onFeedResultContextMenu(None)
+
+    def _getActionablePost(self):
+        post = self._getFocusedPost()
+        if post is None:
+            nvdaUi.message("No post selected.")
+        return post
+
+    def onUserAction(self, evt=None):
+        if self.postList.GetSelectedItemCount() > 1:
+            nvdaUi.message("User action needs a single post selected.")
+            return
+        post = self._getFocusedPost()
+        if post is None:
+            nvdaUi.message("No post selected.")
+            return
+        users = self._getRelevantUsers(post)
+        if len(users) == 1:
+            _, did, handle = users[0]
+            self.showUserActionMenu(did, handle)
+            return
+        menu = wx.Menu()
+        for label, did, handle in users:
+            submenu = wx.Menu()
+            self._populateUserActionMenu(submenu, did, handle)
+            menu.AppendSubMenu(submenu, label)
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _runSearch(self):
+        query = self.searchText.GetValue().strip()
+        if not query or self._account is None:
+            return
+        resultType = self._currentType()
+
+        if resultType == "Posts":
+            self._sourceQuery = query
+            self._filters = {
+                "author": self.advFromText.GetValue().strip() or None,
+                "since": self.advSinceText.GetValue().strip() or None,
+                "until": self.advUntilText.GetValue().strip() or None,
+                "lang": self.advLangText.GetValue().strip() or None,
+            }
+            self._feedKey = _search_feed_key(query, self._filters)
+            # onCheckForUpdates (not _loadFromCache directly) is what
+            # actually calls _syncPage -- _loadFromCache alone only
+            # reads whatever's already cached under _feedKey, which is
+            # why a fresh query showed 0 and a repeated one silently
+            # showed stale results.
+            super().onCheckForUpdates(None)
+            return
+
+        nvdaUi.message("Searching...")
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                if resultType == "People":
+                    results = client.search_actors(atprotoClient, query)
+                elif resultType == "Starter packs":
+                    results = client.search_starter_packs(atprotoClient, query)
+                else:
+                    results = client.search_feeds(atprotoClient, query)
+                error = None
+            except Exception as e:
+                results = None
+                error = str(e)
+            wx.CallAfter(self._onSearchDone, resultType, query, results, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onSearchDone(self, resultType, query, results, error):
+        if query != self.searchText.GetValue().strip() or resultType != self._currentType():
+            return
+        if error is not None:
+            nvdaUi.message(f"Search failed: {error}")
+            return
+        if resultType == "People":
+            self._users = [
+                {
+                    "did": a.did, "handle": a.handle,
+                    "display_name": getattr(a, "display_name", None),
+                    "description": getattr(a, "description", None),
+                }
+                for a in results.actors
+            ]
+            self._renderUsers()
+            nvdaUi.message(f"{len(self._users)} people found.")
+        elif resultType == "Starter packs":
+            self._starterPacks = list(results.starter_packs)
+            self._renderStarterPacks()
+            nvdaUi.message(f"{len(self._starterPacks)} starter packs found.")
+        else:
+            self._feeds = list(getattr(results, "feeds", []))
+            self._renderFeeds()
+            nvdaUi.message(f"{len(self._feeds)} feeds found.")
+        self._updateActionButtons()
+
+    def onPeopleContextMenu(self, evt):
+        user = self._getFocusedUser()
+        if user is None:
+            return
+        self.showUserActionMenu(user["did"], user["handle"], user.get("display_name"))
+
+    def _renderStarterPacks(self):
+        self.starterPacksList.DeleteAllItems()
+        for i, pack in enumerate(self._starterPacks):
+            record = pack.record
+            self.starterPacksList.InsertItem(i, getattr(record, "name", "Starter pack"))
+            creator = getattr(pack, "creator", None)
+            self.starterPacksList.SetItem(i, 1, f"@{creator.handle}" if creator else "")
+            self.starterPacksList.SetItem(i, 2, (getattr(record, "description", None) or "").replace("\n", " "))
+        if self._starterPacks:
+            self.starterPacksList.Focus(0)
+            self.starterPacksList.Select(0)
+
+    def onStarterPackContextMenu(self, evt):
+        index = self.starterPacksList.GetFocusedItem()
+        if index == -1 or index >= len(self._starterPacks):
+            return
+        pack = self._starterPacks[index]
+        menu = wx.Menu()
+        self._addMenuItem(menu, "View pack details...", lambda: self._viewStarterPackDetails(pack))
+        self._addMenuItem(menu, "Follow everyone in this pack", lambda: self._followStarterPack(pack))
+        self._addMenuItem(menu, "Open on bsky.app", lambda: self._openStarterPackInBrowser(pack))
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _followStarterPack(self, pack):
+        nvdaUi.message("Following everyone in the pack...")
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                full = client.get_starter_pack_full(atprotoClient, pack.uri)
+                count = client.follow_starter_pack_members(atprotoClient, full)
+                error = None
+            except Exception as e:
+                count = 0
+                error = str(e)
+            wx.CallAfter(self._onFollowStarterPackDone, count, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onFollowStarterPackDone(self, count, error):
+        if error:
+            nvdaUi.message(f"Could not follow pack members: {error}")
+            return
+        nvdaUi.message(f"Followed {count} new {'person' if count == 1 else 'people'}.")
+
+    def _viewStarterPackDetails(self, pack):
+        nvdaUi.message("Loading pack details...")
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                full = client.get_starter_pack_full(atprotoClient, pack.uri)
+                error = None
+            except Exception as e:
+                full = None
+                error = str(e)
+            wx.CallAfter(self._onStarterPackDetailsDone, pack, full, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onStarterPackDetailsDone(self, pack, full, error):
+        if error or full is None:
+            nvdaUi.message(f"Could not load pack details: {error or 'no data returned'}")
+            return
+        StarterPackDetailsDialog(self, pack, full).Show()
+
+    def _openStarterPackInBrowser(self, pack):
+        rkey = pack.uri.rsplit("/", 1)[-1]
+        creator = getattr(pack, "creator", None)
+        webbrowser.open(f"https://bsky.app/starter-pack/{creator.handle if creator else ''}/{rkey}")
+
+    def _renderFeeds(self):
+        self.feedsResultList.DeleteAllItems()
+        for i, feedGen in enumerate(self._feeds):
+            self.feedsResultList.InsertItem(i, feedGen.display_name or "Feed")
+            creator = getattr(feedGen, "creator", None)
+            self.feedsResultList.SetItem(i, 1, f"@{creator.handle}" if creator else "")
+            self.feedsResultList.SetItem(i, 2, (feedGen.description or "").replace("\n", " "))
+            self.feedsResultList.SetItem(i, 3, str(getattr(feedGen, "like_count", 0) or 0))
+        if self._feeds:
+            self.feedsResultList.Focus(0)
+            self.feedsResultList.Select(0)
+
+    def onFeedResultContextMenu(self, evt):
+        index = self.feedsResultList.GetFocusedItem()
+        if index == -1 or index >= len(self._feeds):
+            return
+        feedGen = self._feeds[index]
+        menu = wx.Menu()
+        self._addMenuItem(menu, "View feed...", lambda: self._viewFeed(feedGen))
+        self._addMenuItem(menu, "Add to my feeds", lambda: self._addFeed(feedGen))
+        self._addMenuItem(
+            menu, "Open on bsky.app",
+            lambda: webbrowser.open(f"https://bsky.app/profile/{feedGen.creator.handle}/feed/{feedGen.uri.rsplit('/', 1)[-1]}"),
+        )
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _viewFeed(self, feedGen):
+        mainWindow = self.GetTopLevelParent()
+        name = feedGen.display_name or "Feed"
+        panel = FeedPreviewTabWindow(mainWindow.notebook, name, "feed", feedGen.uri, origin_key="explore")
+        mainWindow.addTab(panel, name, select=True, removable=True)
+        db.add_open_temp_tab(self._account["id"], {
+            "type": "search_preview", "key": panel._feedKey, "kind": "feed", "source_key": feedGen.uri,
+            "name": name, "origin_key": "explore",
+        })
+
+    def onPostAction(self, evt=None):
+        super().onPostAction(evt)
+
+    def _openSearchInNewTab(self):
+        if not self._feedKey or self._currentType() != "Posts":
+            nvdaUi.message("Search for posts first.")
+            return
+        mainWindow = self.GetTopLevelParent()
+        name = f'Search: {self._sourceQuery}'
+        panel = FeedPreviewTabWindow(
+            mainWindow.notebook, name, "search", self._sourceQuery,
+            filters=self._filters, feed_key=self._feedKey, origin_key="explore",
+        )
+        mainWindow.addTab(panel, name, select=True, removable=True)
+        db.add_open_temp_tab(self._account["id"], {
+            "type": "search_preview", "key": self._feedKey, "kind": "search", "source_key": self._sourceQuery,
+            "name": name, "filters": self._filters, "origin_key": "explore",
+        })
+
+    def _openInNewTab(self):
+        if self._currentType() == "People":
+            self._openUserSearchInNewTab()
+        else:
+            self._openSearchInNewTab()
+
+    def _openUserSearchInNewTab(self):
+        query = self.searchText.GetValue().strip()
+        if not query:
+            nvdaUi.message("Search for people first.")
+            return
+        mainWindow = self.GetTopLevelParent()
+        identity = {"kind": "user_list", "key": f"search:{query}"}
+        if mainWindow.focusTabByIdentity(identity):
+            return
+        tab = UserListTabWindow(mainWindow.notebook, "search", query, origin_key="explore")
+        mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
+        if self._account is not None:
+            db.add_open_temp_tab(self._account["id"], {
+                "type": "user_list", "key": f"search:{query}", "list_kind": "search",
+                "query": query, "origin_key": "explore",
+            })
+
+    def _getActionablePost(self):
+        post = self._getFocusedPost()
+        if post is None:
+            nvdaUi.message("No post selected.")
+        return post
+
+    def onUserAction(self, evt=None):
+        if self.postList.GetSelectedItemCount() > 1:
+            nvdaUi.message("User action needs a single post selected.")
+            return
+        post = self._getFocusedPost()
+        if post is None:
+            nvdaUi.message("No post selected.")
+            return
+        users = self._getRelevantUsers(post)
+        if len(users) == 1:
+            _, did, handle = users[0]
+            self.showUserActionMenu(did, handle)
+            return
+        menu = wx.Menu()
+        for label, did, handle in users:
+            submenu = wx.Menu()
+            self._populateUserActionMenu(submenu, did, handle)
+            menu.AppendSubMenu(submenu, label)
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _addFeed(self, feedGen):
+        nvdaUi.message("Adding feed...")
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                added = client.add_feed_to_saved(atprotoClient, feedGen.uri)
+                error = None
+            except Exception as e:
+                added = False
+                error = str(e)
+            wx.CallAfter(self._onAddFeedDone, added, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onAddFeedDone(self, added, error):
+        if error:
+            nvdaUi.message(f"Could not add feed: {error}")
+            return
+        nvdaUi.message("Feed added." if added else "Already in your feeds.")
+
+
+def _search_feed_key(query, filters):
+    filters = filters or {}
+    parts = [query, filters.get("author") or "", filters.get("since") or "", filters.get("until") or "", filters.get("lang") or ""]
+    return "search:" + "|".join(parts)
+
+
+class FeedPreviewTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
+    """Popped-out feed generator or pinned search -- structurally a
+    clone of ListTabWindow (real cached/paginated feed via
+    _dbGetPage/_syncPage), not a one-shot fetch. kind is "feed" or
+    "search"; source_key is the feed_uri or search query."""
+
+    SUPPORTS_FOCUS_NEXT_UNREAD = True
+    SUPPORTS_SELECT_ALL = True
+
+    def __init__(self, parent, tab_name: str, kind: str, source_key: str, filters: dict = None, feed_key: str = None, origin_key: str = None):
+        super().__init__(parent)
+
+        self._account = db.get_active_account()
+        self.TAB_NAME = tab_name
+        self._kind = kind
+        self._sourceKey = source_key
+        self._filters = filters or {}
+        self._feedKey = feed_key or (source_key if kind == "feed" else _search_feed_key(source_key, self._filters))
+        self._originTabKey = origin_key
+        self.TAB_TEMP_TYPE = "search_preview"
+        self.TAB_TEMP_KEY = self._feedKey
+        self._tracksUnread = True
+        self._initFeedListState()
+
+        extraWidgets = None
+        if kind == "feed":
+            self.addFeedButton = wx.Button(self, label="&Add to my feeds")
+            extraWidgets = [self.addFeedButton]
+
+        self._buildStandardFeedSizer(extra_action_widgets=extraWidgets)
+        self._bindStandardFeedEvents()
+        if kind == "feed":
+            self.addFeedButton.Bind(wx.EVT_BUTTON, lambda e: self._addFeedFromPreview())
+
+        self._finishStandardFeedInit(sync_if_empty=True)
+
+    def onTabActivated(self):
+        self._render()
+        if self._account is not None:
+            nvdaUi.message(f"{self.TAB_NAME} tab")
+            self._restoreFocusPosition()
+
+    def onTabRemoved(self):
+        for value in vars(self).values():
+            if isinstance(value, wx.Timer):
+                value.Stop()
+        if self._account:
+            db.remove_open_temp_tab(self._account["id"], self.TAB_TEMP_TYPE, self.TAB_TEMP_KEY)
+        self._jumpBackToOrigin()
+
+    def _getActionablePost(self):
+        post = self._getFocusedPost()
+        if post is None:
+            nvdaUi.message("No post selected.")
+        return post
+
+    def onUserAction(self, evt=None):
+        post = self._getFocusedPost()
+        if post is None:
+            nvdaUi.message("No post selected.")
+            return
+        self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
+
+    def _dbGetPage(self, before_indexed_at=None, limit=None):
+        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
+
+    def _dbGetUnreadCount(self):
+        return 0
+
+    def _syncPage(self, atprotoClient, cursor, limit):
+        if not self._sourceKey:
+            return None
+        if self._kind == "feed":
+            return client.sync_feed_generator_page(atprotoClient, self._account["id"], self._sourceKey, cursor=cursor, limit=limit)
+        return client.sync_search_page(
+            atprotoClient, self._account["id"], self._feedKey, self._sourceKey, cursor=cursor, limit=limit,
+            author=self._filters.get("author"), since=self._filters.get("since"),
+            until=self._filters.get("until"), lang=self._filters.get("lang"),
+        )
+
+    def _markItemRead(self, post):
+        db.mark_post_read(post["uri"])
+        
+
+    def _addFeedFromPreview(self):
+        self.addFeedButton.Disable()
+        nvdaUi.message("Adding feed...")
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                added = client.add_feed_to_saved(atprotoClient, self._sourceKey)
+                error = None
+            except Exception as e:
+                added = False
+                error = str(e)
+            wx.CallAfter(self._onAddFeedFromPreviewDone, added, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onAddFeedFromPreviewDone(self, added, error):
+        self.addFeedButton.Enable()
+        if error:
+            nvdaUi.message(f"Could not add feed: {error}")
+            return
+        nvdaUi.message("Feed added." if added else "Already in your feeds.")
+
+
 class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     TAB_KEY = "saved"
 
@@ -2258,37 +3542,9 @@ class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         self._tracksUnread = False
         self._initFeedListState()
 
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self._buildFeedListColumns()
-        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        self.statusBar = wx.StatusBar(self)
-        sizer.Add(self.statusBar, flag=wx.EXPAND)
-
-        self.SetSizer(sizer)
-
-        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
-        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onItemActivated)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        self._updateTitle()
-        self._loadFromCache(reset=True)
-
-        if self._account is None:
-            nvdaUi.message("No active account. Log in from Settings first.")
-        else:
-            self._restoreFocusPosition(moveFocus=False)
+        self._buildStandardFeedSizer()
+        self._bindStandardFeedEvents()
+        self._finishStandardFeedInit()
 
     def onTabActivated(self):
         self._render()
@@ -2562,11 +3818,12 @@ class SubscribeListDialog(wx.Dialog):
         mainWindow = self.GetParent().GetTopLevelParent()
         account = db.get_active_account()
         for i, lst in enumerate(curateLists):
-            tab = ListTabWindow(mainWindow.notebook, lst["uri"], lst["name"])
+            tab = ListTabWindow(mainWindow.notebook, lst["uri"], lst["name"], origin_key="lists")
             mainWindow.addTab(tab, lst["name"], select=(i == len(curateLists) - 1), removable=True)
             if account is not None:
                 db.add_open_temp_tab(account["id"], {
                     "type": "list", "key": lst["uri"], "list_uri": lst["uri"], "list_name": lst["name"],
+                    "origin_key": "lists",
                 })
         nvdaUi.message(f"Opened {len(curateLists)} list{'s' if len(curateLists) != 1 else ''} as tabs.")
 
@@ -3305,13 +4562,16 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             nvdaUi.message("Moderation lists don't have a timeline to open in a tab.")
             return
         mainWindow = self.GetTopLevelParent()
-        tab = ListTabWindow(mainWindow.notebook, self._selectedList["list_uri"], self._selectedList["name"])
+        tab = ListTabWindow(
+            mainWindow.notebook, self._selectedList["list_uri"], self._selectedList["name"], origin_key="lists"
+        )
         mainWindow.addTab(tab, self._selectedList["name"], select=True, removable=True)
         db.add_open_temp_tab(self._account["id"], {
             "type": "list",
             "key": self._selectedList["list_uri"],
             "list_uri": self._selectedList["list_uri"],
             "list_name": self._selectedList["name"],
+            "origin_key": "lists",
         })
 
     def onManageMembers(self, evt=None):
@@ -3362,12 +4622,75 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             self.onUserAction()
         
     def _syncForBulkCheck(self, atprotoClient):
-        self._syncListsFromServer()
+        # Was calling self._syncListsFromServer(), which spawns its OWN
+        # separate background thread and its OWN separate
+        # client.get_client_for_active_account() login -- called from
+        # INSIDE the bulk-check flow's already-shared background thread,
+        # this raced a second concurrent login against the one
+        # checkAllOpenTabs already holds, exactly the class of bug the
+        # shared-thread design was meant to avoid (see MainWindow.
+        # checkAllOpenTabs' own comment). Also fire-and-forget, so this
+        # method's return value never reflected whether anything
+        # actually changed -- confirmed as the cause of "Lists doesn't
+        # announce AND doesn't update" during Ctrl+F5. Do the list-sync
+        # work directly here instead, synchronously, on the SAME
+        # atprotoClient/thread the caller already established.
+        beforeSnapshot = {l["list_uri"]: l.get("muted") for l in self._lists}
+        entries = client.get_lists(atprotoClient, self._account["did"])
+        for entry in entries:
+            db.upsert_list({
+                "account_id": self._account["id"],
+                "list_uri": entry["uri"],
+                "cid": entry["cid"],
+                "name": entry["name"],
+                "description": entry["description"],
+                "purpose": entry["purpose"],
+                "creator_did": entry["creator_did"],
+                "creator_handle": entry["creator_handle"],
+                "muted": int(entry["muted"]),
+                "blocked_uri": entry["blocked_uri"],
+            })
+        afterLists = db.get_lists(self._account["id"])
+        afterSnapshot = {l["list_uri"]: l.get("muted") for l in afterLists}
+        listsChanged = afterSnapshot != beforeSnapshot
+
+        curateChanged = False
         if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
-            return super()._syncForBulkCheck(atprotoClient)
-        return False  # a moderation list's member roster isn't a "new post" concept
+            curateChanged = super()._syncForBulkCheck(atprotoClient)
+
+        return listsChanged or curateChanged
 
     def _reloadAfterBulkCheck(self, moveFocus=True):
+        # _syncForBulkCheck above already wrote fresh list metadata to
+        # the DB synchronously -- rebuild the tree from it here instead
+        # of leaving it stale until the next explicit F5 (which still
+        # goes through the async _syncListsFromServer/_onSyncListsDone
+        # path unchanged).
+        selectedUri = self._selectedList["list_uri"] if self._selectedList else None
+        self._lists = db.get_lists(self._account["id"])
+        self.listTree.Freeze()
+        try:
+            self.listTree.DeleteAllItems()
+            self._listRoot = self.listTree.AddRoot("Lists")
+            for lst in self._lists:
+                item = self.listTree.AppendItem(self._listRoot, self._listLabel(lst))
+                self.listTree.SetItemData(item, lst["list_uri"])
+            item, cookie = self.listTree.GetFirstChild(self._listRoot)
+            selected = False
+            while item.IsOk():
+                if self.listTree.GetItemData(item) == selectedUri:
+                    self.listTree.SelectItem(item)
+                    selected = True
+                    break
+                item, cookie = self.listTree.GetNextChild(self._listRoot, cookie)
+            if not selected:
+                firstItem, _cookie = self.listTree.GetFirstChild(self._listRoot)
+                if firstItem.IsOk():
+                    self.listTree.SelectItem(firstItem)
+        finally:
+            self.listTree.Thaw()
+        self._updateListsStatusBar()
+
         if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
             super()._reloadAfterBulkCheck(moveFocus=moveFocus)
         elif self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
@@ -3381,7 +4704,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             self._loadMembersLive()
 
 
-class ListTabWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
+class ListTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     """
     A single curation list's timeline, popped out into its own
     removable tab via Lists' "Show in new tab" -- structurally a clone
@@ -3390,51 +4713,21 @@ class ListTabWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMi
     the main Lists tab.
     """
 
-    def __init__(self, parent, list_uri: str, list_name: str):
+    def __init__(self, parent, list_uri: str, list_name: str, origin_key: str = None):
         super().__init__(parent)
 
         self._account = db.get_active_account()
         self.TAB_NAME = list_name
-        # Generic identity MainWindow uses for its remember-last-tab
-        # feature (see _getTabIdentity in mainWindow.py) -- matches the
-        # "type"/"key" fields this tab is already stored under via
-        # db.add_open_temp_tab.
+        # Generic identity for MainWindow's remember-last-tab feature.
         self.TAB_TEMP_TYPE = "list"
         self.TAB_TEMP_KEY = list_uri
         self._feedKey = list_uri
+        self._originTabKey = origin_key
         self._initFeedListState()
 
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self._buildFeedListColumns()
-        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        self.statusBar = wx.StatusBar(self)
-        sizer.Add(self.statusBar, flag=wx.EXPAND)
-
-        self.SetSizer(sizer)
-
-        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
-        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onItemActivated)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        self._updateTitle()
-        self._loadFromCache(reset=True)
-
-        if self._account is None:
-            nvdaUi.message("No active account. Log in from Settings first.")
-        else:
-            self._restoreFocusPosition(moveFocus=False)
+        self._buildStandardFeedSizer()
+        self._bindStandardFeedEvents()
+        self._finishStandardFeedInit(sync_if_empty=True)
 
     def onTabActivated(self):
         self._render()
@@ -3487,12 +4780,15 @@ class ListTabWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMi
                 value.Stop()
         if self._account is not None:
             db.remove_open_temp_tab(self._account["id"], "list", self._feedKey)
+        self._jumpBackToOrigin()
 
     def onTabRenamed(self, newName):
         # MainWindow.renameCurrentTab() calls this (if present) right
         # after updating panel.TAB_NAME in memory -- persists the new
         # name into this tab's existing db.get_open_temp_tabs() entry
         # so it survives past this session (previously session-only).
+        # Overrides RemovableTabMixin's no-op stub -- ListTabWindow IS
+        # user-renameable, unlike the other RemovableTabMixin hosts.
         if self._account is not None:
             db.set_temp_tab_custom_name(self._account["id"], "list", self._feedKey, newName)
     

@@ -310,20 +310,21 @@ class ComposeDialog(wx.Dialog):
                         log.info(f"NVSky: link card fetch failed, posting without preview: {e}")
                         link_card = None
 
-                client.create_post(
+                createdPost = client.create_post(
                     atprotoClient, text, attachments=attachments, reply_ref=reply_ref,
                     quote_ref=quote_ref, link_card=link_card, facets=facets,
                 )
                 error = None
             except Exception as e:
+                createdPost = None
                 error = str(e)
-            wx.CallAfter(self._onPostDone, error)
+            wx.CallAfter(self._onPostDone, error, createdPost)
 
         threading.Thread(target=worker, daemon=True).start()
 
 
-    @uiutil.safe_ui_callback
-    def _onPostDone(self, error):
+    @uiutil.safe_ui_callback(check_app_closing=False)
+    def _onPostDone(self, error, createdPost=None):
         if error:
             self.postButton.Enable()
             self.cancelButton.Enable()
@@ -332,6 +333,8 @@ class ComposeDialog(wx.Dialog):
             nvdaUi.message(f"Failed to post: {error}")
             return
         self.posted = True
+        if createdPost:
+            self._insertOptimisticPost(createdPost)
         nvdaUi.message("Posted successfully.")
         # Delay the actual close instead of delaying whatever happens
         # after -- Close() is what jumps focus back to the parent window
@@ -339,3 +342,62 @@ class ComposeDialog(wx.Dialog):
         # Buttons are already disabled, so staying open silently for a
         # moment longer doesn't let anything unwanted happen.
         wx.CallLater(1000, self.Close)
+
+    def _insertOptimisticPost(self, createdPost):
+        """
+        Best-effort local insert of the just-created post into the Home
+        (Following) feed cache, then a quiet in-place re-render of an
+        already-open Home tab IF it's currently showing that feed --
+        never moves real focus. Fields the SDK's create_record response
+        doesn't give us client-side (like/repost counts, server-
+        processed image thumbnail URLs) are left blank/zero here; the
+        next real sync (manual or background) fills them in properly.
+        Any failure here is silently swallowed -- the post itself
+        already succeeded server-side regardless of whether this
+        cosmetic step works.
+        """
+        try:
+            account = db.get_active_account()
+            if account is None:
+                return
+            if db.get_author(account["did"]) is None:
+                db.upsert_author(
+                    did=account["did"], handle=account["handle"], display_name=None, avatar_url=None,
+                )
+            db.upsert_post({
+                "uri": createdPost["uri"],
+                "cid": createdPost["cid"],
+                "account_id": account["id"],
+                "author_did": account["did"],
+                "text": createdPost.get("text", ""),
+                "created_at": createdPost.get("created_at"),
+                "indexed_at": createdPost.get("created_at"),
+                "like_count": 0,
+                "repost_count": 0,
+                "reply_count": 0,
+                "reply_parent_uri": self._replyTo["uri"] if self._replyTo else None,
+                "reply_to_did": None,
+                "reply_to_handle": self._replyTo.get("handle") if self._replyTo else None,
+                "is_repost": 0,
+                "reposted_by_did": None,
+                "reposted_by_handle": None,
+                "reposted_by_display_name": None,
+                "embed_json": None,
+                "facets_json": None,
+                "quoted_text": self._quoteOf.get("text") if self._quoteOf else None,
+                "quoted_author_handle": self._quoteOf.get("handle") if self._quoteOf else None,
+                "viewer_like_uri": None,
+                "viewer_repost_uri": None,
+                "viewer_bookmarked": False,
+            })
+            db.upsert_feed_item(account["id"], "home", createdPost["uri"], createdPost.get("created_at"))
+
+            from . import get_main_window
+            mainWindow = get_main_window()
+            if mainWindow is None:
+                return
+            for panel in mainWindow.getOpenTabs():
+                if getattr(panel, "TAB_KEY", None) == "home" and getattr(panel, "_feedKey", None) == "home":
+                    panel._loadFromCache(reset=True)
+        except Exception as e:
+            log.error(f"NVSky: optimistic post insert failed (non-fatal): {e}")

@@ -79,7 +79,7 @@ def move_focus_and_check_announce(list_ctrl, index: int) -> bool:
     return not hadRealFocus or previousIndex == index
 
 
-def safe_ui_callback(func):
+def safe_ui_callback(func=None, *, check_app_closing=True):
     """
     Decorator for methods that are the target of wx.CallAfter(...)
     from a background worker thread (the self._onXxxDone pattern used
@@ -99,24 +99,46 @@ def safe_ui_callback(func):
     swallowed -- any other exception (including other RuntimeErrors)
     still propagates normally, so this can't hide unrelated bugs.
 
+    check_app_closing=False (default True) opts a method OUT of the
+    app_closing early-check below. Confirmed via testing that the
+    default True was wrongly applied to dialogs with NO relationship
+    to MainWindow's lifecycle at all (LoginDialog, ProfilePanel,
+    MutedWordsPanel -- all opened from NVDA's own Settings dialog,
+    independent of whether MainWindow is even open): app_closing only
+    ever gets reset to False by MainWindow.__init__, so once MainWindow
+    had been closed and NOT reopened in the same NVDA session, EVERY
+    safe_ui_callback-wrapped method anywhere in the add-on silently
+    no-op'd forever, including totally unrelated ones -- e.g. login
+    completing successfully server-side but the dialog never noticing.
+    Use check_app_closing=False for anything not parented into
+    MainWindow's own tree.
+
     TEMPORARY: logs every time this actually catches something, so we
     can confirm in testing that this is the crash path being hit and
     how often. Safe to remove the log.info call once confirmed stable
     -- the try/except itself should stay permanently.
     """
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        if app_closing:
-            log.info(f"NVSky: {func.__qualname__} skipped -- app is closing")
-            return None
-        try:
-            return func(self, *args, **kwargs)
-        except RuntimeError as e:
-            if "has been deleted" in str(e):
-                log.info(
-                    f"NVSky: {func.__qualname__} skipped -- target "
-                    f"window already destroyed ({e})"
-                )
+    def decorator(f):
+        @functools.wraps(f)
+        def wrapper(self, *args, **kwargs):
+            if check_app_closing and app_closing:
+                log.info(f"NVSky: {f.__qualname__} skipped -- app is closing")
                 return None
-            raise
-    return wrapper
+            try:
+                return f(self, *args, **kwargs)
+            except RuntimeError as e:
+                if "has been deleted" in str(e):
+                    log.info(
+                        f"NVSky: {f.__qualname__} skipped -- target "
+                        f"window already destroyed ({e})"
+                    )
+                    return None
+                raise
+        return wrapper
+
+    if func is not None:
+        # Bare @uiutil.safe_ui_callback usage (no parens) -- the
+        # existing 43+ call sites across the add-on all use this form,
+        # kept working unchanged with check_app_closing defaulting True.
+        return decorator(func)
+    return decorator
