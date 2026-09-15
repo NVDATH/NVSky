@@ -71,6 +71,7 @@ from . import feedWindow
 from .feedWindow import RemovableTabMixin
 from . import timeutils
 from . import uiutil
+from . import soundpack
 
 # LOW CONFIDENCE: Bluesky's DM character limit isn't published on the
 # docs site the way the 300-grapheme post limit is -- this number is a
@@ -126,24 +127,67 @@ def _describe_reactions(reactions_json) -> str:
     return " ".join(f"{emoji}x{n}" if n > 1 else emoji for emoji, n in counts.items())
 
 
-_COMMON_EMOJI = [
-    ("\U0001F600", "Grinning face"),
-    ("\U0001F602", "Face with tears of joy"),
-    ("\U0001F60A", "Smiling face"),
-    ("\U0001F60D", "Heart eyes"),
-    ("\U0001F622", "Crying face"),
-    ("\U0001F62E", "Surprised face"),
-    ("\U0001F621", "Angry face"),
-    ("\U0001F44D", "Thumbs up"),
-    ("\U0001F44E", "Thumbs down"),
-    ("\U0001F64F", "Folded hands"),
-    ("\U0001F44F", "Clapping hands"),
-    ("\U0001F389", "Party popper"),
-    ("\u2764\uFE0F", "Red heart"),
-    ("\U0001F525", "Fire"),
-    ("\U0001F4AF", "Hundred points"),
-    ("\U0001F634", "Sleeping face"),
-]
+def _describe_message_embed(embed_json) -> str:
+    if not embed_json:
+        return ""
+    try:
+        embed = json.loads(embed_json)
+    except (ValueError, TypeError):
+        return ""
+    quotedText = embed.get("quoted_text")
+    quotedHandle = embed.get("quoted_author_handle")
+    if quotedHandle and quotedText:
+        # Translators: Description of a shared-post embed in a chat message. First {} is the handle, second {} is the post text.
+        return _("Shared post from @{}: {}").format(quotedHandle, quotedText)
+    if quotedHandle:
+        # Translators: Description of a shared-post embed with no post text available. {} is the handle.
+        return _("Shared post from @{}").format(quotedHandle)
+    if quotedText:
+        # Translators: Description of a shared-post embed with no author handle available. {} is the post text.
+        return _("Shared post: {}").format(quotedText)
+    # Translators: Description of a shared-post embed with neither handle nor text available.
+    return _("Shared post")
+
+
+def _common_emoji():
+    # Deferred into a function (not a module-level constant) so _()
+    # calls happen at emoji-picker-open time, not at import time --
+    # keeps this consistent with every other translated string in the
+    # add-on, which are all evaluated lazily inside functions/methods.
+    return [
+        # Translators: Emoji picker entry.
+        ("\U0001F600", _("Grinning face")),
+        # Translators: Emoji picker entry.
+        ("\U0001F602", _("Face with tears of joy")),
+        # Translators: Emoji picker entry.
+        ("\U0001F60A", _("Smiling face")),
+        # Translators: Emoji picker entry.
+        ("\U0001F60D", _("Heart eyes")),
+        # Translators: Emoji picker entry.
+        ("\U0001F622", _("Crying face")),
+        # Translators: Emoji picker entry.
+        ("\U0001F62E", _("Surprised face")),
+        # Translators: Emoji picker entry.
+        ("\U0001F621", _("Angry face")),
+        # Translators: Emoji picker entry.
+        ("\U0001F44D", _("Thumbs up")),
+        # Translators: Emoji picker entry.
+        ("\U0001F44E", _("Thumbs down")),
+        # Translators: Emoji picker entry.
+        ("\U0001F64F", _("Folded hands")),
+        # Translators: Emoji picker entry.
+        ("\U0001F44F", _("Clapping hands")),
+        # Translators: Emoji picker entry.
+        ("\U0001F389", _("Party popper")),
+        # Translators: Emoji picker entry.
+        ("\u2764\uFE0F", _("Red heart")),
+        # Translators: Emoji picker entry.
+        ("\U0001F525", _("Fire")),
+        # Translators: Emoji picker entry.
+        ("\U0001F4AF", _("Hundred points")),
+        # Translators: Emoji picker entry.
+        ("\U0001F634", _("Sleeping face")),
+    ]
 
 
 def _pick_emoji(parent, title):
@@ -152,18 +196,22 @@ def _pick_emoji(parent, title):
     # navigable (arrows to browse, each item read as "emoji + name").
     # "Custom..." falls back to typing/pasting (e.g. from the Windows
     # emoji panel, Win+.) for anything not in the curated list.
-    choices = [f"{emoji} {label}" for emoji, label in _COMMON_EMOJI] + ["Custom..."]
-    dlg = wx.SingleChoiceDialog(parent, "Choose an emoji:", title, choices)
+    commonEmoji = _common_emoji()
+    # Translators: Entry in the emoji picker for typing/pasting a custom emoji.
+    choices = [f"{emoji} {label}" for emoji, label in commonEmoji] + [_("Custom...")]
+    # Translators: Prompt in the emoji picker dialog.
+    dlg = wx.SingleChoiceDialog(parent, _("Choose an emoji:"), title, choices)
     result = None
     if dlg.ShowModal() == wx.ID_OK:
         index = dlg.GetSelection()
-        if index == len(_COMMON_EMOJI):
-            entryDlg = wx.TextEntryDialog(parent, "Type or paste one emoji:", title)
+        if index == len(commonEmoji):
+            # Translators: Prompt for typing/pasting a custom emoji.
+            entryDlg = wx.TextEntryDialog(parent, _("Type or paste one emoji:"), title)
             if entryDlg.ShowModal() == wx.ID_OK:
                 result = entryDlg.GetValue().strip()
             entryDlg.Destroy()
         else:
-            result = _COMMON_EMOJI[index][0]
+            result = commonEmoji[index][0]
     dlg.Destroy()
     return result
 
@@ -179,7 +227,8 @@ def _show_message_dialog(parent, title, text):
     sizer = wx.BoxSizer(wx.VERTICAL)
     textCtrl = wx.TextCtrl(dlg, value=text, style=wx.TE_MULTILINE | wx.TE_READONLY)
     sizer.Add(textCtrl, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-    closeBtn = wx.Button(dlg, id=wx.ID_CLOSE, label="&Close")
+    # Translators: Button to close the full-message-text dialog.
+    closeBtn = wx.Button(dlg, id=wx.ID_CLOSE, label=_("&Close"))
     sizer.Add(closeBtn, flag=wx.ALIGN_RIGHT | wx.RIGHT | wx.BOTTOM, border=10)
     dlg.SetSizer(sizer)
     dlg.CentreOnScreen()
@@ -312,7 +361,9 @@ class _ChatMessagePanelMixin:
                     self._afterMessageRead(convoId)
                     self._pushMessageReadToServer(convoId, message["message_id"])
                 return
-        nvdaUi.message("No unread messages.")
+        soundpack.play("boundary")
+        # Translators: Announced when there are no unread chat messages to jump to.
+        nvdaUi.message(_("No unread messages."))
 
     def _pushMessageReadToServer(self, convoId, messageId):
         # Silent, background-only -- see client.mark_message_read's
@@ -353,7 +404,8 @@ class _ChatMessagePanelMixin:
         newestFirst = getattr(self, "_messagesNewestFirst", False)
         index = (n - 1) if newestFirst else (len(messages) - n)
         if not (0 <= index < len(messages)):
-            nvdaUi.message(f"No message {n}.")
+            # Translators: Announced when Alt+number is pressed for a message index that doesn't exist. {} is the number.
+            nvdaUi.message(_("No message {}.").format(n))
             return
         message = messages[index]
         # Alt+number doesn't move focus, so onMessageFocused never
@@ -364,7 +416,8 @@ class _ChatMessagePanelMixin:
                 _describe_reactions(message.get("reactions_json")),
                 self._messageFromLabel(message),
                 self._messageDisplayText(message),
-                _format_time(message["sent_at"]) if message.get("sent_at") else "Sending...",
+                # Translators: Placeholder shown for a message still being sent.
+                _format_time(message["sent_at"]) if message.get("sent_at") else _("Sending..."),
             ]
             nvdaUi.message(", ".join(p for p in parts if p))
         messageId = message.get("message_id")
@@ -386,7 +439,8 @@ class _ChatMessagePanelMixin:
             return
         replyToId = messages[index].get("reply_to_message_id")
         if not replyToId:
-            nvdaUi.message("This message isn't a reply.")
+            # Translators: Announced when Left-arrow jump-to-reply-target is pressed on a non-reply message.
+            nvdaUi.message(_("This message isn't a reply."))
             return
         for i, m in enumerate(messages):
             if m["message_id"] == replyToId:
@@ -394,9 +448,11 @@ class _ChatMessagePanelMixin:
                 self.messageList.Focus(i)
                 self.messageList.Select(i)
                 self.messageList.EnsureVisible(i)
-                nvdaUi.message("Jumped to original message.")
+                # Translators: Announced after jumping to the original message a reply refers to.
+                nvdaUi.message(_("Jumped to original message."))
                 return
-        nvdaUi.message("Original message isn't loaded in this view.")
+        # Translators: Announced when the original message a reply refers to isn't currently loaded.
+        nvdaUi.message(_("Original message isn't loaded in this view."))
 
     def _jumpBackToReply(self):
         index = _focused_list_index(self.messageList)
@@ -415,7 +471,8 @@ class _ChatMessagePanelMixin:
                 (m["message_id"] for m in messages if m.get("reply_to_message_id") == currentId), None
             )
             if targetId is None:
-                nvdaUi.message("No reply to this message found.")
+                # Translators: Announced when Right-arrow jump-forward-to-reply is pressed and no reply exists.
+                nvdaUi.message(_("No reply to this message found."))
                 return
 
         for i, m in enumerate(messages):
@@ -423,7 +480,8 @@ class _ChatMessagePanelMixin:
                 self.messageList.Focus(i)
                 self.messageList.Select(i)
                 self.messageList.EnsureVisible(i)
-                nvdaUi.message("Jumped forward.")
+                # Translators: Announced after jumping forward to a reply.
+                nvdaUi.message(_("Jumped forward."))
                 return
 
     # ---------------- message-level actions ----------------
@@ -431,30 +489,35 @@ class _ChatMessagePanelMixin:
     def _startReply(self, message):
         self._replyToMessageId = message["message_id"]
         preview = (message.get("text") or "")[:40]
-        self.replyingToLabel.SetLabel(f"Replying to: {preview}")
+        # Translators: Label shown above the compose box while replying to a message. {} is a preview of that message.
+        replyingLabel = _("Replying to: {}").format(preview)
+        self.replyingToLabel.SetLabel(replyingLabel)
         self.replyingToLabel.Show()
         self.cancelReplyButton.Show()
         self.Layout()
         self.composeText.SetFocus()
-        nvdaUi.message(f"Replying to: {preview}")
+        nvdaUi.message(replyingLabel)
 
     def onCancelReply(self, evt):
         self._replyToMessageId = None
         self.replyingToLabel.Hide()
         self.cancelReplyButton.Hide()
         self.Layout()
-        nvdaUi.message("Reply canceled.")
+        # Translators: Announced after canceling a reply-in-progress.
+        nvdaUi.message(_("Reply canceled."))
 
     def _copyMessageText(self, message):
         if wx.TheClipboard.Open():
             wx.TheClipboard.SetData(wx.TextDataObject(message.get("text", "")))
             wx.TheClipboard.Close()
-        nvdaUi.message("Message text copied to clipboard.")
+        # Translators: Announced after copying a chat message's text to the clipboard.
+        nvdaUi.message(_("Message text copied to clipboard."))
 
     def _showFullMessage(self, message):
         fromLabel = self._messageFromLabel(message)
         text = self._messageDisplayText(message)
-        _show_message_dialog(self, f"Message from {fromLabel}", text)
+        # Translators: Title of the full-message-text dialog. {} is who sent the message.
+        _show_message_dialog(self, _("Message from {}").format(fromLabel), text)
 
     def _deleteMessageForSelf(self, message):
         convoId = self._currentConvoId
@@ -475,9 +538,13 @@ class _ChatMessagePanelMixin:
     def _onDeleteMessageDone(self, convoId, error):
         if error:
             log.error(f"NVSky: delete message failed: {error}")
-            nvdaUi.message(f"Could not delete message: {error}")
+            soundpack.play("error")
+            # Translators: Announced when deleting a chat message fails. {} is the error message.
+            nvdaUi.message(_("Could not delete message: {}").format(error))
             return
-        nvdaUi.message("Message deleted.")
+        soundpack.play("delete")
+        # Translators: Announced after successfully deleting a chat message.
+        nvdaUi.message(_("Message deleted."))
         self._reloadMessagesIfCurrent(convoId)
         self._notifyConvoChanged(convoId)
 
@@ -504,7 +571,8 @@ class _ChatMessagePanelMixin:
     def _reactToMessage(self, convoId, message):
         messageId = message.get("message_id")
         if not messageId:
-            nvdaUi.message("This message hasn't finished sending yet.")
+            # Translators: Announced when trying to react to a message that hasn't finished sending yet.
+            nvdaUi.message(_("This message hasn't finished sending yet."))
             return
         myDid = self._account["did"] if self._account else None
         try:
@@ -515,10 +583,14 @@ class _ChatMessagePanelMixin:
 
         if myReaction:
             emoji = myReaction.get("value", "")
-            if wx.MessageBox(f"Remove your {emoji} reaction?", "Remove reaction", wx.YES_NO | wx.ICON_QUESTION) != wx.YES:
+            # Translators: Confirmation prompt for removing your own reaction from a chat message. {} is the emoji.
+            question = _("Remove your {} reaction?").format(emoji)
+            # Translators: Title of the remove-reaction confirmation dialog.
+            if wx.MessageBox(question, _("Remove reaction"), wx.YES_NO | wx.ICON_QUESTION) != wx.YES:
                 return
             newReactions = [r for r in existingReactions if r is not myReaction]
-            self._applyReactionsLocally(convoId, message, newReactions, f"{emoji} reaction removed.")
+            # Translators: Announced after removing your own reaction from a chat message. {} is the emoji.
+            self._applyReactionsLocally(convoId, message, newReactions, _("{} reaction removed.").format(emoji))
 
             def worker():
                 try:
@@ -538,13 +610,16 @@ class _ChatMessagePanelMixin:
             threading.Thread(target=worker, daemon=True).start()
             return
 
-        emoji = _pick_emoji(self, "React to message")
+        # Translators: Title of the emoji picker when reacting to a message.
+        emoji = _pick_emoji(self, _("React to message"))
         if emoji:
             if client.count_graphemes(emoji) != 1:
-                nvdaUi.message("Please pick or enter exactly one emoji.")
+                # Translators: Announced when the entered custom reaction isn't exactly one emoji.
+                nvdaUi.message(_("Please pick or enter exactly one emoji."))
                 return
             newReactions = existingReactions + [{"value": emoji, "sender": {"did": myDid}}]
-            self._applyReactionsLocally(convoId, message, newReactions, f"Reacted with {emoji}.")
+            # Translators: Announced after reacting to a chat message. {} is the emoji.
+            self._applyReactionsLocally(convoId, message, newReactions, _("Reacted with {}.").format(emoji))
 
             def worker():
                 try:
@@ -565,7 +640,8 @@ class _ChatMessagePanelMixin:
             # Roll back the optimistic update -- the server never
             # actually applied it, so leaving the UI showing it would be
             # a lie.
-            self._applyReactionsLocally(convoId, message, previousReactions, f"Reaction failed: {error}")
+            # Translators: Announced when reacting/removing a reaction fails. {} is the error message.
+            self._applyReactionsLocally(convoId, message, previousReactions, _("Reaction failed: {}").format(error))
             return
         # sync_convo_messages already landed the authoritative state
         # (ours plus anyone else's) in the DB above -- just re-render in
@@ -577,7 +653,8 @@ class _ChatMessagePanelMixin:
     def onInsertEmoji(self, evt):
         if not self.composeText.IsShown():
             return
-        emoji = _pick_emoji(self, "Insert emoji")
+        # Translators: Title of the emoji picker when inserting an emoji into the compose box.
+        emoji = _pick_emoji(self, _("Insert emoji"))
         if emoji:
             self.composeText.WriteText(emoji)
         self.composeText.SetFocus()
@@ -587,7 +664,8 @@ class _ChatMessagePanelMixin:
     def onMessageContextMenu(self, evt):
         index = _focused_list_index(self.messageList)
         if index == -1:
-            nvdaUi.message("No message selected.")
+            # Translators: Announced when opening the message context menu with no message focused.
+            nvdaUi.message(_("No message selected."))
             return
         convoId = self._currentConvoId
         if not convoId:
@@ -598,11 +676,16 @@ class _ChatMessagePanelMixin:
         message = messages[index]
 
         menu = wx.Menu()
-        replyItem = menu.Append(wx.ID_ANY, "Reply")
-        reactItem = menu.Append(wx.ID_ANY, "React...")
-        copyItem = menu.Append(wx.ID_ANY, "Copy text")
-        showItem = menu.Append(wx.ID_ANY, "Show message...")
-        deleteItem = menu.Append(wx.ID_ANY, "Delete for me...")
+        # Translators: Context menu item to reply to a chat message.
+        replyItem = menu.Append(wx.ID_ANY, _("&Reply"))
+        # Translators: Context menu item to react to a chat message with an emoji.
+        reactItem = menu.Append(wx.ID_ANY, _("R&eact..."))
+        # Translators: Context menu item to copy a chat message's text.
+        copyItem = menu.Append(wx.ID_ANY, _("&Copy text"))
+        # Translators: Context menu item to view a chat message's full, unsplit text.
+        showItem = menu.Append(wx.ID_ANY, _("Sho&w message..."))
+        # Translators: Context menu item to delete a chat message for yourself only.
+        deleteItem = menu.Append(wx.ID_ANY, _("&Delete for me..."))
 
         self.Bind(wx.EVT_MENU, lambda e: self._startReply(message), replyItem)
         self.Bind(wx.EVT_MENU, lambda e: self._reactToMessage(convoId, message), reactItem)
@@ -628,11 +711,14 @@ class _ChatMessagePanelMixin:
             return
         length = client.count_graphemes(text)
         if length > CHAT_MESSAGE_MAX_LENGTH:
-            nvdaUi.message(f"Message is too long ({length}/{CHAT_MESSAGE_MAX_LENGTH}).")
+            soundpack.play("max_length")
+            # Translators: Announced when the composed message exceeds the length limit. First {} is the current length, second {} is the max.
+            nvdaUi.message(_("Message is too long ({}/{}).").format(length, CHAT_MESSAGE_MAX_LENGTH))
             return
         convoId = self._currentConvoId
         if not convoId:
-            nvdaUi.message("Select a conversation first.")
+            # Translators: Announced when trying to send a message with no conversation selected.
+            nvdaUi.message(_("Select a conversation first."))
             return
 
         self.composeText.SetValue("")
@@ -652,10 +738,11 @@ class _ChatMessagePanelMixin:
         tempIndex = 0 if newestFirst else self.messageList.GetItemCount()
         mainText, moreText = _split_for_columns(text)
         self.messageList.InsertItem(tempIndex, "")
-        self.messageList.SetItem(tempIndex, 1, "You")
+        # Translators: Sender label shown for your own message rows in the chat message list.
+        self.messageList.SetItem(tempIndex, 1, _("You"))
         self.messageList.SetItem(tempIndex, 2, mainText)
         self.messageList.SetItem(tempIndex, 3, moreText)
-        self.messageList.SetItem(tempIndex, 4, "Sending...")
+        self.messageList.SetItem(tempIndex, 4, _("Sending..."))
         self.messageList.Focus(tempIndex)
         self.messageList.Select(tempIndex)
         self.messageList.EnsureVisible(tempIndex)
@@ -670,7 +757,9 @@ class _ChatMessagePanelMixin:
         # The row above is already rendered synchronously by this point
         # -- this pause is only so the spoken confirmation doesn't land
         # in the exact same instant as the keypress.
-        wx.CallLater(250, nvdaUi.message, "Message sent.")
+        soundpack.play("send_message")
+        # Translators: Announced after sending a chat message.
+        wx.CallLater(250, nvdaUi.message, _("Message sent."))
         # LOW CONFIDENCE fix for a reported "status bar shows just
         # 'Send' after sending" -- no code was found that sets any
         # status bar to that text, so the best guess is real keyboard
@@ -689,6 +778,7 @@ class _ChatMessagePanelMixin:
                 client.send_message(atprotoClient, convoId, text, reply_to_message_id=replyToMessageId)
             except Exception as e:
                 log.error(f"NVSky: send_message full traceback:\n{traceback.format_exc()}")
+                soundpack.play("error")
                 wx.CallAfter(self._onSendComplete, convoId, str(e))
                 return
 
@@ -711,7 +801,8 @@ class _ChatMessagePanelMixin:
     @uiutil.safe_ui_callback
     def _onSendComplete(self, convoId, error):
         if error:
-            nvdaUi.message(f"Could not send message: {error}")
+            # Translators: Announced when sending a chat message fails. {} is the error message.
+            nvdaUi.message(_("Could not send message: {}").format(error))
         self._reloadMessagesIfCurrent(convoId)  # drops/swaps the optimistic row either way
         if not error:
             self._notifyConvoChanged(convoId)
@@ -725,9 +816,11 @@ class _ChatMessagePanelMixin:
         # wording (which only ever reports on the currently selected
         # convo -- correct for plain F5, misleading here).
         if self._account is None:
-            nvdaUi.message("No active account.")
+            nvdaUi.message(_("No active account."))
             return
-        nvdaUi.message("Checking all chats for updates, please wait...")
+        # Translators: Announced when checking every conversation for updates (Shift+F5).
+        nvdaUi.message(_("Checking all chats for updates, please wait..."))
+        soundpack.start_progress()
 
         def worker():
             try:
@@ -742,9 +835,12 @@ class _ChatMessagePanelMixin:
 
     @uiutil.safe_ui_callback
     def _onCheckAllConvosDone(self, error):
+        soundpack.stop_progress()
         if error:
             log.error(f"NVSky: Chat sync failed: {error}")
-            nvdaUi.message(f"Could not check all chats for updates: {error}")
+            soundpack.play("error")
+            # Translators: Announced when checking every conversation for updates fails. {} is the error message.
+            nvdaUi.message(_("Could not check all chats for updates: {}").format(error))
             return
         # _reloadMessagesIfCurrent alone only re-renders the currently
         # open conversation's messages -- confirmed via testing that
@@ -755,13 +851,33 @@ class _ChatMessagePanelMixin:
         # _loadFromCache(); ConvoTabWindow has no such list to refresh.
         self._reloadMessagesIfCurrent(self._currentConvoId)
         self._reloadConvoListIfAny()
-        nvdaUi.message("All chats checked.")
+        # Translators: Announced after checking every conversation for updates.
+        nvdaUi.message(_("All chats checked."))
 
     def _reloadConvoListIfAny(self):
         pass
 
+    def _checkMessageListBoundaryBeforeKey(self, keyCode):
+        # Deterministic boundary check -- same reasoning as
+        # FeedListMixin._checkListBoundaryBeforeKey in feedWindow.py
+        # (comparing focus before/after via wx.CallAfter fired on every
+        # arrow press, not just real boundaries, since EVT_CHAR_HOOK's
+        # own callback ran before the native ListCtrl actually moved).
+        messages = getattr(self, "_currentMessages", [])
+        if not messages:
+            return
+        index = self.messageList.GetFocusedItem()
+        if index == -1:
+            return
+        if keyCode == wx.WXK_UP and index == 0:
+            soundpack.play("boundary")
+        elif keyCode == wx.WXK_DOWN and index == len(messages) - 1:
+            soundpack.play("boundary")
+
     def onCharHook(self, evt):
         keyCode = evt.GetKeyCode()
+        if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers() and self.FindFocus() is self.messageList:
+            self._checkMessageListBoundaryBeforeKey(keyCode)
         if keyCode == wx.WXK_F5 and evt.ControlDown():
             # Let this bubble up to MainWindow's own Ctrl+F5 handler
             # (checkAllOpenTabs -- updates every open tab in the addon,
@@ -815,22 +931,31 @@ class JoinGroupDialog(wx.Dialog):
         self._previewedCode = None
         self._previewConvoId = None
 
-        super().__init__(parent, title="Join a group", size=(420, 280))
+        # Translators: Title of the Join a group dialog.
+        super().__init__(parent, title=_("Join a group"), size=(420, 280))
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        codeLabel = wx.StaticText(self, label="Paste a group join link or code:")
+        # Translators: Label for the group join link/code field.
+        codeLabel = wx.StaticText(self, label=_("Paste a group join &link or code:"))
         self.codeText = wx.TextCtrl(self)
         sizer.Add(codeLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
         sizer.Add(self.codeText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
 
-        previewLabel = wx.StaticText(self, label="Group info:")
+        # Translators: Label above the read-only group info preview.
+        previewLabel = wx.StaticText(self, label=_("&Group info:"))
         sizer.Add(previewLabel, flag=wx.LEFT | wx.RIGHT, border=10)
         self.previewText = wx.TextCtrl(self, style=wx.TE_READONLY | wx.TE_MULTILINE, size=(-1, 60))
         sizer.Add(self.previewText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+        # Nothing to preview until a real code/link is typed --
+        # hidden until _loadPreview actually has something to show.
+        self._previewLabel = previewLabel
+        previewLabel.Hide()
+        self.previewText.Hide()
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.joinButton = wx.Button(self, label="Join")
+        # Translators: Button to join the group previewed above.
+        self.joinButton = wx.Button(self, label=_("&Join"))
         closeBtn = wx.Button(self, label="&Cancel")
         actionRow.Add(self.joinButton, flag=wx.RIGHT, border=5)
         actionRow.Add(closeBtn)
@@ -870,6 +995,9 @@ class JoinGroupDialog(wx.Dialog):
             self._debounceTimer.StartOnce(self.PREVIEW_DEBOUNCE_MS)
         else:
             self.previewText.SetValue("")
+            self._previewLabel.Hide()
+            self.previewText.Hide()
+            self.Layout()
 
     def onDebounceTimer(self, evt):
         self._loadPreview()
@@ -878,8 +1006,13 @@ class JoinGroupDialog(wx.Dialog):
         code = _extract_join_code(self.codeText.GetValue())
         if not code:
             return
-        self.previewText.SetValue("Loading group info...")
-        nvdaUi.message("Loading group info...")
+        self._previewLabel.Show()
+        self.previewText.Show()
+        self.Layout()
+        # Translators: Status text while loading a group's info preview.
+        loadingText = _("Loading group info...")
+        self.previewText.SetValue(loadingText)
+        nvdaUi.message(loadingText)
 
         def worker():
             try:
@@ -898,23 +1031,35 @@ class JoinGroupDialog(wx.Dialog):
         if code != _extract_join_code(self.codeText.GetValue()):
             return
         if error:
-            text = f"Could not load preview: {error}"
+            # Translators: Status text when loading a group preview fails. {} is the error message.
+            text = _("Could not load preview: {}").format(error)
             self.previewText.SetValue(text)
             nvdaUi.message(text)
             return
         preview = previews[0] if previews else None
         if not preview or "name" not in preview:
-            text = "This link is disabled or invalid."
+            # Translators: Status text when the pasted join link/code is disabled or invalid.
+            text = _("This link is disabled or invalid.")
             self.previewText.SetValue(text)
             nvdaUi.message(text)
             return
         owner = preview.get("owner") or {}
-        approvalText = "Requires owner approval" if preview.get("requireApproval") else "Joins immediately"
-        text = (
-            f'Group: {preview.get("name", "Group")}\n'
-            f'Owner: @{owner.get("handle", "unknown")}\n'
-            f'Members: {preview.get("memberCount", "?")}/{preview.get("memberLimit", "?")}\n'
-            f'{approvalText}'
+        # Translators: Group preview line: joining requires the group owner's approval.
+        # Translators: Group preview line: joining is instant, no approval needed.
+        approvalText = _("Requires owner approval") if preview.get("requireApproval") else _("Joins immediately")
+        # Translators: Multi-line group preview text. Placeholders: group name, owner handle, member count, member limit, then the approval line above.
+        text = _(
+            "Group: {}\n"
+            "Owner: @{}\n"
+            "Members: {}/{}\n"
+            "{}"
+        ).format(
+            # Translators: Fallback group name when the server didn't provide one.
+            preview.get("name") or _("Group"),
+            owner.get("handle", "unknown"),
+            preview.get("memberCount", "?"),
+            preview.get("memberLimit", "?"),
+            approvalText,
         )
         self.previewText.SetValue(text)
         self.previewText.SetFocus()
@@ -927,7 +1072,8 @@ class JoinGroupDialog(wx.Dialog):
         if not self._previewedCode:
             return
         self.joinButton.Disable()
-        nvdaUi.message("Joining...")
+        # Translators: Announced while a group-join request is in progress.
+        nvdaUi.message(_("Joining..."))
 
         def worker():
             try:
@@ -946,11 +1092,13 @@ class JoinGroupDialog(wx.Dialog):
     def _onJoinDone(self, result, error):
         if error:
             self.joinButton.Enable()
-            nvdaUi.message(f"Could not join: {error}")
+            # Translators: Announced when joining a group fails. {} is the error message.
+            nvdaUi.message(_("Could not join: {}").format(error))
             return
         status = (result or {}).get("status")
         if status == "joined":
-            nvdaUi.message("Joined the group.")
+            # Translators: Announced after successfully joining a group.
+            nvdaUi.message(_("Joined the group."))
             if self._onJoined and self._previewConvoId:
                 self._onJoined(self._previewConvoId)
             self.Close()
@@ -958,10 +1106,13 @@ class JoinGroupDialog(wx.Dialog):
         # Pending approval -- keep the dialog open with a way to back
         # out, instead of closing on a request the user might want to
         # cancel (no other UI surfaces a pending outgoing request at all).
-        nvdaUi.message(f"Join request sent (status: {status or 'pending'}). You can withdraw it below.")
-        self.previewText.SetValue(self.previewText.GetValue() + "\nRequest pending approval.")
+        # Translators: Announced when a join request needs owner approval. {} is the request status.
+        nvdaUi.message(_("Join request sent (status: {}). You can withdraw it below.").format(status or "pending"))
+        # Translators: Appended to the group preview text while a join request is pending.
+        self.previewText.SetValue(self.previewText.GetValue() + "\n" + _("Request pending approval."))
         self.joinButton.Destroy()
-        self.withdrawButton = wx.Button(self, label="Withdraw request")
+        # Translators: Button to withdraw a pending group join request.
+        self.withdrawButton = wx.Button(self, label=_("&Withdraw request"))
         self.GetSizer().Add(self.withdrawButton, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
         self.withdrawButton.Bind(wx.EVT_BUTTON, self.onWithdraw)
         self.Layout()
@@ -969,7 +1120,8 @@ class JoinGroupDialog(wx.Dialog):
 
     def onWithdraw(self, evt):
         self.withdrawButton.Disable()
-        nvdaUi.message("Withdrawing request...")
+        # Translators: Announced while withdrawing a pending group join request.
+        nvdaUi.message(_("Withdrawing request..."))
 
         def worker():
             try:
@@ -986,9 +1138,11 @@ class JoinGroupDialog(wx.Dialog):
     def _onWithdrawDone(self, error):
         if error:
             self.withdrawButton.Enable()
-            nvdaUi.message(f"Could not withdraw request: {error}")
+            # Translators: Announced when withdrawing a group join request fails. {} is the error message.
+            nvdaUi.message(_("Could not withdraw request: {}").format(error))
             return
-        nvdaUi.message("Request withdrawn.")
+        # Translators: Announced after successfully withdrawing a group join request.
+        nvdaUi.message(_("Request withdrawn."))
         self.Close()
 
 
@@ -1018,30 +1172,36 @@ class NewChatDialog(wx.Dialog):
         self._recipients = []  # list of {"did", "handle", "display_name"}
         self._onStarted = on_started
 
-        super().__init__(parent, title="Start a new chat", size=(440, 560))
+        # Translators: Title of the Start a new chat dialog.
+        super().__init__(parent, title=_("Start a new chat"), size=(440, 560))
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        userLabel = wx.StaticText(self, label="Search for a user by handle or name:")
+        # Translators: Label for the user search field in the new-chat dialog.
+        userLabel = wx.StaticText(self, label=_("&Search for a user by handle or name:"))
         self.userSearchText = wx.TextCtrl(self)
         sizer.Add(userLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
         sizer.Add(self.userSearchText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
 
-        self.searchResultsLabel = wx.StaticText(self, label="Search results:")
+        # Translators: Label above the user search results checklist.
+        self.searchResultsLabel = wx.StaticText(self, label=_("Search results:"))
         self.searchResultsList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
         sizer.Add(self.searchResultsLabel, flag=wx.LEFT | wx.TOP, border=10)
         sizer.Add(self.searchResultsList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-        self.addRecipientButton = wx.Button(self, label="Add checked")
+        # Translators: Button to add checked search results as recipients.
+        self.addRecipientButton = wx.Button(self, label=_("Add chec&ked"))
         sizer.Add(self.addRecipientButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
         self.searchResultsLabel.Hide()
         self.searchResultsList.Hide()
         self.addRecipientButton.Hide()
 
-        self.recipientsLabel = wx.StaticText(self, label="Recipients:")
+        # Translators: Label above the queued-recipients checklist.
+        self.recipientsLabel = wx.StaticText(self, label=_("&Recipients:"))
         self.recipientsList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
         sizer.Add(self.recipientsLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
         sizer.Add(self.recipientsList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
-        self.removeRecipientButton = wx.Button(self, label="Remove checked")
+        # Translators: Button to remove checked recipients from the queue.
+        self.removeRecipientButton = wx.Button(self, label=_("Re&move checked"))
         sizer.Add(self.removeRecipientButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
         # Nothing to show/remove until at least one recipient has been
         # added -- an empty check-list box otherwise has odd, screen-
@@ -1051,20 +1211,25 @@ class NewChatDialog(wx.Dialog):
         self.removeRecipientButton.Hide()
 
         groupNameLabel = wx.StaticText(
-            self, label="Group name (optional -- set this to force a group chat even with a single recipient):"
+            self,
+            # Translators: Label for the optional group name field. Setting it forces a group chat even with one recipient.
+            label=_("&Group name (optional -- set this to force a group chat even with a single recipient):"),
         )
         self.groupNameText = wx.TextCtrl(self)
         sizer.Add(groupNameLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
         sizer.Add(self.groupNameText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
 
-        messageLabel = wx.StaticText(self, label="First message:")
+        # Translators: Label for the first-message field, required to actually create the conversation.
+        messageLabel = wx.StaticText(self, label=_("&First message:"))
         self.messageText = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(-1, 60))
         sizer.Add(messageLabel, flag=wx.LEFT | wx.RIGHT, border=10)
         sizer.Add(self.messageText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.startButton = wx.Button(self, label="Start chat")
-        self.joinGroupButton = wx.Button(self, label="Join group...")
+        # Translators: Button to start the new chat.
+        self.startButton = wx.Button(self, label=_("St&art chat"))
+        # Translators: Button to open the join-a-group dialog instead of starting a new chat.
+        self.joinGroupButton = wx.Button(self, label=_("&Join group..."))
         closeBtn = wx.Button(self, label="&Cancel")
         actionRow.Add(self.startButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.joinGroupButton, flag=wx.RIGHT, border=5)
@@ -1135,7 +1300,8 @@ class NewChatDialog(wx.Dialog):
         self.addRecipientButton.Show(hasResults)
         self.Layout()
         self.searchResultsList.Set(
-            [f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in self._userSuggestions]
+            # Translators: List entry format for a search result with no display name set. {} is the handle.
+            [f'@{r["handle"]} ({r.get("display_name") or _("no display name")})' for r in self._userSuggestions]
         )
         self.searchResultsList.CheckedItems = []
         if self._userSuggestions:
@@ -1144,7 +1310,8 @@ class NewChatDialog(wx.Dialog):
     def onAddRecipient(self, evt):
         indices = list(self.searchResultsList.CheckedItems)
         if not indices:
-            nvdaUi.message("No search results checked.")
+            # Translators: Announced when adding recipients with nothing checked in the search results.
+            nvdaUi.message(_("No search results checked."))
             return
         toAdd = [self._userSuggestions[i] for i in indices if 0 <= i < len(self._userSuggestions)]
         if not toAdd:
@@ -1152,7 +1319,7 @@ class NewChatDialog(wx.Dialog):
         wasEmpty = not self._recipients
         self._recipients.extend(toAdd)
         self.recipientsList.Set(
-            [f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in self._recipients]
+            [f'@{r["handle"]} ({r.get("display_name") or _("no display name")})' for r in self._recipients]
         )
         self.recipientsList.CheckedItems = []
         if self._recipients:
@@ -1168,12 +1335,14 @@ class NewChatDialog(wx.Dialog):
             self.recipientsList.Show()
             self.removeRecipientButton.Show()
         self.Layout()
-        nvdaUi.message(f'Added {len(toAdd)}. {len(self._recipients)} recipient(s) total.')
+        # Translators: Announced after adding recipients. First {} is how many were added, second {} is the new total.
+        nvdaUi.message(_("Added {}. {} recipient(s) total.").format(len(toAdd), len(self._recipients)))
 
     def onRemoveRecipient(self, evt):
         indices = list(self.recipientsList.CheckedItems)
         if not indices:
-            nvdaUi.message("No recipients checked.")
+            # Translators: Announced when removing recipients with nothing checked.
+            nvdaUi.message(_("No recipients checked."))
             return
         toRemove = {self._recipients[i]["did"] for i in indices if 0 <= i < len(self._recipients)}
         if not toRemove:
@@ -1181,7 +1350,7 @@ class NewChatDialog(wx.Dialog):
         removedCount = len(toRemove)
         self._recipients = [r for r in self._recipients if r["did"] not in toRemove]
         self.recipientsList.Set(
-            [f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in self._recipients]
+            [f'@{r["handle"]} ({r.get("display_name") or _("no display name")})' for r in self._recipients]
         )
         self.recipientsList.CheckedItems = []
         if not self._recipients:
@@ -1190,15 +1359,18 @@ class NewChatDialog(wx.Dialog):
             self.removeRecipientButton.Hide()
             self.Layout()
             self.userSearchText.SetFocus()
-        nvdaUi.message(f'Removed {removedCount}. {len(self._recipients)} recipient(s) left.')
+        # Translators: Announced after removing recipients. First {} is how many were removed, second {} is how many remain.
+        nvdaUi.message(_("Removed {}. {} recipient(s) left.").format(removedCount, len(self._recipients)))
 
     def onStartChat(self, evt):
         if not self._recipients:
-            nvdaUi.message("Add at least one recipient first.")
+            # Translators: Announced when starting a chat with no recipient queued.
+            nvdaUi.message(_("Add at least one recipient first."))
             return
         text = self.messageText.GetValue().strip()
         if not text:
-            nvdaUi.message("Type a first message before starting the chat.")
+            # Translators: Announced when starting a chat with an empty first message.
+            nvdaUi.message(_("Type a first message before starting the chat."))
             return
         groupName = self.groupNameText.GetValue().strip() or None
         recipients = list(self._recipients)
@@ -1211,8 +1383,10 @@ class NewChatDialog(wx.Dialog):
         # minimum-2 guard added here instead.
         isGroup = len(recipients) > 1 or bool(groupName)
         nvdaUi.message(
-            "Starting group chat, please wait..." if isGroup
-            else f'Starting chat with @{recipients[0]["handle"]}, please wait...'
+            # Translators: Announced while creating a new group chat.
+            _("Starting group chat, please wait...") if isGroup
+            # Translators: Announced while starting a new 1:1 chat. {} is the recipient's handle.
+            else _("Starting chat with @{}, please wait...").format(recipients[0]["handle"])
         )
 
         def worker():
@@ -1240,15 +1414,18 @@ class NewChatDialog(wx.Dialog):
     def _onStartChatDone(self, convo, error):
         if error:
             log.error(f"NVSky: start new chat failed: {error}")
-            nvdaUi.message(f"Could not start chat: {error}")
+            # Translators: Announced when starting a new chat fails. {} is the error message.
+            nvdaUi.message(_("Could not start chat: {}").format(error))
             return
         if not convo or not convo.get("id"):
             log.error(f"NVSky: start chat returned no usable convo: {convo!r}")
-            nvdaUi.message("Could not start chat: no conversation was returned.")
+            # Translators: Announced when the server didn't return a usable conversation.
+            nvdaUi.message(_("Could not start chat: no conversation was returned."))
             return
         gui.mainFrame.postPopup()
         self.Destroy()
-        nvdaUi.message("Chat started.")
+        # Translators: Announced after successfully starting a new chat.
+        nvdaUi.message(_("Chat started."))
         if self._onStarted:
             self._onStarted(convo.get("id"))
 
@@ -1266,18 +1443,23 @@ class JoinRequestsDialog(wx.Dialog):
         self._convo = convo
         self._requests = []
 
-        super().__init__(parent, title="Join requests", size=(420, 320))
+        # Translators: Title of the Join requests dialog.
+        super().__init__(parent, title=_("Join requests"), size=(420, 320))
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.requestsList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self.requestsList.InsertColumn(0, "Requester", width=200)
-        self.requestsList.InsertColumn(1, "Requested", width=160)
+        # Translators: Column header for the requester's handle in the join requests list.
+        self.requestsList.InsertColumn(0, _("Requester"), width=200)
+        # Translators: Column header for when the join request was made.
+        self.requestsList.InsertColumn(1, _("Requested"), width=160)
         sizer.Add(self.requestsList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.approveButton = wx.Button(self, label="Approve")
-        self.rejectButton = wx.Button(self, label="Reject")
+        # Translators: Button to approve the selected join request.
+        self.approveButton = wx.Button(self, label=_("&Approve"))
+        # Translators: Button to reject the selected join request.
+        self.rejectButton = wx.Button(self, label=_("&Reject"))
         closeBtn = wx.Button(self, label="&Close")
         actionRow.Add(self.approveButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.rejectButton, flag=wx.RIGHT, border=5)
@@ -1306,7 +1488,8 @@ class JoinRequestsDialog(wx.Dialog):
         self.Destroy()
 
     def _loadRequests(self):
-        nvdaUi.message("Loading join requests...")
+        # Translators: Announced while loading join requests.
+        nvdaUi.message(_("Loading join requests..."))
 
         def worker():
             try:
@@ -1324,7 +1507,8 @@ class JoinRequestsDialog(wx.Dialog):
     @uiutil.safe_ui_callback
     def _onLoadDone(self, requests_, error):
         if error:
-            nvdaUi.message(f"Could not load join requests: {error}")
+            # Translators: Announced when loading join requests fails. {} is the error message.
+            nvdaUi.message(_("Could not load join requests: {}").format(error))
             return
         self._requests = requests_
         self.requestsList.DeleteAllItems()
@@ -1335,19 +1519,23 @@ class JoinRequestsDialog(wx.Dialog):
         if requests_:
             self.requestsList.Focus(0)
             self.requestsList.Select(0)
-        nvdaUi.message(f'{len(requests_)} join request{"s" if len(requests_) != 1 else ""}.')
+        # Translators: Announced after loading join requests. {} is the count.
+        nvdaUi.message(_("{} join request(s).").format(len(requests_)))
 
     def _resolveSelected(self, approve):
         index = _focused_list_index(self.requestsList)
         if index == -1 or index >= len(self._requests):
-            nvdaUi.message("No request selected.")
+            # Translators: Announced when approving/rejecting a join request with none selected.
+            nvdaUi.message(_("No request selected."))
             return
         member = (self._requests[index].get("requestedBy") or {}).get("did")
         if not member:
             return
         self.approveButton.Disable()
         self.rejectButton.Disable()
-        nvdaUi.message("Approving..." if approve else "Rejecting...")
+        # Translators: Announced while approving a join request.
+        # Translators: Announced while rejecting a join request.
+        nvdaUi.message(_("Approving...") if approve else _("Rejecting..."))
 
         def worker():
             try:
@@ -1368,9 +1556,14 @@ class JoinRequestsDialog(wx.Dialog):
         self.approveButton.Enable()
         self.rejectButton.Enable()
         if error:
-            nvdaUi.message(f"Could not {'approve' if approve else 'reject'}: {error}")
+            # Translators: Announced when approving a join request fails. {} is the error message.
+            # Translators: Announced when rejecting a join request fails. {} is the error message.
+            message = _("Could not approve: {}").format(error) if approve else _("Could not reject: {}").format(error)
+            nvdaUi.message(message)
             return
-        nvdaUi.message("Approved." if approve else "Rejected.")
+        # Translators: Announced after approving a join request.
+        # Translators: Announced after rejecting a join request.
+        nvdaUi.message(_("Approved.") if approve else _("Rejected."))
         if 0 <= index < len(self._requests):
             del self._requests[index]
         self.requestsList.DeleteItem(index)
@@ -1386,10 +1579,14 @@ class InviteLinkDialog(wx.Dialog):
     controls in place -- rebuilding broke wx's tab order chain."""
 
     JOIN_RULE_OPTIONS = [
-        ("Anyone can join instantly", "anyone", False),
-        ("Anyone can request to join", "anyone", True),
-        ("People I follow can join instantly", "followedByOwner", False),
-        ("People I follow can request to join", "followedByOwner", True),
+        # Translators: Invite-link join rule: anyone with the link joins immediately.
+        (_("Anyone can join instantly"), "anyone", False),
+        # Translators: Invite-link join rule: anyone with the link must request approval.
+        (_("Anyone can request to join"), "anyone", True),
+        # Translators: Invite-link join rule: only people you follow join immediately.
+        (_("People I follow can join instantly"), "followedByOwner", False),
+        # Translators: Invite-link join rule: only people you follow can request approval.
+        (_("People I follow can request to join"), "followedByOwner", True),
     ]
     # No real shareable URL exists for group invites -- only the code
     # itself, usable by pasting into another NVSky's Join Group dialog
@@ -1400,7 +1597,8 @@ class InviteLinkDialog(wx.Dialog):
         self._convo = convo
         self._joinLink = None
 
-        super().__init__(parent, title="Invite link", size=(420, 320))
+        # Translators: Title of the Invite link dialog.
+        super().__init__(parent, title=_("Invite link"), size=(420, 320))
         outerSizer = wx.BoxSizer(wx.VERTICAL)
 
         self.setupPanel = wx.Panel(self)
@@ -1411,6 +1609,14 @@ class InviteLinkDialog(wx.Dialog):
         self._buildResultPanel(self.resultPanel)
         outerSizer.Add(self.resultPanel, proportion=1, flag=wx.EXPAND)
         self.resultPanel.Hide()
+        # Enable(False) alongside Hide() -- Hide() alone doesn't
+        # reliably remove a panel's children from wx's own tab-traversal
+        # chain, confirmed by testing: tabbing past urlText could land
+        # on a control inside the still-"tab-reachable" hidden
+        # setupPanel, which looked like the control had simply vanished
+        # (nothing visible/announced there). Disabling the hidden panel
+        # excludes it from traversal properly.
+        self.resultPanel.Enable(False)
 
         self.SetSizer(outerSizer)
         self.CentreOnScreen()
@@ -1433,21 +1639,25 @@ class InviteLinkDialog(wx.Dialog):
         sizer = wx.BoxSizer(wx.VERTICAL)
         infoLabel = wx.StaticText(
             panel,
-            label="An invite link lets people join this group without being added directly. "
-                  "Your name, avatar, the group name, and member count are visible to anyone with the link. "
-                  "There's no way to check whether one already exists -- Save creates a new one, or updates "
-                  "the existing one if it turns out there already is one.",
+            # Translators: Explanatory text in the invite-link setup panel.
+            label=_("An invite link lets people join this group without being added directly. "
+                    "Your name, avatar, the group name, and member count are visible to anyone with the link. "
+                    "There's no way to check whether one already exists -- Save creates a new one, or updates "
+                    "the existing one if it turns out there already is one."),
         )
         sizer.Add(infoLabel, flag=wx.EXPAND | wx.ALL, border=10)
 
         self.ruleRadio = wx.RadioBox(
-            panel, label="Who can join", choices=[o[0] for o in self.JOIN_RULE_OPTIONS], style=wx.RA_SPECIFY_ROWS
+            # Translators: Label for the "who can join via this link" radio group.
+            panel, label=_("Who can join"), choices=[o[0] for o in self.JOIN_RULE_OPTIONS], style=wx.RA_SPECIFY_ROWS
         )
         sizer.Add(self.ruleRadio, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.generateButton = wx.Button(panel, label="Save")
-        self.setupCloseButton = wx.Button(panel, label="&Cancel")
+        # Translators: Button to create or update the invite link.
+        self.generateButton = wx.Button(panel, label=_("&Save"))
+        # Translators: Initial label before a link exists -- overwritten dynamically by _showSetupPanel afterward.
+        self.setupCloseButton = wx.Button(panel, label=_("&Cancel"))
         actionRow.Add(self.generateButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.setupCloseButton)
         sizer.Add(actionRow, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
@@ -1465,19 +1675,24 @@ class InviteLinkDialog(wx.Dialog):
     def _buildResultPanel(self, panel):
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        urlLabel = wx.StaticText(panel, label="Invite code (share this text with people you want to invite):")
+        # Translators: Label for the read-only invite code field.
+        urlLabel = wx.StaticText(panel, label=_("Invite code (share this text with people you want to invite):"))
         sizer.Add(urlLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
-        self.urlText = wx.TextCtrl(panel, style=wx.TE_READONLY)
+        self.urlText = wx.TextCtrl(panel, style=wx.TE_READONLY | wx.TE_MULTILINE)
         sizer.Add(self.urlText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
 
         self.statusLabel = wx.StaticText(panel, label="")
         sizer.Add(self.statusLabel, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.copyButton = wx.Button(panel, label="Copy")
-        self.editButton = wx.Button(panel, label="Edit permissions...")
-        self.toggleButton = wx.Button(panel, label="Disable link")
-        self.resultCloseButton = wx.Button(panel, label="&Close")
+        # Translators: Button to copy the invite code to the clipboard.
+        self.copyButton = wx.Button(panel, label=_("&Copy"))
+        # Translators: Button to change the invite link's join rule.
+        self.editButton = wx.Button(panel, label=_("&Edit permissions..."))
+        # Translators: Button to disable the currently-enabled invite link.
+        self.toggleButton = wx.Button(panel, label=_("&Disable link"))
+        # Translators: Button to close the invite-link dialog. Mnemonic on "l" since Copy already claims "C" in this same panel.
+        self.resultCloseButton = wx.Button(panel, label=_("C&lose"))
         actionRow.Add(self.copyButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.editButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.toggleButton, flag=wx.RIGHT, border=5)
@@ -1500,21 +1715,39 @@ class InviteLinkDialog(wx.Dialog):
     def _showSetupPanel(self):
         if self._joinLink:
             self.ruleRadio.SetSelection(self._ruleIndexFor(self._joinLink))
-        self.setupCloseButton.SetLabel("&Cancel" if self._joinLink else "&Close")
+        # Translators: Button label when going back to setup from an already-generated link (cancels editing).
+        # Translators: Button label when this is the only screen shown yet (closes the whole dialog).
+        self.setupCloseButton.SetLabel(_("&Cancel") if self._joinLink else _("&Close"))
         self.resultPanel.Hide()
+        self.resultPanel.Enable(False)
         self.setupPanel.Show()
+        self.setupPanel.Enable(True)
         self.Layout()
+        # Force a full repaint -- Layout() alone can leave stale pixels
+        # from the sibling panel that just got hidden, since both
+        # occupy the exact same rect (proportion=1, EXPAND).
+        self.Refresh()
         self.ruleRadio.SetFocus()
 
     def _showResultPanel(self):
         self.urlText.SetValue(self._joinLink.get("code", ""))
         ruleIndex = self._ruleIndexFor(self._joinLink)
         enabled = self._joinLink.get("enabledStatus") == "enabled"
-        self.statusLabel.SetLabel(f'{self.JOIN_RULE_OPTIONS[ruleIndex][0]} -- {"enabled" if enabled else "disabled"}')
-        self.toggleButton.SetLabel("Disable link" if enabled else "Enable link")
+        # Translators: Word shown when the invite link is currently enabled.
+        # Translators: Word shown when the invite link is currently disabled.
+        statusState = _("enabled") if enabled else _("disabled")
+        # Translators: Status line showing the current join rule and enabled/disabled state. First {} is the rule text, second {} is "enabled"/"disabled".
+        self.statusLabel.SetLabel(_("{} -- {}").format(self.JOIN_RULE_OPTIONS[ruleIndex][0], statusState))
+        self.toggleButton.SetLabel(_("&Disable link") if enabled else _("&Enable link"))
         self.setupPanel.Hide()
+        self.setupPanel.Enable(False)
         self.resultPanel.Show()
+        self.resultPanel.Enable(True)
         self.Layout()
+        # Force a full repaint -- Layout() alone can leave stale pixels
+        # from the sibling panel that just got hidden, since both
+        # occupy the exact same rect (proportion=1, EXPAND).
+        self.Refresh()
         self.urlText.SetFocus()
         self.urlText.SelectAll()
 
@@ -1522,12 +1755,14 @@ class InviteLinkDialog(wx.Dialog):
         if wx.TheClipboard.Open():
             wx.TheClipboard.SetData(wx.TextDataObject(self.urlText.GetValue()))
             wx.TheClipboard.Close()
-        nvdaUi.message("Invite code copied.")
+        # Translators: Announced after copying the invite code to the clipboard.
+        nvdaUi.message(_("Invite code copied."))
 
     def onGenerate(self, evt):
-        _, joinRule, requireApproval = self.JOIN_RULE_OPTIONS[self.ruleRadio.GetSelection()]
+        _label, joinRule, requireApproval = self.JOIN_RULE_OPTIONS[self.ruleRadio.GetSelection()]
         self.generateButton.Disable()
-        nvdaUi.message("Saving invite link...")
+        # Translators: Announced while creating or updating the invite link.
+        nvdaUi.message(_("Saving invite link..."))
 
         def worker():
             try:
@@ -1554,18 +1789,23 @@ class InviteLinkDialog(wx.Dialog):
     def _onGenerateDone(self, joinLink, error):
         self.generateButton.Enable()
         if error:
-            nvdaUi.message(f"Could not save invite link: {error}")
+            # Translators: Announced when saving the invite link fails. {} is the error message.
+            nvdaUi.message(_("Could not save invite link: {}").format(error))
             return
         if not joinLink:
-            nvdaUi.message("The server didn't return link details -- check debug_dumps for the raw response.")
+            # Translators: Announced when the server response for the invite link is unexpectedly empty.
+            nvdaUi.message(_("The server didn't return link details -- check debug_dumps for the raw response."))
             return
         self._joinLink = joinLink
-        nvdaUi.message("Invite link ready.")
+        # Translators: Announced after the invite link is created/updated.
+        nvdaUi.message(_("Invite link ready."))
         self._showResultPanel()
 
     def onToggleEnabled(self, evt):
         enabling = self._joinLink.get("enabledStatus") != "enabled"
-        nvdaUi.message("Enabling invite link..." if enabling else "Disabling invite link...")
+        # Translators: Announced while enabling the invite link.
+        # Translators: Announced while disabling the invite link.
+        nvdaUi.message(_("Enabling invite link...") if enabling else _("Disabling invite link..."))
 
         def worker():
             try:
@@ -1586,13 +1826,15 @@ class InviteLinkDialog(wx.Dialog):
     @uiutil.safe_ui_callback
     def _onToggleDone(self, joinLink, error):
         if error:
-            nvdaUi.message(f"Could not update invite link: {error}")
+            # Translators: Announced when enabling/disabling the invite link fails. {} is the error message.
+            nvdaUi.message(_("Could not update invite link: {}").format(error))
             return
         if not joinLink:
-            nvdaUi.message("The server didn't return link details -- check debug_dumps for the raw response.")
+            nvdaUi.message(_("The server didn't return link details -- check debug_dumps for the raw response."))
             return
         self._joinLink = joinLink
-        nvdaUi.message("Invite link updated.")
+        # Translators: Announced after enabling/disabling the invite link.
+        nvdaUi.message(_("Invite link updated."))
         self._showResultPanel()
         
 
@@ -1620,44 +1862,51 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
         self._members = list(members)
         self._suggestions = []
 
-        title = convo.get("group_name") or "Group"
-        super().__init__(parent, title=f"Manage members - {title}", size=(460, 520))
+        # Translators: Fallback group name shown when the group has none set. Used as "Manage members - {}".
+        title = convo.get("group_name") or _("Group")
+        # Translators: Title of the manage-group-members dialog. {} is the group name.
+        super().__init__(parent, title=_("Manage members - {}").format(title), size=(460, 520))
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        memberLabel = wx.StaticText(self, label="Current members:")
+        # Translators: Label above the current group members checklist.
+        memberLabel = wx.StaticText(self, label=_("Current members:"))
         sizer.Add(memberLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
         self.memberList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
         self._renderMembers()
         sizer.Add(self.memberList, proportion=1, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
-        self.removeButton = wx.Button(self, label="Remove checked")
+        # Translators: Button to remove checked members from the group.
+        self.removeButton = wx.Button(self, label=_("&Remove checked"))
         sizer.Add(self.removeButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
         self.removeButton.Show(bool(self._members))
 
-        addLabel = wx.StaticText(self, label="Add member (type a handle or name to search):")
+        # Translators: Label for the add-member search field.
+        addLabel = wx.StaticText(self, label=_("Add &member (type a handle or name to search):"))
         sizer.Add(addLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
         self.searchText = wx.TextCtrl(self)
         sizer.Add(self.searchText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=10)
 
-        self.suggestLabel = wx.StaticText(self, label="Search results:")
+        # Translators: Label above the member-search results checklist.
+        self.suggestLabel = wx.StaticText(self, label=_("Search results:"))
         self.suggestionList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
         sizer.Add(self.suggestLabel, flag=wx.LEFT | wx.TOP, border=10)
         sizer.Add(self.suggestionList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-        self.addButton = wx.Button(self, label="Add checked")
+        # Translators: Button to add checked search results as group members.
+        self.addButton = wx.Button(self, label=_("&Add checked"))
         sizer.Add(self.addButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
         self.suggestLabel.Hide()
         self.suggestionList.Hide()
         self.addButton.Hide()
 
-        closeBtn = wx.Button(self, label="&Close")
+        # Translators: Button to close the manage-group-members dialog.
+        closeBtn = wx.Button(self, label=_("&Close"))
         sizer.Add(closeBtn, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
 
         self.SetSizer(sizer)
         self.CentreOnScreen()
 
         self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
-        self.memberList.Bind(wx.EVT_CONTEXT_MENU, self.onMemberContextMenu)
         self.searchText.Bind(wx.EVT_TEXT, self.onSearchTextChanged)
         self.addButton.Bind(wx.EVT_BUTTON, self.onAddSuggestion)
         closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
@@ -1665,64 +1914,6 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
         self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
         self.memberList.SetFocus()
-
-    def onMemberContextMenu(self, evt):
-        index = self.memberList.GetSelection()
-        if index == wx.NOT_FOUND or index >= len(self._members):
-            return
-        member = self._members[index]
-        menu = wx.Menu()
-        self._populateUserActionMenu(menu, member["did"], member["handle"], member.get("display_name"))
-        menu.AppendSeparator()
-        self._addMenuItem(menu, "Message", lambda: self._messageMember(member))
-        self._addMenuItem(menu, "Remove from group...", lambda: self._removeSingleMember(member))
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _messageMember(self, member):
-        nvdaUi.message(f'Opening chat with @{member["handle"]}, please wait...')
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                # Best-effort pre-check for a clearer error than the
-                # generic send failure -- never blocks the actual
-                # attempt if this fails or the response shape is wrong.
-                try:
-                    availability = client.get_convo_availability(atprotoClient, [member["did"]])
-                    canChat = getattr(availability, "can_chat", getattr(availability, "canChat", True))
-                except Exception:
-                    canChat = True
-                if not canChat:
-                    wx.CallAfter(self._onMessageMemberDone, None, f'@{member["handle"]} isn\'t accepting messages from you.')
-                    return
-                convo = client.get_or_create_convo_for_member(atprotoClient, member["did"])
-                client.sync_convos(atprotoClient, self._account["id"], self._account["did"])
-                error = None
-            except Exception as e:
-                convo = None
-                error = str(e)
-            wx.CallAfter(self._onMessageMemberDone, convo, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onMessageMemberDone(self, convo, error):
-        if error or not convo or not convo.get("id"):
-            nvdaUi.message(f"Could not open chat: {error or 'no conversation was returned'}")
-            return
-        openConvo = getattr(self.GetParent().GetTopLevelParent(), "_openChatConvo", None)
-        self.Close()
-        if openConvo:
-            openConvo(convo["id"])
-
-    def _removeSingleMember(self, member):
-        try:
-            index = self._members.index(member)
-        except ValueError:
-            return
-        self.memberList.CheckedItems = [index]
-        self.onRemove(None)
 
     def onCharHook(self, evt):
         if evt.GetKeyCode() == wx.WXK_ESCAPE:
@@ -1735,7 +1926,7 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
         self.Destroy()
 
     def _renderMembers(self):
-        self.memberList.Set([f'@{m["handle"]} ({m.get("display_name") or "no display name"})' for m in self._members])
+        self.memberList.Set([f'@{m["handle"]} ({m.get("display_name") or _("no display name")})' for m in self._members])
         self.memberList.CheckedItems = []
         if self._members:
             self.memberList.SetSelection(0)
@@ -1743,7 +1934,8 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
     def onRemove(self, evt):
         indices = list(self.memberList.CheckedItems)
         if not indices:
-            nvdaUi.message("No members checked.")
+            # Translators: Announced when removing group members with nothing checked.
+            nvdaUi.message(_("No members checked."))
             return
         toRemove = [self._members[i] for i in indices if 0 <= i < len(self._members)]
         if not toRemove:
@@ -1751,7 +1943,11 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
 
         names = ", ".join(f'@{m["handle"]}' for m in toRemove)
         confirm = wx.MessageDialog(
-            self, f"Remove {names} from this group?", "Confirm remove", wx.YES_NO | wx.NO_DEFAULT
+            self,
+            # Translators: Confirmation body for removing group members. {} is a comma-separated list of handles.
+            _("Remove {} from this group?").format(names),
+            # Translators: Title of the confirm-remove-group-members dialog.
+            _("Confirm remove"), wx.YES_NO | wx.NO_DEFAULT
         )
         confirmed = confirm.ShowModal() == wx.ID_YES
         confirm.Destroy()
@@ -1765,7 +1961,8 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
         self._renderMembers()
         self.removeButton.Show(bool(self._members))
         self.Layout()
-        nvdaUi.message(f"Removing {len(toRemove)} member(s)...")
+        # Translators: Announced while removing group members. {} is the count.
+        nvdaUi.message(_("Removing {} member(s)...").format(len(toRemove)))
 
         def worker():
             try:
@@ -1787,9 +1984,11 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
             self._renderMembers()
             self.removeButton.Show(bool(self._members))
             self.Layout()
-            nvdaUi.message(f"Could not remove member(s): {error}")
+            # Translators: Announced when removing group members fails. {} is the error message.
+            nvdaUi.message(_("Could not remove member(s): {}").format(error))
             return
-        nvdaUi.message(f"Removed {len(removed)} member(s).")
+        # Translators: Announced after removing group members. {} is the count.
+        nvdaUi.message(_("Removed {} member(s).").format(len(removed)))
 
     def onSearchTextChanged(self, evt):
         wx.CallLater(400, self._runSearch, self.searchText.GetValue())
@@ -1825,7 +2024,7 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
         self.suggestionList.Show(hasResults)
         self.addButton.Show(hasResults)
         self.Layout()
-        self.suggestionList.Set([f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in self._suggestions])
+        self.suggestionList.Set([f'@{r["handle"]} ({r.get("display_name") or _("no display name")})' for r in self._suggestions])
         self.suggestionList.CheckedItems = []
         if self._suggestions:
             self.suggestionList.SetSelection(0)
@@ -1833,7 +2032,8 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
     def onAddSuggestion(self, evt):
         indices = list(self.suggestionList.CheckedItems)
         if not indices:
-            nvdaUi.message("No suggestions checked.")
+            # Translators: Announced when adding group members with nothing checked in search results.
+            nvdaUi.message(_("No suggestions checked."))
             return
         toAdd = [self._suggestions[i] for i in indices if 0 <= i < len(self._suggestions)]
         if not toAdd:
@@ -1849,7 +2049,8 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
         self.suggestionList.Hide()
         self.addButton.Hide()
         self.Layout()
-        nvdaUi.message(f"Adding {len(toAdd)} member(s)...")
+        # Translators: Announced while adding group members. {} is the count.
+        nvdaUi.message(_("Adding {} member(s)...").format(len(toAdd)))
 
         def worker():
             try:
@@ -1872,9 +2073,135 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
             self._renderMembers()
             self.removeButton.Show(bool(self._members))
             self.Layout()
-            nvdaUi.message(f"Could not add member(s): {error}")
+            # Translators: Announced when adding group members fails. {} is the error message.
+            nvdaUi.message(_("Could not add member(s): {}").format(error))
             return
-        nvdaUi.message(f"Added {len(added)} member(s).")
+        # Translators: Announced after adding group members. {} is the count.
+        nvdaUi.message(_("Added {} member(s).").format(len(added)))
+
+
+class ShareToChatDialog(wx.Dialog):
+    """
+    Post action's "Share to chat..." -- picks an existing accepted
+    conversation and sends the post as an app.bsky.embed.record embed
+    (see client.send_message's embed_ref param). No "start a new
+    conversation from here" option -- NewChatDialog already covers
+    that, keeping this dialog to a single, simple job.
+    """
+
+    def __init__(self, parent, account, post):
+        self._account = account
+        self._post = post
+        self._convos = []
+
+        # Translators: Title of the share-post-to-chat dialog.
+        super().__init__(parent, title=_("Share to chat"), size=(420, 400))
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        previewText = (post.get("text") or "")[:60]
+        if len(post.get("text") or "") > 60:
+            previewText += "..."
+        # Translators: Preview line showing which post is being shared. {} is a truncated preview of the post text.
+        previewLabel = wx.StaticText(self, label=_("Sharing: {}").format(previewText))
+        sizer.Add(previewLabel, flag=wx.EXPAND | wx.ALL, border=10)
+
+        # Translators: Label above the conversation list to share a post to. Mnemonic on "to" since Send is taken by the button below.
+        listLabel = wx.StaticText(self, label=_("Send &to:"))
+        sizer.Add(listLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        self.convoList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        # Translators: Column header for the conversation list in the share-to-chat dialog.
+        self.convoList.InsertColumn(0, _("Conversation"), width=380)
+        sizer.Add(self.convoList, proportion=1, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+
+        # Translators: Label for the optional message field in the share-to-chat dialog.
+        messageLabel = wx.StaticText(self, label=_("&Message (optional):"))
+        sizer.Add(messageLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        self.messageText = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(-1, 60))
+        sizer.Add(self.messageText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+
+        buttonRow = wx.BoxSizer(wx.HORIZONTAL)
+        # Translators: Button to send the shared post.
+        self.sendButton = wx.Button(self, label=_("&Send"))
+        closeBtn = wx.Button(self, label=_("&Cancel"))
+        buttonRow.Add(self.sendButton, flag=wx.RIGHT, border=5)
+        buttonRow.Add(closeBtn)
+        sizer.Add(buttonRow, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
+
+        self.SetSizer(sizer)
+        self.CentreOnScreen()
+
+        self.sendButton.Bind(wx.EVT_BUTTON, self.onSend)
+        self.convoList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onSend)
+        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        self.Bind(wx.EVT_CLOSE, self.onClose)
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+
+        self._loadConvos()
+
+    def onCharHook(self, evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        evt.Skip()
+
+    def onClose(self, evt):
+        gui.mainFrame.postPopup()
+        self.Destroy()
+
+    def _loadConvos(self):
+        allConvos = db.get_convos(self._account["id"])
+        self._convos = [c for c in allConvos if c.get("status") != "request"]
+        self.convoList.DeleteAllItems()
+        for i, convo in enumerate(self._convos):
+            members = db.get_convo_members(self._account["id"], convo["convo_id"])
+            self.convoList.InsertItem(i, db.describe_convo_from_members(convo, members))
+        if self._convos:
+            self.convoList.Focus(0)
+            self.convoList.Select(0)
+            self.convoList.SetFocus()
+        else:
+            # Translators: Announced when there are no conversations to share a post to.
+            nvdaUi.message(_("No conversations to share to yet -- start one from the Chat tab first."))
+
+    def onSend(self, evt):
+        index = self.convoList.GetFocusedItem()
+        if not (0 <= index < len(self._convos)):
+            # Translators: Announced when sharing a post to chat with no conversation selected.
+            nvdaUi.message(_("No conversation selected."))
+            return
+        convo = self._convos[index]
+        convoId = convo["convo_id"]
+        embedRef = {"uri": self._post["uri"], "cid": self._post["cid"]}
+        text = self.messageText.GetValue().strip()
+
+        self.sendButton.Disable()
+        # Translators: Announced while sharing a post to a chat conversation.
+        nvdaUi.message(_("Sharing, please wait..."))
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                client.send_message(atprotoClient, convoId, text, embed_ref=embedRef)
+                client.sync_convo_messages(atprotoClient, self._account["id"], convoId)
+                error = None
+            except Exception as e:
+                error = str(e)
+            wx.CallAfter(self._onSendDone, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onSendDone(self, error):
+        self.sendButton.Enable()
+        if error:
+            log.error(f"NVSky: share to chat failed: {error}")
+            # Translators: Announced when sharing a post to chat fails. {} is the error message.
+            nvdaUi.message(_("Could not share: {}").format(error))
+            return
+        # Translators: Announced after successfully sharing a post to chat.
+        nvdaUi.message(_("Shared."))
+        self.Close()
 
 
 class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
@@ -1899,19 +2226,20 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.convoTree = wx.TreeCtrl(
             self, style=wx.TR_HAS_BUTTONS | wx.TR_HIDE_ROOT | wx.TR_SINGLE | wx.TR_LINES_AT_ROOT
         )
-        self._convoRoot = self.convoTree.AddRoot("Conversations")
+        # Translators: Hidden root label of the conversation tree (used as its accessible name).
+        self._convoRoot = self.convoTree.AddRoot(_("Conversations"))
         splitRow.Add(self.convoTree, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
 
         self.messageList = wx.ListCtrl(self, style=wx.LC_REPORT)
         self._buildMessageListColumns()
         splitRow.Add(self.messageList, proportion=2, flag=wx.EXPAND)
 
-        # Explicit label for composeText -- without one, wx/NVDA falls
-        # back to guessing a label from the nearest static text in tab
-        # order, which is exactly how requestNotice's warning text ended
-        # up getting read out as if it were this edit box's label.
+        # Explicit label -- otherwise NVDA guesses one from the nearest
+        # static text in tab order.
         self.requestNotice = wx.StaticText(
-            self, label="This is a message request. Accept it (see the conversation's menu) to view messages."
+            self,
+            # Translators: Shown in place of the message list for an unaccepted chat request.
+            label=_("This is a message request. Accept it (see the conversation's menu) to view messages."),
         )
         self.requestNotice.Hide()
         splitRow.Add(self.requestNotice, proportion=2, flag=wx.EXPAND)
@@ -1919,10 +2247,13 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         sizer.Add(splitRow, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         composeRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.composeLabel = wx.StaticText(self, label="M&essage:")
+        # Translators: Label for the chat compose box.
+        self.composeLabel = wx.StaticText(self, label=_("&Message:"))
         self.composeText = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER, size=(-1, 60))
-        self.emojiButton = wx.Button(self, label="Emoji...")
-        self.sendButton = wx.Button(self, label="Send (Ctrl+Enter)")
+        # Translators: Button to open the emoji picker for the compose box.
+        self.emojiButton = wx.Button(self, label=_("&Emoji..."))
+        # Translators: Button to send the composed chat message. Shows the Ctrl+Enter shortcut.
+        self.sendButton = wx.Button(self, label=_("&Send (Ctrl+Enter)"))
         composeRow.Add(self.composeLabel, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
         composeRow.Add(self.composeText, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
         composeRow.Add(self.emojiButton, flag=wx.RIGHT, border=5)
@@ -1932,47 +2263,42 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.charCountLabel = wx.StaticText(self, label="")
         sizer.Add(self.charCountLabel, flag=wx.LEFT | wx.BOTTOM, border=10)
 
-        # Dedicated widget for the "this group is locked" explanation --
-        # previously this reused composeLabel (SetLabel()'d in place),
-        # which sat as the last VISIBLE static text before statusBar
-        # whenever every other compose/request/reply control was hidden,
-        # and got its text changed WHILE convoTree still had real focus
-        # (selecting a conversation always fires with tree focus). Fix
-        # replaced dynamic composeLabel retexting with this dedicated,
-        # always-static widget instead -- composeLabel now only ever
-        # shows its fixed default text. Same layout pattern as
-        # requestNotice, which never had this problem.
+        # Dedicated static widget (not composeLabel retexted in place --
+        # that used to get read with stale tree focus, see history).
         self.lockNotice = wx.StaticText(
-            self, label="This group is locked -- no new messages can be sent."
+            # Translators: Shown in place of the compose box for a locked group chat.
+            self, label=_("This group is locked -- no new messages can be sent."),
         )
         sizer.Add(self.lockNotice, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
         self.lockNotice.Hide()
 
-        # Separate, always-visible buttons for a request conversation --
-        # NOT tucked into the context menu, swapped in place of the
-        # compose row above (never both at once) via _updateActionArea().
+        # Dedicated always-visible buttons for a request conversation,
+        # not menu items -- swapped in for the compose row via
+        # _updateActionArea() (never both shown at once).
         requestActionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.acceptButton = wx.Button(self, label="Accept")
-        self.declineButton = wx.Button(self, label="Decline...")
+        # Translators: Button to accept a chat message request.
+        self.acceptButton = wx.Button(self, label=_("&Accept"))
+        # Translators: Button to decline a chat message request.
+        self.declineButton = wx.Button(self, label=_("&Decline..."))
         requestActionRow.Add(self.acceptButton, flag=wx.RIGHT, border=5)
         requestActionRow.Add(self.declineButton)
         sizer.Add(requestActionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
         replyRow = wx.BoxSizer(wx.HORIZONTAL)
         self.replyingToLabel = wx.StaticText(self, label="")
-        self.cancelReplyButton = wx.Button(self, label="Cancel reply")
+        # Translators: Button to cancel an in-progress reply-to-message.
+        self.cancelReplyButton = wx.Button(self, label=_("&Cancel reply"))
         replyRow.Add(self.replyingToLabel, proportion=1, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
         replyRow.Add(self.cancelReplyButton)
         sizer.Add(replyRow, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
         self.replyingToLabel.Hide()
         self.cancelReplyButton.Hide()
 
-        # Explicit accessible name -- without one, NVDA can fall back to
-        # guessing a label for the status bar from the nearest visible
-        # StaticText in tab order (same class of bug as requestNotice
-        # borrowing composeText's label).
+        # Explicit accessible name -- otherwise NVDA can guess one from
+        # the nearest visible StaticText in tab order.
         self.statusBar = wx.StatusBar(self)
-        self.statusBar.SetName("Chat status")
+        # Translators: Accessible name of the Chat tab's status bar.
+        self.statusBar.SetName(_("Chat status"))
         sizer.Add(self.statusBar, flag=wx.EXPAND)
 
         self.SetSizer(sizer)
@@ -1987,6 +2313,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.acceptButton.Bind(wx.EVT_BUTTON, self.onAcceptButton)
         self.declineButton.Bind(wx.EVT_BUTTON, self.onDeclineButton)
         self.cancelReplyButton.Bind(wx.EVT_BUTTON, self.onCancelReply)
+        self.convoTree.Bind(wx.EVT_CHAR_HOOK, self.onConvoTreeCharHook)
         self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
         self._updateTitle()
@@ -1995,16 +2322,17 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self._startTimeRefreshTimer()
 
         if self._account is None:
-            nvdaUi.message("No active account. Log in from Settings first.")
-            
+            # Translators: Announced when opening the Chat tab with no active account.
+            nvdaUi.message(_("No active account. Log in from Settings first."))
+
     # ---------------- MainWindow integration hooks ----------------
 
     def onTabActivated(self):
-        nvdaUi.message(f"{self.TAB_NAME} tab")
-        # Local-only refresh (no network) -- picks up anything written
-        # to the shared local DB by another tab (e.g. a message sent
-        # from a popped-out ConvoTabWindow) since Chat was last shown,
-        # without needing an explicit F5.
+        # Translators: Announced when switching to the Chat tab. {} is the tab name.
+        nvdaUi.message(_("{} tab").format(self.TAB_NAME))
+        # Local-only refresh (no network) -- picks up anything another
+        # tab wrote to the shared DB (e.g. a send from a popped-out
+        # ConvoTabWindow) since Chat was last shown, without an F5.
         currentConvo = self._currentConvo()
         self._loadFromCache()
         if currentConvo:
@@ -2017,7 +2345,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self._timeRefreshTimer.Start(60000)
 
     def _onTimeRefreshTick(self, evt):
-        mode, _ = timeutils.current_mode_and_pattern(db)
+        mode, _pattern = timeutils.current_mode_and_pattern(db)
         if mode not in ("relative_24h", "relative_always"):
             return
         if not self.messageList.IsShownOnScreen():
@@ -2038,9 +2366,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
     def _updateTitle(self):
         # Same pattern as FeedListMixin._updateTitle in feedWindow.py --
-        # short tab label, full "<tab> - NVSky - <handle>" on the shared
-        # MainWindow title bar only while this tab is the active one.
-        accountLabel = self._account["handle"] if self._account else "no account"
+        # short tab label, full title only while this tab is active.
+        # Translators: Fallback account label in the window title when no account is active.
+        accountLabel = self._account["handle"] if self._account else _("no account")
         notebook = self.GetParent()
         index = notebook.FindPage(self)
         if index != wx.NOT_FOUND:
@@ -2095,24 +2423,32 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
     def _convoLabel(self, convo):
         members = self._membersByConvo.get(convo["convo_id"], [])
         name = db.describe_convo_from_members(convo, members)
-        # db.get_unread_message_count (kept in sync with the server via
-        # reconcile_message_read_state + client.mark_message_read)
-        # instead of convo["unread_count"] directly -- that field only
-        # changes on a full resync or the explicit "Mark read" action.
+        # db.get_unread_message_count (synced via reconcile_message_read_state
+        # + client.mark_message_read) instead of convo["unread_count"] --
+        # that field only updates on a full resync or explicit mark-read.
         unread = db.get_unread_message_count(self._account["id"], convo["convo_id"]) if self._account else 0
-        suffix = f", {unread} unread" if unread else ""
+        # Translators: Unread-count suffix on a conversation's tree label. {} is the count.
+        suffix = _(", {} unread").format(unread) if unread else ""
         if convo.get("status") == "request":
-            tags = ["request"]
+            # Translators: Tag for a not-yet-accepted chat request.
+            tags = [_("request")]
         else:
             tags = []
             if convo.get("is_group"):
-                tags.append("group")
+                # Translators: Tag for a group conversation.
+                tags.append(_("group"))
             if convo.get("locked"):
-                tags.append("locked")
+                # Translators: Tag for a locked group conversation.
+                tags.append(_("locked"))
             joinRequests = convo.get("unread_join_request_count", 0) if convo.get("is_admin") else 0
-            if joinRequests:
-                tags.append(f"{joinRequests} join request{'s' if joinRequests != 1 else ''}")
-        prefix = f"({', '.join(tags)}) " if tags else ""
+            if joinRequests == 1:
+                # Translators: Tag for exactly one pending group join request.
+                tags.append(_("1 join request"))
+            elif joinRequests:
+                # Translators: Tag for pending group join requests. {} is the count.
+                tags.append(_("{} join requests").format(joinRequests))
+        # Translators: Wraps the tag list before a conversation name, e.g. "(group, locked) ". {} is the comma-joined tags.
+        prefix = _("({}) ").format(", ".join(tags)) if tags else ""
         return f"{prefix}{name}{suffix}"
 
     def _updateStatusBar(self):
@@ -2121,7 +2457,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             totalUnread = sum(
                 db.get_unread_message_count(self._account["id"], c["convo_id"]) for c in self._convos
             )
-        self.statusBar.SetStatusText(f"Chat {totalUnread} unread {len(self._convos)} conversations")
+        # Translators: Chat tab status bar text. First {} is unread count, second {} is conversation count.
+        self.statusBar.SetStatusText(_("Chat {} unread {} conversations").format(totalUnread, len(self._convos)))
 
     def _refreshConvoLabel(self, convoId):
         # Updates just this one conversation's tree label + the overall
@@ -2156,27 +2493,41 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         myDid = self._account["did"] if self._account else None
         senderDid = message.get("sender_did")
         if senderDid == myDid:
-            return "You"
+            # Translators: Sender label for your own messages in the chat list.
+            return _("You")
         return self._memberLabel(self._currentConvoId, senderDid)
 
     def _messageDisplayText(self, message):
         text = message.get("text", "")
         replyPreview = message.get("reply_to_text")
         if replyPreview:
-            text = f"(Reply to: {replyPreview[:30]}) {text}"
+            # Translators: Reply-preview prefix on a chat message row. First {} is a preview of the original, second {} is this message's own text.
+            text = _("(Reply to: {}) {}").format(replyPreview[:30], text)
+        embedDesc = _describe_message_embed(message.get("embed_json"))
+        if embedDesc:
+            text = f"{text} {embedDesc}".strip() if text else embedDesc
         return text
 
+    def _checkConvoTreeBoundaryBeforeKey(self, keyCode):
+        # Same deterministic-boundary reasoning as
+        # _checkMessageListBoundaryBeforeKey above, adapted for
+        # TreeCtrl's sibling-based navigation instead of a flat index.
+        item = self.convoTree.GetSelection()
+        if not item.IsOk() or item == self._convoRoot:
+            return
+        if keyCode == wx.WXK_UP:
+            prevItem = self.convoTree.GetPrevSibling(item)
+            if not prevItem.IsOk():
+                soundpack.play("boundary")
+        elif keyCode == wx.WXK_DOWN:
+            nextItem = self.convoTree.GetNextSibling(item)
+            if not nextItem.IsOk():
+                soundpack.play("boundary")
+
     def onConvoSelected(self, evt):
-        # Defensive guard added after the _openChatConvo suppression fix
-        # (mainWindow.py) alone didn't stop every crash -- the tree can
-        # apparently still get torn down from some other path this
-        # hasn't been pinned down yet. try/except here can't fix that
-        # underlying cause, but it turns a repeat into a silent no-op
-        # instead of an unhandled RuntimeError that force-restarts NVDA,
-        # which is the important part while the real cause is still
-        # unconfirmed. Please keep reporting if this still fires -- it
-        # means there's a genuine bug being papered over, not just
-        # defensive style.
+        # Defensive guard -- tree can apparently get torn down from an
+        # unconfirmed path; catches it as a no-op instead of crashing
+        # NVDA. Report if this still fires, the real cause is unknown.
         try:
             if not getattr(self, "convoTree", None):
                 return
@@ -2191,21 +2542,12 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             evt.Skip()
 
     def _showMessages(self, convoId):
-        # previousConvoId lets the lock/request announcement below fire
-        # only when the SELECTED conversation actually changes, not on
-        # every resync-triggered redraw of the same conversation (Check
-        # for updates, background sync, etc.) -- otherwise it would
-        # repeat itself on every F5 while sitting in a locked group.
+        # Only announce lock/request status on an actual selection
+        # change, not every resync-triggered redraw of the same convo.
         previousConvoId = self._currentConvoId
-        # previousMessageId lets a reload of the SAME conversation
-        # restore the message the user was actually on, instead of
-        # always snapping to the newest one. This became much more
-        # visible once cross-tab notifyConvoChanged started triggering
-        # reloads far more often (every send/react/mark-read/lock
-        # anywhere touching this convo, not just an explicit F5) --
-        # reading through older messages and having focus silently
-        # yanked to the newest one moments after a background resync
-        # landed was the "focus keeps jumping to the last item" report.
+        # Restores focus to the same message on a reload of the SAME
+        # convo instead of snapping to newest -- matters since
+        # notifyConvoChanged reloads far more often than just F5.
         previousMessageId = None
         if convoId == previousConvoId:
             oldMessages = getattr(self, "_currentMessages", [])
@@ -2235,14 +2577,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
             isRequest = convo is not None and convo.get("status") == "request"
             isLocked = convo is not None and bool(convo.get("locked")) and not isRequest
-            # lockNotice/requestNotice are plain StaticText -- neither is
-            # a Tab stop, so ordinary keyboard navigation never lands on
-            # them (only the review cursor does, which most users don't
-            # use day to day -- confirmed by testing). Speaking this
-            # explicitly on an actual selection change is what makes the
-            # "why" discoverable; the convoTree's own "(locked)"/
-            # "(request)" tag on the item only says THAT it's locked/a
-            # request, not what that means for sending a message.
+            # Speak lock/request status explicitly -- neither notice is
+            # a Tab stop, and the tree's own "(locked)"/"(request)" tag
+            # only says THAT, not what it means for sending a message.
             if convoId != previousConvoId:
                 if isLocked:
                     nvdaUi.message(self.lockNotice.GetLabel())
@@ -2292,14 +2629,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             self.messageList.Thaw()
 
     def _updateActionArea(self, convo):
-        # Exactly one of (compose+Send) / (Accept+Decline) / (lock
-        # notice) is visible at a time, based on the selected
-        # conversation's status -- never more than one, never none
-        # (unless nothing is selected at all). composeLabel now ONLY
-        # ever shows its fixed default text and is shown/hidden in
-        # lockstep with the real compose controls -- it is never
-        # SetLabel()'d dynamically anymore (see lockNotice's comment in
-        # __init__ for why).
+        # Exactly one of compose+Send / Accept+Decline / lock notice is
+        # visible at a time, based on the selected conversation.
         isRequest = convo is not None and convo.get("status") == "request"
         isLocked = convo is not None and bool(convo.get("locked")) and not isRequest
         hasConvo = convo is not None
@@ -2313,6 +2644,17 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.acceptButton.Show(isRequest)
         self.declineButton.Show(isRequest)
         self.Layout()
+
+    def onConvoTreeCharHook(self, evt):
+        # Bound directly on convoTree (not the shared panel-level
+        # EVT_CHAR_HOOK, which only ever checked messageList) so
+        # Up/Down here plays "boundary" at the top/bottom of the
+        # conversation tree specifically -- messageList's own check
+        # stays in _ChatMessagePanelMixin.onCharHook, unaffected.
+        keyCode = evt.GetKeyCode()
+        if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers():
+            self._checkConvoTreeBoundaryBeforeKey(keyCode)
+        evt.Skip()
 
     def onAcceptButton(self, evt):
         convo = self._currentConvo()
@@ -2330,9 +2672,11 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         # the way a 1:1's single member used to.
         members = self._membersByConvo.get(convoId, [])
         member = next((m for m in members if m["did"] == did), None)
+        # Translators: Fallback sender label when a chat member's info isn't cached.
+        fallback = _("Them")
         if member is None:
-            return "Them"
-        return member.get("display_name") or member.get("handle") or "Them"
+            return fallback
+        return member.get("display_name") or member.get("handle") or fallback
 
     def _currentConvo(self):
         item = self.convoTree.GetSelection()
@@ -2358,9 +2702,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.convoTree.SelectItem(item)
         convo = self._currentConvo()
         if convo is None or convo.get("status") == "request":
-            # Accept/Decline are dedicated always-visible buttons now
-            # (see _updateActionArea), not menu items -- nothing else
-            # applies to a not-yet-accepted request.
+            # Accept/Decline are dedicated always-visible buttons (see
+            # _updateActionArea) -- nothing else applies to a request.
             return
 
         isGroup = bool(convo.get("is_group"))
@@ -2368,46 +2711,51 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         isAdmin = bool(convo.get("is_admin"))
 
         menu = wx.Menu()
-        markReadItem = menu.Append(wx.ID_ANY, "Mark read")
-        markAllReadItem = menu.Append(wx.ID_ANY, "Mark all read")
-        muteItem = menu.Append(wx.ID_ANY, "Unmute" if convo.get("muted") else "Mute")
+        # Translators: Context menu item to mark a conversation read.
+        markReadItem = menu.Append(wx.ID_ANY, _("&Mark read"))
+        # Translators: Context menu item to mark every conversation read.
+        markAllReadItem = menu.Append(wx.ID_ANY, _("Mark &all read"))
+        # Translators: Context menu item to mute a conversation.
+        # Translators: Context menu item to unmute a conversation.
+        muteItem = menu.Append(wx.ID_ANY, _("U&nmute") if convo.get("muted") else _("M&ute"))
         self.Bind(wx.EVT_MENU, lambda e: self._markConvoRead(convo), markReadItem)
         self.Bind(wx.EVT_MENU, lambda e: self._markAllConvosRead(), markAllReadItem)
         self.Bind(wx.EVT_MENU, lambda e: self._toggleMuteConvo(convo), muteItem)
 
-        # An owner can't Leave until the group is locked (OwnerCannotLeave
-        # from the server) -- previously Leave was always offered and
-        # _onLeaveConvoDone turned the failure into a clear "lock first"
-        # message after the fact. Now that convo["is_admin"] reliably
-        # reflects the current account's own role (see
-        # client._store_convo), the one case guaranteed to fail -- an
-        # unlocked group's owner -- just isn't offered at all; every
-        # other case (1:1, a regular member, or an already-locked
-        # group's owner) still shows it exactly as before.
+        # An owner can't Leave until the group is locked (server's
+        # OwnerCannotLeave error, confirmed by testing) -- only offer
+        # Leave when that failure case doesn't apply.
         if not (isGroup and isAdmin and not locked):
-            leaveItem = menu.Append(wx.ID_ANY, "Leave conversation...")
+            # Translators: Context menu item to leave a conversation.
+            leaveItem = menu.Append(wx.ID_ANY, _("&Leave conversation..."))
             self.Bind(wx.EVT_MENU, lambda e: self._leaveConvo(convo), leaveItem)
         if isGroup and isAdmin:
             # LOCK REQUIRES OWNER -- confirmed via a real 400
-            # InsufficientRole error from a regular member. Only ever
-            # offered to the admin/owner now.
-            lockItem = menu.Append(wx.ID_ANY, "Unlock this group" if locked else "Lock this group")
+            # InsufficientRole error from a regular member.
+            # Translators: Context menu item to unlock a group conversation.
+            # Translators: Context menu item to lock a group conversation.
+            lockItem = menu.Append(wx.ID_ANY, _("Unlo&ck this group") if locked else _("Loc&k this group"))
             self.Bind(wx.EVT_MENU, lambda e: self._setGroupLocked(convo, not locked), lockItem)
 
-        openTabItem = menu.Append(wx.ID_ANY, "Open in new tab...")
+        # Translators: Context menu item to open a conversation in its own removable tab.
+        openTabItem = menu.Append(wx.ID_ANY, _("&Open in new tab..."))
         self.Bind(wx.EVT_MENU, lambda e: self._openInNewTab(convo), openTabItem)
         if isGroup:
-            manageMembersItem = menu.Append(wx.ID_ANY, "Manage members...")
+            # Translators: Context menu item to add/remove group members.
+            manageMembersItem = menu.Append(wx.ID_ANY, _("Mana&ge members..."))
             self.Bind(wx.EVT_MENU, lambda e: self._manageGroupMembers(convo), manageMembersItem)
         if isGroup and isAdmin:
             # RENAME REQUIRES OWNER TOO -- same InsufficientRole error
-            # confirmed for a regular member trying to rename the group.
-            editNameItem = menu.Append(wx.ID_ANY, "Edit name...")
+            # confirmed for a regular member.
+            # Translators: Context menu item to rename a group.
+            editNameItem = menu.Append(wx.ID_ANY, _("&Edit name..."))
             self.Bind(wx.EVT_MENU, lambda e: self._editGroupName(convo), editNameItem)
         if isGroup and isAdmin:
-            joinRequestsItem = menu.Append(wx.ID_ANY, "Join requests...")
+            # Translators: Context menu item to view pending group join requests.
+            joinRequestsItem = menu.Append(wx.ID_ANY, _("&Join requests..."))
             self.Bind(wx.EVT_MENU, lambda e: JoinRequestsDialog(self, self._account, convo).Show(), joinRequestsItem)
-            inviteLinkItem = menu.Append(wx.ID_ANY, "Invite link...")
+            # Translators: Context menu item to manage the group's invite link.
+            inviteLinkItem = menu.Append(wx.ID_ANY, _("&Invite link..."))
             self.Bind(wx.EVT_MENU, lambda e: InviteLinkDialog(self, self._account, convo).Show(), inviteLinkItem)
 
         self.PopupMenu(menu)
@@ -2420,21 +2768,25 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         dlg.Show()
 
     def _editGroupName(self, convo):
-        dlg = wx.TextEntryDialog(self, "New group name:", "Edit group name", value=convo.get("group_name") or "")
+        # Translators: Prompt for the rename-group text entry dialog.
+        # Translators: Title of the rename-group dialog.
+        dlg = wx.TextEntryDialog(self, _("New group name:"), _("Edit group name"), value=convo.get("group_name") or "")
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
             return
         name = dlg.GetValue().strip()
         dlg.Destroy()
         if not name:
-            nvdaUi.message("Group name can't be empty.")
+            # Translators: Announced when trying to rename a group to an empty name.
+            nvdaUi.message(_("Group name can't be empty."))
             return
         convoId = convo["convo_id"]
         previousName = convo.get("group_name")
         convo["group_name"] = name
         db.set_convo_group_name(self._account["id"], convoId, name)
         self._refreshConvoLabel(convoId)
-        nvdaUi.message(f'Group renamed to "{name}".')
+        # Translators: Announced after renaming a group. {} is the new name.
+        nvdaUi.message(_('Group renamed to "{}".').format(name))
         self._notifyConvoChanged(convoId)
 
         def worker():
@@ -2460,25 +2812,23 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             convo["group_name"] = previousName
         db.set_convo_group_name(self._account["id"], convoId, previousName)
         self._refreshConvoLabel(convoId)
-        nvdaUi.message(f"Could not rename group: {error}")
+        # Translators: Announced when renaming a group fails. {} is the error message.
+        nvdaUi.message(_("Could not rename group: {}").format(error))
         self._notifyConvoChanged(convoId)
 
     def _setGroupLocked(self, convo, locked):
-        # Optimistic UI, same pattern as _markConvoRead just above: we
-        # already know the resulting state (we're the one requesting
-        # it), so update local DB + on-screen state immediately instead
-        # of announcing progress and waiting on a full foreground Chat
-        # sync (onCheckForUpdates) the way this used to work -- that
-        # produced a confusing "Group locked." immediately followed by
-        # "Checking Chat for updates, please wait..." for something the
-        # UI already knew the answer to.
+        # Optimistic UI (same pattern as _markConvoRead): we already
+        # know the result, so update DB + UI immediately instead of a
+        # full sync round-trip.
         convoId = convo["convo_id"]
         db.set_convo_locked(self._account["id"], convoId, locked)
         convo["locked"] = int(locked)
         self._refreshConvoLabel(convoId)
         if self._currentConvoId == convoId:
             self._updateActionArea(convo)
-        nvdaUi.message("Group locked." if locked else "Group unlocked.")
+        # Translators: Announced after locking a group conversation.
+        # Translators: Announced after unlocking a group conversation.
+        nvdaUi.message(_("Group locked.") if locked else _("Group unlocked."))
         self._notifyConvoChanged(convoId)
 
         def worker():
@@ -2503,9 +2853,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
     def _onSetGroupLockedDone(self, convoId, requestedLocked, error):
         if error:
             log.error(f"NVSky: lock/unlock group failed: {error}")
-            # The optimistic update above was wrong -- roll it back and
-            # say so plainly, instead of leaving the UI showing a state
-            # the server never actually applied.
+            # Roll back the optimistic update -- the server never
+            # actually applied it.
             db.set_convo_locked(self._account["id"], convoId, not requestedLocked)
             convo = next((c for c in self._convos if c["convo_id"] == convoId), None)
             if convo is not None:
@@ -2513,13 +2862,17 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 self._refreshConvoLabel(convoId)
                 if self._currentConvoId == convoId:
                     self._updateActionArea(convo)
-            nvdaUi.message(f"Could not {'lock' if requestedLocked else 'unlock'} the group: {error}")
+            if requestedLocked:
+                # Translators: Announced when locking a group fails. {} is the error message.
+                nvdaUi.message(_("Could not lock the group: {}").format(error))
+            else:
+                # Translators: Announced when unlocking a group fails. {} is the error message.
+                nvdaUi.message(_("Could not unlock the group: {}").format(error))
             self._notifyConvoChanged(convoId)
             return
-        # Quiet resync already landed the authoritative state in the DB
-        # above -- just re-render if this conversation is still on
-        # screen. No announcement -- the user already heard the result
-        # immediately when they took the action.
+        # Quiet resync already landed the authoritative state -- just
+        # re-render if still on screen. No announcement needed, the
+        # user already heard the result above.
         self._reloadMessagesIfCurrent(convoId)
 
     def _acceptConvo(self, convo):
@@ -2532,15 +2885,19 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = None
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onConvoActionDone, "Accepted." if not error else None, error)
+            # Translators: Announced after accepting a chat message request.
+            wx.CallAfter(self._onConvoActionDone, _("Accepted.") if not error else None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _declineConvo(self, convo):
         name = db.describe_convo_from_members(convo, self._membersByConvo.get(convo["convo_id"], []))
         confirm = wx.MessageDialog(
-            self, f"Decline this message request from {name}?",
-            "Decline request", wx.YES_NO | wx.NO_DEFAULT,
+            self,
+            # Translators: Confirmation body for declining a chat message request. {} is who it's from.
+            _("Decline this message request from {}?").format(name),
+            # Translators: Title of the decline-request confirmation dialog.
+            _("Decline request"), wx.YES_NO | wx.NO_DEFAULT,
         )
         confirmed = confirm.ShowModal() == wx.ID_YES
         confirm.Destroy()
@@ -2578,9 +2935,11 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
     def _onMarkReadDone(self, error):
         if error:
             log.error(f"NVSky: mark convo read failed server-side: {error}")
-            nvdaUi.message(f"Marked as read locally, but the server update failed: {error}")
+            # Translators: Announced when the local mark-read succeeded but the server update failed. {} is the error message.
+            nvdaUi.message(_("Marked as read locally, but the server update failed: {}").format(error))
             return
-        nvdaUi.message("Marked as read.")
+        # Translators: Announced after marking a conversation read.
+        nvdaUi.message(_("Marked as read."))
 
     def _markAllConvosRead(self):
         if self._account is None:
@@ -2589,7 +2948,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             db.mark_convo_read_local(self._account["id"], convo["convo_id"])
             db.mark_all_messages_read(self._account["id"], convo["convo_id"])
         self._loadFromCache()
-        nvdaUi.message("All conversations marked read.")
+        # Translators: Announced after marking every conversation read.
+        nvdaUi.message(_("All conversations marked read."))
 
         def worker():
             try:
@@ -2609,10 +2969,12 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 atprotoClient = client.get_client_for_active_account()
                 if wasMuted:
                     client.unmute_convo(atprotoClient, convoId)
-                    message = "Unmuted."
+                    # Translators: Announced after unmuting a conversation.
+                    message = _("Unmuted.")
                 else:
                     client.mute_convo(atprotoClient, convoId)
-                    message = "Muted."
+                    # Translators: Announced after muting a conversation.
+                    message = _("Muted.")
                 error = None
             except Exception as e:
                 error = str(e)
@@ -2625,9 +2987,10 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         name = db.describe_convo_from_members(convo, self._membersByConvo.get(convo["convo_id"], []))
         confirm = wx.MessageDialog(
             self,
-            f"Leave this conversation with {name}? "
-            "It will be removed from your list.",
-            "Leave conversation", wx.YES_NO | wx.NO_DEFAULT,
+            # Translators: Confirmation body for leaving a conversation. {} is who it's with.
+            _("Leave this conversation with {}? It will be removed from your list.").format(name),
+            # Translators: Title of the leave-conversation confirmation dialog.
+            _("Leave conversation"), wx.YES_NO | wx.NO_DEFAULT,
         )
         confirmed = confirm.ShowModal() == wx.ID_YES
         confirm.Destroy()
@@ -2652,23 +3015,29 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
     def _onLeaveConvoDone(self, error):
         if error:
             log.error(f"NVSky: leave conversation failed: {error}")
+            soundpack.play("error")
             if "OwnerCannotLeave" in error:
-                nvdaUi.message(
+                # Translators: Announced when leaving fails because the account owns and hasn't locked this group.
+                nvdaUi.message(_(
                     "You're the owner of this group -- lock it first "
                     "(right-click the conversation, Lock this group), "
                     "then you'll be able to leave."
-                )
+                ))
             else:
-                nvdaUi.message(f"Could not leave conversation: {error}")
+                # Translators: Announced when leaving a conversation fails. {} is the error message.
+                nvdaUi.message(_("Could not leave conversation: {}").format(error))
             return
-        nvdaUi.message("Left conversation.")
+        soundpack.play("delete")
+        # Translators: Announced after leaving a conversation.
+        nvdaUi.message(_("Left conversation."))
         self._loadFromCache()
 
     @uiutil.safe_ui_callback
     def _onConvoActionDone(self, message, error):
         if error:
             log.error(f"NVSky: conversation action failed: {error}")
-            nvdaUi.message(f"Action failed: {error}")
+            # Translators: Announced when a conversation action (accept/mute/etc.) fails. {} is the error message.
+            nvdaUi.message(_("Action failed: {}").format(error))
             return
         nvdaUi.message(message)
         self.onCheckForUpdates(None)
@@ -2678,7 +3047,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         members = self._membersByConvo.get(convo["convo_id"], [])
         panel = ConvoTabWindow(mainWindow.notebook, dict(convo), self._account, members, origin_key="chat")
         label = db.describe_convo_from_members(convo, members)
-        mainWindow.addTab(panel, f"Chat: {label}", select=True, removable=True)
+        # Translators: Title of a popped-out conversation tab. {} is the conversation's display name.
+        mainWindow.addTab(panel, _("Chat: {}").format(label), select=True, removable=True)
         db.add_open_temp_tab(self._account["id"], {
             "type": "conversation",
             "key": convo["convo_id"],
@@ -2690,13 +3060,15 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
     def onRefreshSelectedConvo(self):
         # Plain F5 -- cheap, single-conversation refresh (the full
-        # sweep is Ctrl+F5, see onCheckForUpdates below, which
-        # MainWindow's checkAllOpenTabs() also calls for every tab).
+        # sweep is Ctrl+F5, see onCheckForUpdates below).
         convoId = self._currentConvoId
         if not convoId or self._account is None:
-            nvdaUi.message("Select a conversation first.")
+            # Translators: Announced when F5 is pressed with no conversation selected.
+            nvdaUi.message(_("Select a conversation first."))
             return
-        nvdaUi.message("Checking for updates, please wait...")
+        # Translators: Announced while checking a single conversation for updates.
+        nvdaUi.message(_("Checking for updates, please wait..."))
+        soundpack.start_progress()
         previousMessageCount = len(getattr(self, "_currentMessages", []))
 
         def worker():
@@ -2712,29 +3084,30 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
     @uiutil.safe_ui_callback
     def _onRefreshSelectedConvoDone(self, convoId, error, previousMessageCount):
+        soundpack.stop_progress()
         if error:
             log.error(f"NVSky: conversation refresh failed: {error}")
-            nvdaUi.message(f"Could not check for updates: {error}")
+            soundpack.play("error")
+            # Translators: Announced when checking a conversation for updates fails. {} is the error message.
+            nvdaUi.message(_("Could not check for updates: {}").format(error))
             return
         self._reloadMessagesIfCurrent(convoId)
         convo = next((c for c in self._convos if c["convo_id"] == convoId), None)
         members = self._membersByConvo.get(convoId, [])
-        name = db.describe_convo_from_members(convo, members) if convo else "this conversation"
+        # Translators: Fallback name when a conversation's members aren't cached.
+        name = db.describe_convo_from_members(convo, members) if convo else _("this conversation")
         newCount = len(getattr(self, "_currentMessages", []))
         if newCount <= previousMessageCount:
-            nvdaUi.message(f"No new chat for {name}.")
+            # Translators: Announced when a conversation refresh finds nothing new. {} is the conversation name.
+            nvdaUi.message(_("No new chat for {}.").format(name))
         else:
-            nvdaUi.message(f"{name} updated.")
+            # Translators: Announced when a conversation refresh finds new messages. {} is the conversation name.
+            nvdaUi.message(_("{} updated.").format(name))
 
     def _syncForBulkCheck(self, atprotoClient):
-        # Comparing summed unread_count alone missed real changes that
-        # don't move that number -- a brand-new convo already read
-        # elsewhere, a message landing in an already-fully-read convo,
-        # or last_message_text changing with unread staying flat --
-        # confirmed as the cause of "data really did update, but
-        # checkAllOpenTabs neither announced nor reloaded it." Snapshot
-        # every convo's (unread_count, last_message_sent_at) instead --
-        # any of those changing means something real happened.
+        # Snapshot (unread_count, last_message_sent_at) per convo --
+        # summed unread_count alone missed real changes (already-read
+        # elsewhere, flat unread with new last-message, etc).
         beforeSnapshot = {
             c["convo_id"]: (c.get("unread_count") or 0, c.get("last_message_sent_at"))
             for c in self._convos
@@ -2748,18 +3121,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         return afterSnapshot != beforeSnapshot
 
     def _reloadAfterBulkCheck(self, moveFocus=True):
-        # moveFocus WAS ignored here on the assumption that
-        # SelectItem() alone doesn't grab real OS focus -- confirmed
-        # false by testing: _loadFromCache() below does a full
-        # DeleteAllItems()+rebuild of convoTree (not just SelectItem),
-        # and rebuilding the native tree control's items apparently
-        # does pull real focus back onto convoTree, even while the
-        # user actually had real focus on messageList (reading/
-        # replying while background sync ticked). Explicitly capturing
-        # and restoring whichever control really had focus beforehand,
-        # rather than trusting which native calls do or don't touch
-        # focus, is the same defensive pattern already used elsewhere
-        # (see FeedListMixin._applyFocusPosition's history).
+        # _loadFromCache() rebuilds convoTree's items, which pulls real
+        # focus back onto it even if messageList had focus -- capture
+        # and restore explicitly instead of trusting native behavior.
         hadMessageListFocus = self.messageList.HasFocus()
         currentConvo = self._currentConvo()
         self._loadFromCache()
@@ -2770,9 +3134,12 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
     def onCheckForUpdates(self, evt=None):
         if self._account is None:
-            nvdaUi.message("No active account.")
+            # Translators: Announced when checking Chat for updates with no active account.
+            nvdaUi.message(_("No active account."))
             return
-        nvdaUi.message("Checking Chat for updates, please wait...")
+        # Translators: Announced while checking Chat for updates (Ctrl+F5 or app-wide check).
+        nvdaUi.message(_("Checking Chat for updates, please wait..."))
+        soundpack.start_progress()
         currentConvo = self._currentConvo()
         previousMessageCount = len(getattr(self, "_currentMessages", [])) if currentConvo else 0
 
@@ -2789,9 +3156,12 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
     @uiutil.safe_ui_callback
     def _onCheckForUpdatesDone(self, error, previousMessageCount=0):
+        soundpack.stop_progress()
         if error:
             log.error(f"NVSky: Chat sync failed: {error}")
-            nvdaUi.message(f"Could not check Chat for updates: {error}")
+            soundpack.play("error")
+            # Translators: Announced when checking Chat for updates fails. {} is the error message.
+            nvdaUi.message(_("Could not check Chat for updates: {}").format(error))
             return
         currentConvoBefore = self._currentConvo()
         self._loadFromCache()
@@ -2800,10 +3170,13 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         newMessageCount = len(getattr(self, "_currentMessages", []))
         if currentConvoBefore and newMessageCount <= previousMessageCount:
             members = self._membersByConvo.get(currentConvoBefore["convo_id"], [])
-            name = db.describe_convo_from_members(currentConvoBefore, members) if members or currentConvoBefore.get("is_group") else "this conversation"
-            nvdaUi.message(f"No new chat for {name}.")
+            # Translators: Fallback name when a conversation's members aren't cached.
+            name = db.describe_convo_from_members(currentConvoBefore, members) if members or currentConvoBefore.get("is_group") else _("this conversation")
+            # Translators: Announced when checking Chat for updates finds nothing new. {} is the conversation name.
+            nvdaUi.message(_("No new chat for {}.").format(name))
         else:
-            nvdaUi.message("Chat updated.")
+            # Translators: Announced when checking Chat for updates finds new messages.
+            nvdaUi.message(_("Chat updated."))
 
 
 class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
@@ -2839,8 +3212,10 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
 
         composeRow = wx.BoxSizer(wx.HORIZONTAL)
         self.composeText = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER, size=(-1, 60))
-        self.emojiButton = wx.Button(self, label="Emoji...")
-        self.sendButton = wx.Button(self, label="Send (Ctrl+Enter)")
+        # Translators: Button to open the emoji picker for the compose box.
+        self.emojiButton = wx.Button(self, label=_("&Emoji..."))
+        # Translators: Button to send the composed chat message. Shows the Ctrl+Enter shortcut.
+        self.sendButton = wx.Button(self, label=_("&Send (Ctrl+Enter)"))
         composeRow.Add(self.composeText, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
         composeRow.Add(self.emojiButton, flag=wx.RIGHT, border=5)
         composeRow.Add(self.sendButton)
@@ -2849,14 +3224,17 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         self.charCountLabel = wx.StaticText(self, label="")
         sizer.Add(self.charCountLabel, flag=wx.LEFT | wx.BOTTOM, border=10)
 
-        # lock-aware compose hiding, was missing entirely before
-        self.lockNotice = wx.StaticText(self, label="This group is locked -- no new messages can be sent.")
+        self.lockNotice = wx.StaticText(
+            # Translators: Shown in place of the compose box for a locked group chat.
+            self, label=_("This group is locked -- no new messages can be sent."),
+        )
         sizer.Add(self.lockNotice, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
         self.lockNotice.Hide()
 
         replyRow = wx.BoxSizer(wx.HORIZONTAL)
         self.replyingToLabel = wx.StaticText(self, label="")
-        self.cancelReplyButton = wx.Button(self, label="Cancel reply")
+        # Translators: Button to cancel an in-progress reply-to-message.
+        self.cancelReplyButton = wx.Button(self, label=_("&Cancel reply"))
         replyRow.Add(self.replyingToLabel, proportion=1, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
         replyRow.Add(self.cancelReplyButton)
         sizer.Add(replyRow, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
@@ -2864,7 +3242,8 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         self.cancelReplyButton.Hide()
 
         self.statusBar = wx.StatusBar(self)
-        self.statusBar.SetName(f"{self.TAB_NAME} status")
+        # Translators: Accessible name of a conversation tab's status bar. {} is the conversation name.
+        self.statusBar.SetName(_("{} status").format(self.TAB_NAME))
         sizer.Add(self.statusBar, flag=wx.EXPAND)
 
         self.SetSizer(sizer)
@@ -2896,15 +3275,20 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         self.Layout()
 
     def _updateTitle(self):
+        # Same account-label pattern as ChatWindow -- see that class's
+        # _updateTitle history for why this needed adding.
+        # Translators: Fallback account label in the window title when no account is active.
+        accountLabel = self._account["handle"] if self._account else _("no account")
         notebook = self.GetParent()
         index = notebook.FindPage(self)
         if index != wx.NOT_FOUND:
             notebook.SetPageText(index, self.TAB_NAME)
             if index == notebook.GetSelection():
-                self.GetTopLevelParent().SetTitle(f"{self.TAB_NAME} - NVSky")
+                self.GetTopLevelParent().SetTitle(f"{self.TAB_NAME} - NVSky - {accountLabel}")
 
     def onTabActivated(self):
-        nvdaUi.message(f"{self.TAB_NAME} tab")
+        # Translators: Announced when switching to a conversation tab. {} is the tab name.
+        nvdaUi.message(_("{} tab").format(self.TAB_NAME))
         self._loadMessages()  # moveFocus=True by default -- handles it internally now
 
     def onTabRemoved(self):
@@ -2947,13 +3331,9 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         self._updateTitle()
 
     def _reloadMessagesIfCurrent(self, convoId, moveFocus=True):
-        # This tab only ever shows one fixed conversation, so "current"
-        # is unconditional. moveFocus=False is used by
-        # MainWindow.notifyConvoChanged (cross-tab live sync) --
-        # _loadMessages(moveFocus=True) calls messageList.SetFocus(),
-        # which would otherwise steal real OS focus away from whatever
-        # tab the user is actually in when SOME OTHER panel is the one
-        # that triggered this reload.
+        # Only one conversation here, so "current" is unconditional.
+        # moveFocus=False (used by notifyConvoChanged cross-tab sync)
+        # avoids SetFocus() stealing focus from another active tab.
         self._loadMessages(moveFocus=moveFocus)
 
     # ---------------- full-text hooks (Alt+number / Show message...) ----------------
@@ -2962,7 +3342,8 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         myDid = self._account["did"] if self._account else None
         senderDid = message.get("sender_did")
         if senderDid == myDid:
-            return "You"
+            # Translators: Sender label for your own messages in the chat list.
+            return _("You")
         member = next((m for m in self._members if m["did"] == senderDid), None)
         if member is None:
             return self.TAB_NAME
@@ -2976,23 +3357,23 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
             replyMessage = messageById.get(replyToId)
             if replyMessage is not None:
                 preview = (replyMessage.get("text") or "")[:30]
-                text = f"(Reply to: {preview}) {text}"
+                # Translators: Reply-preview prefix on a chat message row. First {} is a preview of the original, second {} is this message's own text.
+                text = _("(Reply to: {}) {}").format(preview, text)
+        embedDesc = _describe_message_embed(message.get("embed_json"))
+        if embedDesc:
+            text = f"{text} {embedDesc}".strip() if text else embedDesc
         return text
 
     def _updateStatusBar(self):
         unread = db.get_unread_message_count(self._account["id"], self._convo["convo_id"]) if self._account else 0
         messages = getattr(self, "_currentMessages", [])
-        self.statusBar.SetStatusText(f"{self.TAB_NAME} {unread} unread {len(messages)} messages")
+        # Translators: Conversation tab status bar text. First {} is the tab name, second {} is unread count, third {} is message count.
+        self.statusBar.SetStatusText(_("{} {} unread {} messages").format(self.TAB_NAME, unread, len(messages)))
 
     def _loadMessages(self, moveFocus=True):
-        # Refresh self._convo from the DB every time -- this tab's copy
-        # is a one-time dict(convo) snapshot taken when the tab was
-        # opened (see ChatWindow._openInNewTab), so it never picks up a
-        # lock/unlock that happened elsewhere (ChatWindow, another
-        # account instance, etc.) on its own. This call already runs on
-        # every cross-tab notifyConvoChanged, F5, and tab-activation, so
-        # piggybacking the lock-state refresh here means it doesn't need
-        # its own separate propagation path.
+        # Refresh self._convo from DB every time -- this tab's copy is
+        # a one-time snapshot, so it never picks up a lock/unlock from
+        # elsewhere on its own otherwise.
         freshConvo = db.get_convo(self._account["id"], self._convo["convo_id"]) if self._account else None
         if freshConvo is not None:
             self._convo = freshConvo
@@ -3032,14 +3413,9 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
                     )
                 if targetIndex is None:
                     targetIndex = 0 if newestFirst else len(messages) - 1
-                # SetFocus() BEFORE Focus()/Select() -- reversed from
-                # before. Confirmed by testing: switching tabs via
-                # Ctrl+Tab/Ctrl+number and landing here announced the
-                # correct item TWICE, while the equivalent tree-based
-                # switch (ChatWindow's convoTree, which doesn't have
-                # this quirk) never doubled. Moving real focus first,
-                # then setting the item, leaves only one state change
-                # for NVDA to react to instead of two.
+                # SetFocus() before Focus()/Select() -- confirmed by
+                # testing this avoids a double-announcement on tab
+                # switch that the reversed order caused.
                 if moveFocus:
                     self.messageList.SetFocus()
                 self.messageList.Focus(targetIndex)
@@ -3069,7 +3445,9 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
 
     def onCheckForUpdates(self, evt=None):
         convoId = self._convo["convo_id"]
-        nvdaUi.message(f"Checking {self.TAB_NAME} for updates, please wait...")
+        # Translators: Announced while checking a single conversation tab for updates. {} is the tab name.
+        nvdaUi.message(_("Checking {} for updates, please wait...").format(self.TAB_NAME))
+        soundpack.start_progress()
         previousMessageCount = len(getattr(self, "_currentMessages", []))
 
         def worker():
@@ -3085,12 +3463,17 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
 
     @uiutil.safe_ui_callback
     def _onCheckForUpdatesDone(self, error, previousMessageCount=0):
+        soundpack.stop_progress()
         if error:
             log.error(f"NVSky: conversation sync failed: {error}")
-            nvdaUi.message(f"Could not check for updates: {error}")
+            soundpack.play("error")
+            # Translators: Announced when checking a conversation tab for updates fails. {} is the error message.
+            nvdaUi.message(_("Could not check for updates: {}").format(error))
             return
         self._loadMessages()
         if len(getattr(self, "_currentMessages", [])) <= previousMessageCount:
-            nvdaUi.message(f"No new chat for {self.TAB_NAME}.")
+            # Translators: Announced when a conversation tab refresh finds nothing new. {} is the tab name.
+            nvdaUi.message(_("No new chat for {}.").format(self.TAB_NAME))
         else:
-            nvdaUi.message(f"{self.TAB_NAME} updated.")
+            # Translators: Announced when a conversation tab refresh finds new messages. {} is the tab name.
+            nvdaUi.message(_("{} updated.").format(self.TAB_NAME))

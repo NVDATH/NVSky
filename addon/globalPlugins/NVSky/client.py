@@ -17,11 +17,13 @@ import os
 import random
 import re
 import string
+import struct
 import tempfile
 import threading
 import time
 import unicodedata
 import types
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -32,6 +34,7 @@ from logHandler import log
 
 from . import crypto
 from . import db
+from . import soundpack
 
 
 class LoginError(Exception):
@@ -294,6 +297,30 @@ def _store_convo(convo, account_id: int, my_did: str, status: str):
     db.replace_convo_members(account_id, convo.id, otherMembers)
 
 
+def _extract_message_embed_info(message: dict):
+    """LOW CONFIDENCE -- shape guessed by analogy with post embeds'
+    own record.value.text/record.author.handle (see
+    _extract_embed_info) since this is raw JSON already (getMessages
+    is parsed via the raw-JSON bypass, not the typed SDK), never
+    confirmed against a real record-embed message response. Returns
+    None if there's no embed or it doesn't look like a record embed."""
+    embed = message.get("embed")
+    if not isinstance(embed, dict):
+        return None
+    record = embed.get("record") or {}
+    value = record.get("value") or {}
+    author = record.get("author") or {}
+    quotedText = value.get("text")
+    quotedHandle = author.get("handle")
+    if quotedText is None and quotedHandle is None:
+        return None
+    return {
+        "quoted_text": quotedText,
+        "quoted_author_handle": quotedHandle,
+        "quoted_uri": record.get("uri"),
+    }
+
+
 def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int = 0, limit: int = 100):
     # Same SDK bug _fetch_thread_json above works around for View
     # Thread -- pydantic can't resolve chat.bsky.convo.defs#messageView's
@@ -310,12 +337,36 @@ def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int =
     )
     rawMessages = response.content.get("messages", []) if isinstance(response.content, dict) else []
 
+    # Sound feedback for a genuinely NEW incoming message (someone
+    # else's, not our own optimistic row) -- compares against what was
+    # already cached before this sync writes anything, since
+    # upsert_message's own ON CONFLICT can't tell "new" from "already
+    # had this one" on its own.
+    existingIds = {
+        m["message_id"] for m in db.get_messages_for_convo(account_id, convo_id)
+    }
+    # BUG GUARD: an empty existingIds means this conversation has never
+    # been synced/cached before (first-ever open, or right after a
+    # cache clear) -- every message in rawMessages would then count as
+    # "new", which would fire the new_message sound once per historical
+    # message in a single burst instead of once for a real incoming
+    # message. Since this exact scenario is hard to trigger reliably in
+    # testing (see plan-18.md), this guard is defensive: skip the sound
+    # entirely on a convo's first-ever sync, even though every message
+    # loaded is technically "new" to the local cache.
+    isFirstSyncForConvo = not existingIds
+    myDid = db.get_active_account()
+    myDid = myDid["did"] if myDid else None
+    hasNewIncoming = False
+
     for message in rawMessages:
         if "text" not in message:
             # A #deletedMessageView / #systemMessageView placeholder,
             # not a real message -- nothing to cache.
             continue
         sender = message.get("sender") or {}
+        if not isFirstSyncForConvo and message.get("id") not in existingIds and sender.get("did") != myDid:
+            hasNewIncoming = True
         # Unlike the REQUEST side (MessageInput.replyTo, just {messageId}),
         # the RESPONSE embeds the entire original message under replyTo --
         # id/text directly, not a bare reference. Store both so the reply
@@ -328,6 +379,7 @@ def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int =
         # in the lexicon docs, never confirmed against a real server
         # response in this project -- paste back the raw dict (or a
         # traceback) if reactions don't show up right.
+        embedInfo = _extract_message_embed_info(message)
         db.upsert_message({
             "account_id": account_id,
             "convo_id": convo_id,
@@ -338,7 +390,11 @@ def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int =
             "reply_to_message_id": replyTo.get("id"),
             "reply_to_text": replyTo.get("text"),
             "reactions_json": json.dumps(message.get("reactions") or []),
+            "embed_json": json.dumps(embedInfo) if embedInfo else None,
         })
+
+    if hasNewIncoming:
+        soundpack.play("new_message")
 
     # Re-derive is_read for every cached message in this conversation
     # from the server's own unread_count, instead of guessing per
@@ -378,24 +434,54 @@ def sync_convos(client, account_id: int, my_did: str, limit: int = 50):
                 # now that background sync calls sync_convos every
                 # couple of minutes instead of only on manual F5.
                 log.error(f"NVSky: failed to sync a conversation: {e}")
-def sync_convo_messages(client, account_id: int, convo_id: str, limit: int = 100):
-    """Refreshes just ONE conversation's messages -- used after sending
-    a message, and by the pop-out per-conversation tab's own Check for
-    updates, without re-listing every conversation.
-
-    LOW CONFIDENCE / KNOWN LIMITATION: this path doesn't re-fetch the
-    convo's own unread_count from the server (no confirmed single-convo
-    getConvo call in this project yet) -- it reuses whatever was last
-    synced into the local convos table (via sync_convos, or the direct
-    optimistic decrement in mark_message_read's caller). Fine for the
-    common cases this is called from (right after my own send, where my
-    own unread_count doesn't change; or a manual F5), but a genuinely
-    fresh unread_count for this one conversation would need a real
-    chat.bsky.convo.getConvo call, not added here yet.
+def get_convo(client, convo_id: str):
+    """
+    Fetches a single conversation's current state via
+    chat.bsky.convo.getConvo -- unlike list_convos, this returns just
+    one ConvoView, letting sync_convo_messages get a FRESH unread_count
+    for this one conversation instead of reusing whatever sync_convos
+    last wrote (closes the LOW CONFIDENCE gap that used to be
+    documented here). Typed call -- list_convos already resolves this
+    same ConvoView type fine in _store_convo without needing a
+    raw-JSON bypass, so this should behave the same. Returns None if
+    the conversation doesn't exist or the call fails.
     """
     dm = get_chat_client(client).chat.bsky.convo
-    convo = db.get_convo(account_id, convo_id)
-    unreadCount = (convo.get("unread_count") or 0) if convo else 0
+    try:
+        resp = dm.get_convo(params={"convo_id": convo_id})
+    except Exception as e:
+        log.info(f"NVSky: get_convo failed for {convo_id}: {e}")
+        return None
+    return getattr(resp, "convo", None)
+
+
+def sync_convo_messages(client, account_id: int, convo_id: str, limit: int = 100):
+    """
+    Refreshes just ONE conversation's messages -- used after sending a
+    message, and by the pop-out per-conversation tab's own Check for
+    updates, without re-listing every conversation.
+
+    Also re-fetches this one conversation's own record via get_convo()
+    first, so its unread_count -- and locked/group-name/muted state --
+    comes from the server fresh instead of reusing whatever sync_convos
+    last wrote. Falls back to the last-known local unread_count if
+    get_convo fails or the active account doesn't match account_id.
+    """
+    dm = get_chat_client(client).chat.bsky.convo
+    localConvo = db.get_convo(account_id, convo_id)
+    unreadCount = (localConvo.get("unread_count") or 0) if localConvo else 0
+
+    account = db.get_active_account()
+    if account is not None and account["id"] == account_id:
+        freshConvo = get_convo(client, convo_id)
+        if freshConvo is not None:
+            status = (localConvo.get("status") if localConvo else None) or "accepted"
+            try:
+                _store_convo(freshConvo, account_id, account["did"], status)
+                unreadCount = freshConvo.unread_count or 0
+            except Exception as e:
+                log.error(f"NVSky: failed to store fresh convo {convo_id}: {e}")
+
     _sync_convo_messages(dm, convo_id, account_id, unreadCount, limit=limit)
 def get_chat_client(client):
     """
@@ -414,7 +500,7 @@ def get_chat_client(client):
     return client.with_bsky_chat_proxy()
 
 
-def send_message(client, convo_id: str, text: str, reply_to_message_id: str = None):
+def send_message(client, convo_id: str, text: str, reply_to_message_id: str = None, embed_ref: dict = None):
     # Two SDK-internal issues stacked here, confirmed from a real full
     # traceback (not just the top-level message):
     # 1) sendMessage's response is a MessageView -- the same
@@ -444,6 +530,11 @@ def send_message(client, convo_id: str, text: str, reply_to_message_id: str = No
         messageBody["facets"] = facets
     if reply_to_message_id:
         messageBody["replyTo"] = {"messageId": reply_to_message_id}
+    if embed_ref:
+        messageBody["embed"] = {
+            "$type": "app.bsky.embed.record",
+            "record": {"uri": embed_ref["uri"], "cid": embed_ref["cid"]},
+        }
     body = DotDict({
         "convoId": convo_id,
         "message": messageBody,
@@ -888,6 +979,7 @@ def _fill_media_info(info: dict, mediaView, mediaType: str):
     elif mediaType.startswith("app.bsky.embed.video"):
         info["video_url"] = getattr(mediaView, "playlist", None)
         info["video_thumb_url"] = getattr(mediaView, "thumbnail", None)
+        info["video_alt"] = getattr(mediaView, "alt", None)
     elif mediaType.startswith("app.bsky.embed.external"):
         external = getattr(mediaView, "external", None)
         info["link_url"] = getattr(external, "uri", None)
@@ -908,11 +1000,15 @@ def _store_feed_item(item, account_id: int, feed_key: str = "home"):
         created_at = getattr(record, "created_at", None) or getattr(record, "createdAt", None)
         facets_data = None
 
+    authorViewer = getattr(author, "viewer", None)
     db.upsert_author(
         did=author.did,
         handle=author.handle,
         display_name=getattr(author, "display_name", None),
         avatar_url=getattr(author, "avatar", None),
+        viewer_following=getattr(authorViewer, "following", None) if authorViewer else None,
+        viewer_muted=bool(getattr(authorViewer, "muted", False)) if authorViewer else False,
+        viewer_blocking=getattr(authorViewer, "blocking", None) if authorViewer else None,
     )
 
     is_repost = item.reason is not None
@@ -936,6 +1032,7 @@ def _store_feed_item(item, account_id: int, feed_key: str = "home"):
     viewer_like_uri = getattr(viewer, "like", None) if viewer else None
     viewer_repost_uri = getattr(viewer, "repost", None) if viewer else None
     viewer_bookmarked = bool(getattr(viewer, "bookmarked", False)) if viewer else False
+    viewer_thread_muted = bool(getattr(viewer, "thread_muted", False)) if viewer else False
 
     embed_data = _extract_embed_info(post)
     quoted_text = embed_data.get("quoted_text") if embed_data else None
@@ -966,6 +1063,7 @@ def _store_feed_item(item, account_id: int, feed_key: str = "home"):
         "viewer_like_uri": viewer_like_uri,
         "viewer_repost_uri": viewer_repost_uri,
         "viewer_bookmarked": viewer_bookmarked,
+        "viewer_thread_muted": viewer_thread_muted,
     })
     db.upsert_feed_item(account_id, feed_key, post.uri, feedIndexedAt)
 
@@ -990,17 +1088,22 @@ def _store_resolved_post(post, account_id: int):
         created_at = getattr(record, "created_at", None) or getattr(record, "createdAt", None)
         facets_data = None
 
+    authorViewer = getattr(author, "viewer", None)
     db.upsert_author(
         did=author.did,
         handle=author.handle,
         display_name=getattr(author, "display_name", None),
         avatar_url=getattr(author, "avatar", None),
+        viewer_following=getattr(authorViewer, "following", None) if authorViewer else None,
+        viewer_muted=bool(getattr(authorViewer, "muted", False)) if authorViewer else False,
+        viewer_blocking=getattr(authorViewer, "blocking", None) if authorViewer else None,
     )
 
     viewer = getattr(post, "viewer", None)
     viewer_like_uri = getattr(viewer, "like", None) if viewer else None
     viewer_repost_uri = getattr(viewer, "repost", None) if viewer else None
     viewer_bookmarked = bool(getattr(viewer, "bookmarked", False)) if viewer else False
+    viewer_thread_muted = bool(getattr(viewer, "thread_muted", False)) if viewer else False
 
     embed_data = _extract_embed_info(post)
     quoted_text = embed_data.get("quoted_text") if embed_data else None
@@ -1031,6 +1134,7 @@ def _store_resolved_post(post, account_id: int):
         "viewer_like_uri": viewer_like_uri,
         "viewer_repost_uri": viewer_repost_uri,
         "viewer_bookmarked": viewer_bookmarked,
+        "viewer_thread_muted": viewer_thread_muted,
     })
 
 
@@ -1506,11 +1610,15 @@ def sync_notifications(client, account_id: int, cursor: str = None, limit: int =
 
 def _store_notification(notif, account_id: int, resolvedSubjects: dict):
     author = notif.author
+    authorViewer = getattr(author, "viewer", None)
     db.upsert_author(
         did=author.did,
         handle=author.handle,
         display_name=getattr(author, "display_name", None),
         avatar_url=getattr(author, "avatar", None),
+        viewer_following=getattr(authorViewer, "following", None) if authorViewer else None,
+        viewer_muted=bool(getattr(authorViewer, "muted", False)) if authorViewer else False,
+        viewer_blocking=getattr(authorViewer, "blocking", None) if authorViewer else None,
     )
 
     reason = notif.reason
@@ -1633,6 +1741,291 @@ def _upload_blob_dict(client, image_path: str) -> dict:
         raise
 
 
+VIDEO_EXTENSIONS = (".mp4", ".mpeg", ".mpg", ".mov", ".webm")
+# LOW CONFIDENCE: Bluesky raised these to 10 minutes / 300MB on
+# 2026-08-26 (per TechCrunch/Engadget), after 60s->3min->10min bumps
+# over the past couple years -- expect this to change again. Server is
+# always the final authority; this is just a cheap pre-check to avoid
+# an obviously-doomed upload.
+VIDEO_MAX_DURATION_SECONDS = 600
+VIDEO_MAX_BYTES = 300 * 1_000_000
+
+_VIDEO_MIME_TYPES = {
+    ".mp4": "video/mp4", ".mpeg": "video/mpeg", ".mpg": "video/mpeg",
+    ".mov": "video/quicktime", ".webm": "video/webm",
+}
+
+
+class VideoUploadCancelled(Exception):
+    pass
+
+
+def _find_isobmff_box(f, target_type: bytes):
+    """Scans top-level boxes of an ISOBMFF (MP4/MOV) file for
+    `target_type` (e.g. b"moov"), returns its content bytes or None.
+    Reads only box headers via seeks, not the whole file -- a 300MB
+    video shouldn't be fully loaded just to check its duration."""
+    f.seek(0, 2)
+    fileSize = f.tell()
+    pos = 0
+    while pos + 8 <= fileSize:
+        f.seek(pos)
+        header = f.read(8)
+        if len(header) < 8:
+            break
+        size = struct.unpack(">I", header[0:4])[0]
+        boxType = header[4:8]
+        headerSize = 8
+        if size == 1:
+            extSize = f.read(8)
+            if len(extSize) < 8:
+                break
+            size = struct.unpack(">Q", extSize)[0]
+            headerSize = 16
+        elif size == 0:
+            size = fileSize - pos
+        if size < headerSize:
+            break
+        if boxType == target_type:
+            f.seek(pos + headerSize)
+            return f.read(size - headerSize)
+        pos += size
+    return None
+
+
+def _read_mp4_duration_seconds(video_path: str):
+    """Best-effort duration for MP4/MOV via the mvhd box -- no library.
+    Returns None (not an error) for anything this simple parser can't
+    read (WebM, unusual atom layout); callers should skip the duration
+    check rather than block the upload in that case."""
+    try:
+        with open(video_path, "rb") as f:
+            moov = _find_isobmff_box(f, b"moov")
+            if moov is None:
+                return None
+            pos = 0
+            while pos + 8 <= len(moov):
+                size = struct.unpack(">I", moov[pos:pos + 4])[0]
+                boxType = moov[pos + 4:pos + 8]
+                if size < 8 or pos + size > len(moov):
+                    break
+                content = moov[pos + 8:pos + size]
+                if boxType == b"mvhd":
+                    version = content[0]
+                    if version == 1:
+                        timescale = struct.unpack(">I", content[20:24])[0]
+                        duration = struct.unpack(">Q", content[24:32])[0]
+                    else:
+                        timescale = struct.unpack(">I", content[12:16])[0]
+                        duration = struct.unpack(">I", content[16:20])[0]
+                    return duration / timescale if timescale else None
+                pos += size
+    except Exception:
+        return None
+    return None
+
+
+def validate_video_file(video_path: str) -> dict:
+    """Best-effort pre-upload check -- {"ok": True} or {"ok": False,
+    "message": ...}. Server has the final say; this just catches the
+    cheap, obvious rejects before spending time on an upload that
+    would fail anyway."""
+    ext = os.path.splitext(video_path)[1].lower()
+    if ext not in VIDEO_EXTENSIONS:
+        return {
+            "ok": False,
+            "message": f"Unsupported video format ({ext or 'no extension'}). "
+                       f"Bluesky accepts: {', '.join(VIDEO_EXTENSIONS)}.",
+        }
+
+    try:
+        size = os.path.getsize(video_path)
+    except OSError as e:
+        return {"ok": False, "message": f"Could not read file: {e}"}
+    if size > VIDEO_MAX_BYTES:
+        return {
+            "ok": False,
+            "message": f"Video is {size / 1_000_000:.0f}MB, over Bluesky's current "
+                       f"{VIDEO_MAX_BYTES / 1_000_000:.0f}MB limit.",
+        }
+
+    if ext in (".mp4", ".mov"):
+        duration = _read_mp4_duration_seconds(video_path)
+        if duration is not None and duration > VIDEO_MAX_DURATION_SECONDS:
+            return {
+                "ok": False,
+                "message": f"Video is {duration:.0f}s long, over Bluesky's current "
+                           f"{VIDEO_MAX_DURATION_SECONDS}s limit.",
+            }
+
+    return {"ok": True}
+
+
+def _get_pds_service_did(client) -> str:
+    """
+    Returns the user's own PDS's service DID (did:web:<pds-domain>) --
+    NOT video.bsky.app's -- for use as getServiceAuth's `aud`.
+    CONFIRMED via docs.bsky.app's own video upload tutorial: the token
+    must be scoped to the user's PDS even though it's then used to
+    call video.bsky.app; video.bsky.app validates against the PDS's
+    identity, not its own. A first attempt using
+    "did:web:video.bsky.app" directly produced a real 401 Unauthorized.
+
+    A second attempt tried resolving this via client.me.did_doc, which
+    doesn't exist on this SDK version (client.me is a plain
+    ProfileViewDetailed, confirmed via a real AttributeError) -- the
+    session itself already carries the PDS endpoint from login, no
+    separate DID document fetch/resolution needed.
+    """
+    session = getattr(client, "_session", None)
+    pdsEndpoint = getattr(session, "pds_endpoint", None) if session is not None else None
+    if not pdsEndpoint:
+        pdsEndpoint = "https://bsky.social"  # SDK's own documented default
+    pdsHost = urllib.parse.urlparse(pdsEndpoint).netloc
+    return f"did:web:{pdsHost}"
+
+
+def _get_upload_video_auth(client) -> str:
+    """
+    Auth for app.bsky.video.uploadVideo SPECIFICALLY -- aud is the
+    user's own PDS (not video.bsky.app), lxm is ALWAYS
+    "com.atproto.repo.uploadBlob" regardless of the endpoint actually
+    being called. Confirmed via docs.bsky.app's own tutorial. This
+    scope is uploadVideo-only -- getUploadLimits/getJobStatus need a
+    DIFFERENT aud/lxm entirely, see _get_video_query_auth below. A
+    first attempt sharing one auth helper across all three video
+    endpoints produced 401s on getUploadLimits, confirmed by testing.
+    """
+    audDid = _get_pds_service_did(client)
+    resp = client.com.atproto.server.get_service_auth(
+        params={"aud": audDid, "lxm": "com.atproto.repo.uploadBlob"}
+    )
+    return resp.token
+
+
+def _get_video_query_auth(client, lxm: str) -> str:
+    """
+    Auth for app.bsky.video.getUploadLimits / getJobStatus -- aud is
+    video.bsky.app itself (NOT the PDS, opposite of uploadVideo above),
+    lxm is the actual endpoint name being called. Confirmed via
+    atproto's own GitHub discussion #4437 (permission scope strings
+    list aud=did:web:video.bsky.app for these two) and discussion #400
+    (a real working example using lxm='app.bsky.video.getUploadLimits'
+    with that same aud).
+    """
+    resp = client.com.atproto.server.get_service_auth(
+        params={"aud": "did:web:video.bsky.app", "lxm": lxm}
+    )
+    return resp.token
+
+
+def get_video_upload_limits(client) -> dict:
+    """LOW CONFIDENCE -- app.bsky.video.getUploadLimits never
+    exercised in this project before now. Raw-JSON bypass, same
+    reasoning as every other EXPERIMENTAL endpoint here. Expected
+    shape per public examples: {"canUpload": bool, "message": str,
+    "remainingDailyBytes": int, "remainingDailyVideos": int}."""
+    token = _get_video_query_auth(client, "app.bsky.video.getUploadLimits")
+    request = urllib.request.Request(
+        "https://video.bsky.app/xrpc/app.bsky.video.getUploadLimits",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def upload_video(client, video_path: str, progress_callback=None, cancel_event=None) -> dict:
+    """
+    Uploads a video and polls until Bluesky's processing job finishes,
+    returning the blob dict (same shape _upload_blob_dict returns for
+    images -- usable directly in a post embed).
+
+    LOW CONFIDENCE end to end -- app.bsky.video.uploadVideo/
+    getJobStatus never exercised in this project. Raw HTTP, not the
+    typed SDK. Paste back the traceback (or a debug_dump of the raw
+    job status) if this doesn't work.
+
+    progress_callback(state, extra), if given, is called with
+    "uploading" once the file is sent, then the job's own state string
+    (e.g. "JOB_STATE_ENCODING") on every poll -- no byte-level upload
+    progress is available. cancel_event (threading.Event), if given,
+    is checked between polls; the initial upload POST itself can't be
+    interrupted mid-flight since it's one blocking call, only the
+    polling phase can actually stop.
+    """
+    ext = os.path.splitext(video_path)[1].lower()
+    mimeType = _VIDEO_MIME_TYPES.get(ext, "video/mp4")
+
+    token = _get_upload_video_auth(client)
+    with open(video_path, "rb") as f:
+        videoBytes = f.read()
+
+    if progress_callback:
+        progress_callback("uploading", None)
+
+    params = urllib.parse.urlencode({"did": client.me.did, "name": os.path.basename(video_path)})
+    request = urllib.request.Request(
+        f"https://video.bsky.app/xrpc/app.bsky.video.uploadVideo?{params}",
+        data=videoBytes, method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": mimeType,
+            "Content-Length": str(len(videoBytes)),
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            jobStatus = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            # CONFIRMED (via a real 409 in testing, matching community
+            # docs): uploading the exact same video bytes again isn't a
+            # real failure -- the server recognizes it and returns a
+            # JOB_STATE_COMPLETED job status (with a usable blob)
+            # in the error response's own body, not a fresh upload.
+            # HTTPError acts as a readable response object here.
+            jobStatus = json.loads(e.read().decode("utf-8"))
+        else:
+            raise
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise VideoUploadCancelled()
+
+    blob = jobStatus.get("blob")
+    if blob:
+        return blob
+    jobId = jobStatus.get("jobId")
+    if not jobId:
+        debug_dump(jobStatus, "video_upload_no_job_id")
+        raise RuntimeError("Video upload returned neither a blob nor a job ID.")
+
+    pollToken = _get_video_query_auth(client, "app.bsky.video.getJobStatus")
+    pollParams = urllib.parse.urlencode({"jobId": jobId})
+    pollUrl = f"https://video.bsky.app/xrpc/app.bsky.video.getJobStatus?{pollParams}"
+
+    for _ in range(200):  # ~10 min at 3s intervals
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoUploadCancelled()
+        time.sleep(3)
+        pollRequest = urllib.request.Request(pollUrl, headers={"Authorization": f"Bearer {pollToken}"})
+        with urllib.request.urlopen(pollRequest, timeout=15) as response:
+            status = json.loads(response.read().decode("utf-8"))
+        jobStatus = status.get("jobStatus", status)
+        state = jobStatus.get("state", "")
+        if progress_callback:
+            progress_callback(state, jobStatus.get("progress"))
+        if state == "JOB_STATE_COMPLETED":
+            blob = jobStatus.get("blob")
+            if blob:
+                return blob
+            debug_dump(jobStatus, "video_job_completed_no_blob")
+            raise RuntimeError("Video processing completed but returned no blob.")
+        if state == "JOB_STATE_FAILED":
+            raise RuntimeError(jobStatus.get("error") or jobStatus.get("message") or "Video processing failed.")
+
+    raise RuntimeError("Video processing timed out.")
+
+
 def _get_profile_record(client) -> dict:
     """
     Fetches the raw app.bsky.actor.profile record (rkey "self") as a
@@ -1648,12 +2041,17 @@ def _get_profile_record(client) -> dict:
         recordGet = _dict_get(record)
         if recordGet is not None:
             return dict(record)
+        pinnedPostObj = getattr(record, "pinned_post", None) or getattr(record, "pinnedPost", None)
+        pinnedPost = None
+        if pinnedPostObj is not None:
+            pinnedPost = {"uri": getattr(pinnedPostObj, "uri", None), "cid": getattr(pinnedPostObj, "cid", None)}
         return {
             "$type": "app.bsky.actor.profile",
             "displayName": getattr(record, "display_name", None),
             "description": getattr(record, "description", None),
             "avatar": getattr(record, "avatar", None),
             "banner": getattr(record, "banner", None),
+            "pinnedPost": pinnedPost,
         }
     except Exception:
         # Some accounts have never had a profile record written at all --
@@ -1689,6 +2087,26 @@ def update_profile_avatar(client, image_path: str):
 def update_profile_banner(client, image_path: str):
     record = _get_profile_record(client)
     record["banner"] = _upload_blob_dict(client, image_path)
+    _put_profile_record(client, record)
+
+
+def get_pinned_post_uri(client):
+    record = _get_profile_record(client)
+    pinned = record.get("pinnedPost") if isinstance(record, dict) else None
+    if isinstance(pinned, dict):
+        return pinned.get("uri")
+    return None
+
+
+def pin_post_to_profile(client, post_uri: str, post_cid: str):
+    record = _get_profile_record(client)
+    record["pinnedPost"] = {"uri": post_uri, "cid": post_cid}
+    _put_profile_record(client, record)
+
+
+def unpin_post_from_profile(client):
+    record = _get_profile_record(client)
+    record.pop("pinnedPost", None)
     _put_profile_record(client, record)
 
 
@@ -1789,7 +2207,8 @@ def fetch_link_card(url: str) -> dict:
 # ---------------- posting ----------------
 
 def create_post(client, text: str, attachments: list = None, reply_ref: dict = None,
-                 quote_ref: dict = None, link_card: dict = None, facets: list = None):
+                 quote_ref: dict = None, link_card: dict = None, facets: list = None,
+                 video: dict = None):
     """
     Creates a post. Covers every combo: plain text, images, reply,
     quote, quote-with-images, and a link-card preview (external embed).
@@ -1828,6 +2247,10 @@ def create_post(client, text: str, attachments: list = None, reply_ref: dict = N
             for att in attachments
         ]
         embed = {"$type": "app.bsky.embed.images", "images": images_field}
+    elif video:
+        embed = {"$type": "app.bsky.embed.video", "video": video["blob"]}
+        if video.get("alt"):
+            embed["alt"] = video["alt"]
 
     if quote_ref:
         quote_embed = {
@@ -2015,6 +2438,69 @@ def get_follows(client, did: str, page_limit: int = 100, max_pages: int = 100) -
             break
     return results
 
+
+def get_known_followers(client, did: str, page_limit: int = 100, max_pages: int = 100) -> list:
+    """
+    app.bsky.graph.getKnownFollowers -- people the ACTIVE account
+    follows who also follow `did` (mutual-followers-of-them, the
+    "Followed by X, Y, and 3 others" feature). LOW CONFIDENCE -- never
+    exercised against a real server in this project, field names
+    assumed to match the same ProfileView shape get_followers already
+    uses. Paste back the traceback if this errors.
+    """
+    results = []
+    cursor = None
+    for _ in range(max_pages):
+        resp = client.app.bsky.graph.get_known_followers(params={"actor": did, "limit": page_limit, "cursor": cursor})
+        results.extend(
+            {
+                "did": f.did, "handle": f.handle, "display_name": getattr(f, "display_name", None),
+                "description": getattr(f, "description", None),
+            }
+            for f in resp.followers
+        )
+        cursor = resp.cursor
+        if not cursor:
+            break
+    return results
+
+
+def get_post_likes(client, post_uri: str, page_limit: int = 100, max_pages: int = 100) -> list:
+    """app.bsky.feed.getLikes -- who liked this post. No bio/description
+    in this response shape (unlike getFollowers/getFollows), left blank."""
+    results = []
+    cursor = None
+    for _ in range(max_pages):
+        resp = client.app.bsky.feed.get_likes(params={"uri": post_uri, "limit": page_limit, "cursor": cursor})
+        for like in resp.likes:
+            actor = like.actor
+            results.append({
+                "did": actor.did, "handle": actor.handle,
+                "display_name": getattr(actor, "display_name", None), "description": None,
+            })
+        cursor = resp.cursor
+        if not cursor:
+            break
+    return results
+
+
+def get_post_reposted_by(client, post_uri: str, page_limit: int = 100, max_pages: int = 100) -> list:
+    """app.bsky.feed.getRepostedBy -- who reposted this post. No bio/
+    description in this response shape, left blank."""
+    results = []
+    cursor = None
+    for _ in range(max_pages):
+        resp = client.app.bsky.feed.get_reposted_by(params={"uri": post_uri, "limit": page_limit, "cursor": cursor})
+        for actor in resp.reposted_by:
+            results.append({
+                "did": actor.did, "handle": actor.handle,
+                "display_name": getattr(actor, "display_name", None), "description": None,
+            })
+        cursor = resp.cursor
+        if not cursor:
+            break
+    return results
+
 def _post_view_to_dict(post) -> dict:
     """
     Converts an atproto PostView into the plain dict shape feedWindow.py
@@ -2051,6 +2537,7 @@ def _post_view_to_dict(post) -> dict:
     viewer_like_uri = getattr(viewer, "like", None) if viewer else None
     viewer_repost_uri = getattr(viewer, "repost", None) if viewer else None
     viewer_bookmarked = bool(getattr(viewer, "bookmarked", False)) if viewer else False
+    viewer_thread_muted = bool(getattr(viewer, "thread_muted", False)) if viewer else False
 
     embed_data = _extract_embed_info(post)
 
@@ -2072,6 +2559,7 @@ def _post_view_to_dict(post) -> dict:
         "viewer_like_uri": viewer_like_uri,
         "viewer_repost_uri": viewer_repost_uri,
         "viewer_bookmarked": viewer_bookmarked,
+        "viewer_thread_muted": viewer_thread_muted,
     }
 
 def get_author_feed(client, did: str, page_limit: int = 50, max_pages: int = 2) -> list:
@@ -2206,12 +2694,12 @@ def get_threadgate_settings(client, post_uri: str) -> dict:
 
     return {"state": "custom", "rules": rules, "has_list_rules": hasListRules}
 
-def get_postgate_disables_quotes(client, post_uri: str) -> bool:
-    """Reads the current app.bsky.feed.postgate record for post_uri (if
-    any) and returns True if it disables quote posts (embeddingRules
-    contains a disableRule). EXPERIMENTAL -- paste back the traceback
-    if this errors; postgate hasn't been exercised elsewhere in NVSky
-    yet."""
+def _get_postgate_record(client, post_uri: str) -> dict:
+    """Reads the current app.bsky.feed.postgate record for post_uri as
+    a plain dict ({"embeddingRules": [...], "detachedEmbeddingUris":
+    [...]}), or an empty shape if none exists yet. Shared by every
+    postgate read/write helper below so they never clobber each
+    other's field."""
     from atproto import AtUri
     rkey = AtUri.from_str(post_uri).rkey
     try:
@@ -2220,37 +2708,36 @@ def get_postgate_disables_quotes(client, post_uri: str) -> bool:
         )
     except Exception as e:
         if "RecordNotFound" not in str(e):
-            log.info(f"NVSky: get_postgate_disables_quotes failed to read record for {post_uri}: {e}")
-        return False
+            log.info(f"NVSky: _get_postgate_record failed to read record for {post_uri}: {e}")
+        return {"embeddingRules": [], "detachedEmbeddingUris": []}
 
     record = resp.value
     recordGet = _dict_get(record)
     if recordGet is not None:
         embeddingRules = recordGet("embeddingRules", []) or []
+        detachedUris = recordGet("detachedEmbeddingUris", []) or []
     else:
         embeddingRules = getattr(record, "embedding_rules", None) or getattr(record, "embeddingRules", None) or []
-    for rule in embeddingRules:
-        ruleGet = _dict_get(rule)
-        ruleType = ruleGet("$type", "") if ruleGet is not None else (getattr(rule, "py_type", "") or getattr(rule, "$type", "") or "")
-        if "disableRule" in ruleType:
-            return True
-    return False
+        detachedUris = getattr(record, "detached_embedding_uris", None) or getattr(record, "detachedEmbeddingUris", None) or []
+    return {"embeddingRules": list(embeddingRules), "detachedEmbeddingUris": list(detachedUris)}
 
 
-def set_postgate_disable_quotes(client, post_uri: str, disable: bool):
-    """Sets or clears the app.bsky.feed.postgate record for post_uri to
-    disable/allow quote posts of it. EXPERIMENTAL -- paste back the
-    traceback if this errors."""
+def _put_postgate_record(client, post_uri: str, embedding_rules: list, detached_uris: list):
+    """Writes the FULL postgate record -- both fields together, never
+    just one, so a write to one field can't silently blank the other
+    (confirmed bug in an earlier version of set_postgate_disable_quotes,
+    which always wrote embeddingRules alone and would have wiped any
+    existing detachedEmbeddingUris the moment this got added)."""
     from atproto import AtUri
     rkey = AtUri.from_str(post_uri).rkey
 
-    if not disable:
+    if not embedding_rules and not detached_uris:
         try:
             client.com.atproto.repo.delete_record(
                 data={"repo": client.me.did, "collection": "app.bsky.feed.postgate", "rkey": rkey}
             )
         except Exception:
-            pass  # no postgate existed -- quotes already allowed, nothing to do
+            pass  # no postgate existed -- nothing to do
         return
 
     client.com.atproto.repo.put_record(
@@ -2261,11 +2748,59 @@ def set_postgate_disable_quotes(client, post_uri: str, disable: bool):
             "record": {
                 "$type": "app.bsky.feed.postgate",
                 "post": post_uri,
-                "embeddingRules": [{"$type": "app.bsky.feed.postgate#disableRule"}],
+                "embeddingRules": embedding_rules,
+                "detachedEmbeddingUris": detached_uris,
                 "createdAt": client.get_current_time_iso(),
             },
         }
     )
+
+
+def get_postgate_disables_quotes(client, post_uri: str) -> bool:
+    """Reads the current app.bsky.feed.postgate record for post_uri (if
+    any) and returns True if it disables quote posts (embeddingRules
+    contains a disableRule)."""
+    record = _get_postgate_record(client, post_uri)
+    for rule in record["embeddingRules"]:
+        ruleGet = _dict_get(rule)
+        ruleType = ruleGet("$type", "") if ruleGet is not None else (getattr(rule, "py_type", "") or getattr(rule, "$type", "") or "")
+        if "disableRule" in ruleType:
+            return True
+    return False
+
+
+def set_postgate_disable_quotes(client, post_uri: str, disable: bool):
+    """Sets or clears the disableRule on post_uri's postgate record --
+    preserves any existing detachedEmbeddingUris on the same record
+    (see _get_postgate_record/_put_postgate_record)."""
+    record = _get_postgate_record(client, post_uri)
+    rules = [
+        r for r in record["embeddingRules"]
+        if "disableRule" not in (
+            _dict_get(r)("$type", "") if _dict_get(r) is not None else (getattr(r, "py_type", "") or getattr(r, "$type", "") or "")
+        )
+    ]
+    if disable:
+        rules.append({"$type": "app.bsky.feed.postgate#disableRule"})
+    _put_postgate_record(client, post_uri, rules, record["detachedEmbeddingUris"])
+
+
+def get_postgate_detached_uris(client, post_uri: str) -> list:
+    """URIs of other people's posts that have quoted post_uri and been
+    individually detached (hidden from post_uri's own quote list) via
+    detachedEmbeddingUris."""
+    return _get_postgate_record(client, post_uri)["detachedEmbeddingUris"]
+
+
+def detach_quote(client, post_uri: str, quoting_post_uri: str):
+    """Detaches MY post_uri from someone else's quoting_post_uri that
+    quoted it -- doesn't touch their post, just removes it from
+    post_uri's own quote list. Preserves any existing disableRule."""
+    record = _get_postgate_record(client, post_uri)
+    uris = record["detachedEmbeddingUris"]
+    if quoting_post_uri not in uris:
+        uris = uris + [quoting_post_uri]
+    _put_postgate_record(client, post_uri, record["embeddingRules"], uris)
 
 def get_thread(client, post_uri: str, depth: int = 25, parent_height: int = 100):
     """
@@ -2310,6 +2845,21 @@ def get_thread(client, post_uri: str, depth: int = 25, parent_height: int = 100)
     return posts, target_index
 
 
+def get_post_quotes(client, post_uri: str, page_limit: int = 50, max_pages: int = 20) -> list:
+    """app.bsky.feed.getQuotes -- posts that quote post_uri. Returns
+    plain post dicts via _post_view_to_dict, same shape as get_thread's
+    entries minus _thread_depth."""
+    results = []
+    cursor = None
+    for _ in range(max_pages):
+        resp = client.app.bsky.feed.get_quotes(params={"uri": post_uri, "limit": page_limit, "cursor": cursor})
+        results.extend(_post_view_to_dict(p) for p in resp.posts)
+        cursor = resp.cursor
+        if not cursor:
+            break
+    return results
+
+
 # ---------------- post actions ----------------
 
 def like_post(client, post_uri: str, post_cid: str) -> str:
@@ -2346,6 +2896,28 @@ def create_report(client, subject_uri: str, subject_cid: str, reason_type: str, 
             "reason": reason,
             "subject": {"$type": "com.atproto.repo.strongRef", "uri": subject_uri, "cid": subject_cid},
         }
+    )
+
+
+def create_actor_report(client, did: str, reason_type: str, reason: str = ""):
+    """
+    Raw-JSON bypass -- the typed com.atproto.moderation.createReport
+    call chokes on the repoRef subject's discriminator (confirmed via
+    a real pydantic error: "$type"/"pyType" alias mismatch), same
+    class of bug documented elsewhere in this file for other
+    discriminated-union request bodies. create_report (post reports,
+    strongRef subject) doesn't hit this and stays on the typed call.
+    """
+    from atproto_client.models.dot_dict import DotDict
+
+    client.com.atproto.moderation._client.invoke_procedure(
+        "com.atproto.moderation.createReport",
+        data=DotDict({
+            "reasonType": reason_type,
+            "reason": reason,
+            "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did},
+        }),
+        input_encoding="application/json", output_encoding="application/json",
     )
 
 
@@ -2398,6 +2970,48 @@ def mute_actor(client, did: str):
 
 def unmute_actor(client, did: str):
     client.app.bsky.graph.unmute_actor(data={"actor": did})
+
+
+def get_muted_actors(client, page_limit: int = 100, max_pages: int = 100) -> list:
+    """app.bsky.graph.getMutes -- accounts the active user has muted."""
+    results = []
+    cursor = None
+    for _ in range(max_pages):
+        resp = client.app.bsky.graph.get_mutes(params={"limit": page_limit, "cursor": cursor})
+        for actor in resp.mutes:
+            results.append({
+                "did": actor.did, "handle": actor.handle,
+                "display_name": getattr(actor, "display_name", None),
+                "description": getattr(actor, "description", None),
+            })
+        cursor = resp.cursor
+        if not cursor:
+            break
+    return results
+
+
+def get_blocked_actors(client, page_limit: int = 100, max_pages: int = 100) -> list:
+    """app.bsky.graph.getBlocks -- accounts the active user has
+    blocked. LOW CONFIDENCE: assumes each entry's viewer.blocking
+    carries the block record's own uri (needed for unblock_actor),
+    never confirmed against a real response -- paste back a traceback
+    if unblocking from this list fails."""
+    results = []
+    cursor = None
+    for _ in range(max_pages):
+        resp = client.app.bsky.graph.get_blocks(params={"limit": page_limit, "cursor": cursor})
+        for actor in resp.blocks:
+            viewer = getattr(actor, "viewer", None)
+            results.append({
+                "did": actor.did, "handle": actor.handle,
+                "display_name": getattr(actor, "display_name", None),
+                "description": getattr(actor, "description", None),
+                "blocking_uri": getattr(viewer, "blocking", None) if viewer else None,
+            })
+        cursor = resp.cursor
+        if not cursor:
+            break
+    return results
 
 
 def block_actor(client, did: str) -> str:
@@ -2750,7 +3364,7 @@ def split_at_grapheme_boundary(text: str, max_chars: int):
     Within WHITESPACE_LOOKBACK chars of the target, prefers to land
     right after whitespace OR a punctuation mark (Unicode general
     category starting with "P" -- covers CJK full-width punctuation
-    like "ใ€","ใ€","๏ผ","๏ผ" and Western ".", ",", "!", "?" alike), so
+    like "。", "、", "！", "？" and Western ".", ",", "!", "?" alike), so
     the split lands on a natural phrase/sentence break instead of
     mid-word wherever the text has ANY such break nearby. Thai commonly
     has no punctuation or spaces at all within a short span, and CJK

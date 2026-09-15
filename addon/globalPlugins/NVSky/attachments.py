@@ -64,7 +64,8 @@ def download_to_temp(url: str, suffix: str = "") -> str:
         snippet = data[:200].decode("utf-8", errors="replace")
         raise OSError(f"Expected an image, got Content-Type '{content_type}': {snippet}")
 
-    # บังคับใช้ suffix เป็น .webp ถ้าเซิร์ฟเวอร์ส่ง WebP มา (แม้ว่าตอนเรียกฟังก์ชันจะขอ .jpg ก็ตาม)
+    # Force suffix to .webp if the server actually sent WebP (even if
+    # the caller originally asked for .jpg).
     if content_type.startswith("image/webp"):
         suffix = ".webp"
 
@@ -74,7 +75,7 @@ def download_to_temp(url: str, suffix: str = "") -> str:
     with open(path, "wb") as f:
         f.write(data)
 
-    # [ส่วนที่เพิ่มใหม่] แปลง WebP เป็น PNG ด้วย Pillow ที่ติดมากับ NVDA
+    # Convert WebP to PNG using the Pillow copy bundled with NVDA.
     if suffix == ".webp" or content_type.startswith("image/webp"):
         try:
             from PIL import Image
@@ -83,7 +84,7 @@ def download_to_temp(url: str, suffix: str = "") -> str:
             with Image.open(path) as img:
                 img.save(new_path, "PNG")
             
-            # ลบไฟล์ WebP ต้นฉบับทิ้งเพื่อไม่ให้รก Temp
+            # Remove the original WebP file to avoid littering Temp.
             try:
                 os.remove(path)
             except OSError:

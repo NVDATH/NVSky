@@ -52,6 +52,7 @@ from logHandler import log
 from . import db
 from . import chatWindow
 from . import uiutil
+from . import soundpack
 from .compose import ComposeDialog
 from . import client
 
@@ -101,13 +102,19 @@ class MainWindow(wx.Frame):
         # panel duplicating its own Check for updates/New post buttons
         # (which is what FeedWindow/NotificationsWindow used to do).
         toolbarSizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.checkUpdatesButton = wx.Button(panel, label="Check for updates (F5)")
-        self.newPostButton = wx.Button(panel, label="New post... (Ctrl+N)")
-        self.findListsButton = wx.Button(panel, label="Find lists by user...")
+        # Translators: Toolbar button to sync the current tab. Shows the F5 shortcut.
+        self.checkUpdatesButton = wx.Button(panel, label=_("Check for &updates (F5)"))
+        # Translators: Toolbar button to compose a new post. Shows the Ctrl+N shortcut. Relabeled to "New chat.../New list..." in chat/lists context, see onPageChanged.
+        self.newPostButton = wx.Button(panel, label=_("&New post... (Ctrl+N)"))
+        # Translators: Toolbar button, only shown while a Lists tab is active, to find and subscribe to a list by link.
+        self.findListsButton = wx.Button(panel, label=_("&Find lists by user..."))
         self.findListsButton.Hide()  # only shown while a Lists tab is active, see onPageChanged
-        self.settingsButton = wx.Button(panel, label="Settings...")
-        self.removeTabButton = wx.Button(panel, label="Remove current tab (Ctrl+W)")
-        self.closeButton = wx.Button(panel, label="Close")
+        # Translators: Toolbar button to open NVSky's settings. Shows the Ctrl+P shortcut.
+        self.settingsButton = wx.Button(panel, label=_("&Settings... (Ctrl+P)"))
+        # Translators: Toolbar button to remove the current removable tab. Shows the Ctrl+W shortcut.
+        self.removeTabButton = wx.Button(panel, label=_("&Remove current tab (Ctrl+W)"))
+        # Translators: Toolbar button to close the NVSky window.
+        self.closeButton = wx.Button(panel, label=_("&Close"))
         for button in (
             self.checkUpdatesButton, self.newPostButton, self.findListsButton, self.settingsButton,
             self.removeTabButton, self.closeButton,
@@ -156,7 +163,8 @@ class MainWindow(wx.Frame):
         if isChatContext:
             account = db.get_active_account()
             if account is None:
-                nvdaUi.message("No active account.")
+                # Translators: Announced when trying to start a new chat with no active account.
+                nvdaUi.message(_("No active account."))
                 return
             dlg = chatWindow.NewChatDialog(self, account, on_started=self._openChatConvo)
             dlg.Show()
@@ -209,7 +217,7 @@ class MainWindow(wx.Frame):
 
     # ---------------- tab management ----------------
 
-    def addTab(self, panel, label, select=True, removable=True):
+    def addTab(self, panel, label, select=True, removable=True, play_sound=True):
         """
         Adds `panel` (already constructed with self.notebook as its
         parent) as a new tab. `removable=False` marks a permanent tab
@@ -218,8 +226,15 @@ class MainWindow(wx.Frame):
         "can Ctrl+W take this tab out of the notebook" -- it has
         nothing to do with closing the MainWindow itself (Escape/
         Alt+F4/the toolbar's Close button), see onCharHook below.
+
+        play_sound=False is used when restoring previously-open temp
+        tabs on startup (see GlobalPlugin._buildTabs) -- those aren't
+        the user opening something new right now, so the "open_tab"
+        sound shouldn't fire for each one on every NVSky launch.
         """
         panel.TAB_REMOVABLE = removable
+        if removable and play_sound:
+            soundpack.play("open_tab")
         self.notebook.AddPage(panel, label, select)
         self._updateRemoveTabButton()
 
@@ -260,7 +275,8 @@ class MainWindow(wx.Frame):
             return
         newIndex = index + delta
         if newIndex < 0 or newIndex >= self.notebook.GetPageCount():
-            nvdaUi.message("Can't move the tab further in that direction.")
+            # Translators: Announced when trying to move a tab past the first/last position.
+            nvdaUi.message(_("Can't move the tab further in that direction."))
             return
         panel = self.notebook.GetPage(index)
         label = self.notebook.GetPageText(index)
@@ -382,11 +398,14 @@ class MainWindow(wx.Frame):
             isListsContext = pageIdentity is not None and pageIdentity["kind"] == "permanent" and pageIdentity["key"] == "lists"
             self.findListsButton.Show(isListsContext)
             if isChatContext:
-                self.newPostButton.SetLabel("New chat... (Ctrl+N)")
+                # Translators: Toolbar button relabeled while a Chat tab is active. Shows the Ctrl+N shortcut.
+                self.newPostButton.SetLabel(_("&New chat... (Ctrl+N)"))
             elif isListsContext:
-                self.newPostButton.SetLabel("New list... (Ctrl+N)")
+                # Translators: Toolbar button relabeled while a Lists tab is active. Shows the Ctrl+N shortcut.
+                self.newPostButton.SetLabel(_("&New list... (Ctrl+N)"))
             else:
-                self.newPostButton.SetLabel("New post... (Ctrl+N)")
+                # Translators: Toolbar button to compose a new post. Shows the Ctrl+N shortcut.
+                self.newPostButton.SetLabel(_("&New post... (Ctrl+N)"))
             if not self._activationSuppressed:
                 onActivated = getattr(panel, "onTabActivated", None)
                 if callable(onActivated):
@@ -468,11 +487,13 @@ class MainWindow(wx.Frame):
             return
         panel = self.notebook.GetPage(index)
         if not getattr(panel, "TAB_REMOVABLE", True):
-            nvdaUi.message("This tab can't be removed.")
+            # Translators: Announced when Ctrl+W is pressed on a permanent (non-removable) tab.
+            nvdaUi.message(_("This tab can't be removed."))
             return
         onRemoved = getattr(panel, "onTabRemoved", None)
         if callable(onRemoved):
             onRemoved()
+        soundpack.play("close_tab")
         self.notebook.DeletePage(index)
 
     def renameCurrentTab(self):
@@ -486,10 +507,15 @@ class MainWindow(wx.Frame):
             return
         panel = self.notebook.GetPage(index)
         if not getattr(panel, "TAB_REMOVABLE", True):
-            nvdaUi.message("This tab can't be renamed.")
+            # Translators: Announced when Ctrl+Shift+F2 is pressed on a permanent (non-renameable) tab.
+            nvdaUi.message(_("This tab can't be renamed."))
             return
         currentName = getattr(panel, "TAB_NAME", self.notebook.GetPageText(index))
-        dlg = wx.TextEntryDialog(self, "New tab name:", "Rename tab", value=currentName)
+        dlg = wx.TextEntryDialog(
+            # Translators: Prompt in the rename-tab dialog.
+            # Translators: Title of the rename-tab dialog.
+            self, _("New tab name:"), _("Rename tab"), value=currentName,
+        )
         if dlg.ShowModal() == wx.ID_OK:
             newName = dlg.GetValue().strip()
             if newName:
@@ -504,8 +530,10 @@ class MainWindow(wx.Frame):
                 onRenamed = getattr(panel, "onTabRenamed", None)
                 if callable(onRenamed):
                     onRenamed(newName)
-                nvdaUi.message(f"Tab renamed to {newName}.")
+                # Translators: Announced after renaming a tab. {} is the new name.
+                nvdaUi.message(_("Tab renamed to {}.").format(newName))
         dlg.Destroy()
+
     def onFindLists(self, evt=None):
         index = self.notebook.GetSelection()
         panel = self.notebook.GetPage(index) if index != wx.NOT_FOUND else None
@@ -538,7 +566,8 @@ class MainWindow(wx.Frame):
         panels = [p for p in self.getOpenTabs() if callable(getattr(p, "_syncForBulkCheck", None))]
         if not panels:
             return
-        nvdaUi.message("Checking all open tabs for updates, please wait...")
+        # Translators: Announced while checking every open tab for updates (Ctrl+F5).
+        nvdaUi.message(_("Checking all open tabs for updates, please wait..."))
 
         def worker():
             try:
@@ -561,7 +590,8 @@ class MainWindow(wx.Frame):
     def _onCheckAllOpenTabsDone(self, updatedPanels, error):
         if error:
             log.error(f"NVSky: checkAllOpenTabs failed: {error}")
-            nvdaUi.message(f"Could not check for updates: {error}")
+            # Translators: Announced when checking every open tab for updates fails. {} is the error message.
+            nvdaUi.message(_("Could not check for updates: {}").format(error))
             return
         index = self.notebook.GetSelection()
         activePanel = self.notebook.GetPage(index) if index != wx.NOT_FOUND else None
@@ -578,10 +608,14 @@ class MainWindow(wx.Frame):
             if callable(reload):
                 reload(moveFocus=True)
         if updatedPanels:
-            names = [getattr(p, "TAB_NAME", "a tab") for p in updatedPanels]
-            nvdaUi.message(f"Updates in: {', '.join(names)}.")
+            soundpack.play("ready")
+            # Translators: Fallback tab name when a panel has none set.
+            names = [getattr(p, "TAB_NAME", _("a tab")) for p in updatedPanels]
+            # Translators: Announced after checking every open tab for updates finds changes. {} is a comma-separated list of tab names.
+            nvdaUi.message(_("Updates in: {}.").format(", ".join(names)))
         else:
-            nvdaUi.message("No new updates in any open tab.")
+            # Translators: Announced after checking every open tab for updates finds nothing new.
+            nvdaUi.message(_("No new updates in any open tab."))
 
     # ---------------- window-level keyboard shortcuts ----------------
 

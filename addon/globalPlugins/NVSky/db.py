@@ -113,7 +113,10 @@ def init_db():
                 did TEXT PRIMARY KEY,
                 handle TEXT,
                 display_name TEXT,
-                avatar_url TEXT
+                avatar_url TEXT,
+                viewer_following TEXT,
+                viewer_muted INTEGER DEFAULT 0,
+                viewer_blocking TEXT
             );
 
             CREATE TABLE IF NOT EXISTS posts (
@@ -143,6 +146,7 @@ def init_db():
                 viewer_like_uri TEXT,
                 viewer_repost_uri TEXT,
                 viewer_bookmarked INTEGER DEFAULT 0,
+                viewer_thread_muted INTEGER DEFAULT 0,
                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
                 FOREIGN KEY (author_did) REFERENCES authors(did)
             );
@@ -215,6 +219,7 @@ def init_db():
                 reply_to_text TEXT,
                 is_read INTEGER DEFAULT 0,
                 reactions_json TEXT,
+                embed_json TEXT,
                 PRIMARY KEY (account_id, convo_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(account_id, convo_id, sent_at);
@@ -335,26 +340,55 @@ def close_all_connections():
     _local.conn = None
 
 
-def clear_cache(account_id: int):
+def clear_all_cache(account_id: int):
+    """
+    Wipes every cached/local-state table for this account -- like
+    remove_account but keeps the accounts row itself (still logged in,
+    no re-entering the App Password). This is the Settings > General
+    "Clear all cache" action; Ctrl+Delete in each tab only clears that
+    one tab's own cache, this clears everything at once.
+    """
     with _connect() as conn:
+        # posts cascades into feed_items via the FK on posts.uri --
+        # no separate feed_items delete needed (foreign_keys pragma is
+        # ON, see _get_connection).
         conn.execute("DELETE FROM posts WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM ui_state WHERE key = ?", (f"lastFocus:home:{account_id}",))
+        # notifications/convos/messages/convo_members/lists have no
+        # real FK to accounts (same gap remove_account's own comment
+        # documents) -- deleted explicitly here too.
+        conn.execute("DELETE FROM notifications WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM convos WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM messages WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM convo_members WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM lists WHERE account_id = ?", (account_id,))
+        # ui_state has no account_id column -- every per-account entry
+        # embeds the id in its key string instead (see
+        # get_open_temp_tabs/get_user_list_cache/get_tab_order/etc).
+        # Two LIKE patterns cover every such key: ends with ":<id>", or
+        # starts with "user_list_cache:<id>:" (the one key shape with
+        # the id in the middle, not at the end).
+        conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"%:{account_id}",))
+        conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"user_list_cache:{account_id}:%",))
         conn.commit()
         conn.execute("VACUUM")
 
 
 # ---------------- authors ----------------
 
-def upsert_author(did: str, handle: str, display_name: str, avatar_url: str):
+def upsert_author(did: str, handle: str, display_name: str, avatar_url: str,
+                   viewer_following=None, viewer_muted=False, viewer_blocking=None):
     with _connect() as conn:
         conn.execute(
-            """INSERT INTO authors (did, handle, display_name, avatar_url)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO authors (did, handle, display_name, avatar_url, viewer_following, viewer_muted, viewer_blocking)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(did) DO UPDATE SET
                    handle=excluded.handle,
                    display_name=excluded.display_name,
-                   avatar_url=excluded.avatar_url""",
-            (did, handle, display_name, avatar_url),
+                   avatar_url=excluded.avatar_url,
+                   viewer_following=excluded.viewer_following,
+                   viewer_muted=excluded.viewer_muted,
+                   viewer_blocking=excluded.viewer_blocking""",
+            (did, handle, display_name, avatar_url, viewer_following, int(bool(viewer_muted)), viewer_blocking),
         )
         conn.commit()
 
@@ -363,6 +397,24 @@ def get_author(did: str):
     with _connect() as conn:
         row = conn.execute("SELECT * FROM authors WHERE did = ?", (did,)).fetchone()
         return dict(row) if row else None
+
+
+def set_author_following(did: str, following_uri):
+    with _connect() as conn:
+        conn.execute("UPDATE authors SET viewer_following = ? WHERE did = ?", (following_uri, did))
+        conn.commit()
+
+
+def set_author_muted(did: str, muted: bool):
+    with _connect() as conn:
+        conn.execute("UPDATE authors SET viewer_muted = ? WHERE did = ?", (1 if muted else 0, did))
+        conn.commit()
+
+
+def set_author_blocking(did: str, blocking_uri):
+    with _connect() as conn:
+        conn.execute("UPDATE authors SET viewer_blocking = ? WHERE did = ?", (blocking_uri, did))
+        conn.commit()
 
 
 # ---------------- posts ----------------
@@ -376,12 +428,12 @@ def upsert_post(post: dict):
                 like_count, repost_count, reply_count, reply_parent_uri,
                 reply_to_did, reply_to_handle, is_repost, reposted_by_did, reposted_by_handle, reposted_by_display_name,
                 embed_json, facets_json, quoted_text, quoted_author_handle, viewer_like_uri, viewer_repost_uri,
-                viewer_bookmarked)
+                viewer_bookmarked, viewer_thread_muted)
                VALUES (:uri, :cid, :account_id, :author_did, :text, :created_at, :indexed_at,
                        :like_count, :repost_count, :reply_count, :reply_parent_uri,
                        :reply_to_did, :reply_to_handle, :is_repost, :reposted_by_did, :reposted_by_handle, :reposted_by_display_name,
                        :embed_json, :facets_json, :quoted_text, :quoted_author_handle, :viewer_like_uri, :viewer_repost_uri,
-                       :viewer_bookmarked)
+                       :viewer_bookmarked, :viewer_thread_muted)
                ON CONFLICT(uri) DO UPDATE SET
                    text=excluded.text,
                    created_at=excluded.created_at,
@@ -402,7 +454,8 @@ def upsert_post(post: dict):
                    quoted_author_handle=excluded.quoted_author_handle,
                    viewer_like_uri=excluded.viewer_like_uri,
                    viewer_repost_uri=excluded.viewer_repost_uri,
-                   viewer_bookmarked=excluded.viewer_bookmarked""",
+                   viewer_bookmarked=excluded.viewer_bookmarked,
+                   viewer_thread_muted=excluded.viewer_thread_muted""",
             post,
         )
         conn.commit()
@@ -564,11 +617,14 @@ def describe_convo_from_members(convo: dict, members: list) -> str:
         if convo.get("group_name"):
             return convo["group_name"]
         names = [m.get("display_name") or m.get("handle") or "?" for m in members]
-        return ", ".join(names) if names else "Group"
+        # Translators: Fallback display name for a group conversation with no name and no members cached.
+        return ", ".join(names) if names else _("Group")
     other = members[0] if members else None
     if other is None:
-        return "Conversation"
-    return other.get("display_name") or other.get("handle") or "Conversation"
+        # Translators: Fallback display name for a 1:1 conversation with no member cached.
+        return _("Conversation")
+    # Translators: Fallback display name for a 1:1 conversation whose member has neither a display name nor a handle cached.
+    return other.get("display_name") or other.get("handle") or _("Conversation")
 
 
 def get_convos(account_id: int):
@@ -676,6 +732,24 @@ def upsert_list(list_row: dict):
         conn.commit()
 
 
+def set_list_muted(account_id: int, list_uri: str, muted: bool):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE lists SET muted = ? WHERE account_id = ? AND list_uri = ?",
+            (1 if muted else 0, account_id, list_uri),
+        )
+        conn.commit()
+
+
+def set_list_blocked_uri(account_id: int, list_uri: str, blocked_uri):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE lists SET blocked_uri = ? WHERE account_id = ? AND list_uri = ?",
+            (blocked_uri, account_id, list_uri),
+        )
+        conn.commit()
+
+
 def get_lists(account_id: int):
     with _connect() as conn:
         rows = conn.execute(
@@ -709,15 +783,16 @@ def upsert_message(message: dict):
         conn.execute(
             """INSERT INTO messages
                (account_id, convo_id, message_id, sender_did, text, sent_at,
-                reply_to_message_id, reply_to_text, reactions_json)
+                reply_to_message_id, reply_to_text, reactions_json, embed_json)
                VALUES (:account_id, :convo_id, :message_id, :sender_did, :text, :sent_at,
-                       :reply_to_message_id, :reply_to_text, :reactions_json)
+                       :reply_to_message_id, :reply_to_text, :reactions_json, :embed_json)
                ON CONFLICT(account_id, convo_id, message_id) DO UPDATE SET
                    text=excluded.text,
                    sent_at=excluded.sent_at,
                    reply_to_message_id=excluded.reply_to_message_id,
                    reply_to_text=excluded.reply_to_text,
-                   reactions_json=excluded.reactions_json""",
+                   reactions_json=excluded.reactions_json,
+                   embed_json=excluded.embed_json""",
             message,
         )
         conn.commit()
@@ -856,6 +931,11 @@ def set_post_bookmarked(uri: str, bookmarked: bool):
         conn.execute("UPDATE posts SET viewer_bookmarked = ? WHERE uri = ?", (1 if bookmarked else 0, uri))
         conn.commit()
 
+def set_post_thread_muted(uri: str, muted: bool):
+    with _connect() as conn:
+        conn.execute("UPDATE posts SET viewer_thread_muted = ? WHERE uri = ?", (1 if muted else 0, uri))
+        conn.commit()
+
 def get_unread_count(account_id: int, feed_key: str) -> int:
     with _connect() as conn:
         row = conn.execute(
@@ -928,6 +1008,13 @@ def mark_notification_unread(uri: str):
     with _connect() as conn:
         conn.execute("UPDATE notifications SET is_read = 0 WHERE uri = ?", (uri,))
         conn.commit()
+
+
+def clear_notifications_cache(account_id: int):
+    with _connect() as conn:
+        conn.execute("DELETE FROM notifications WHERE account_id = ?", (account_id,))
+        conn.commit()
+        conn.execute("VACUUM")
 
 
 # ---------------- ui_state ----------------
@@ -1025,13 +1112,22 @@ def set_bg_sync_interval(category: str, minutes: int):
     set_ui_state(f"bg_sync_interval_{category}", str(max(0, minutes)))
 
 
-def get_bg_sync_announce() -> bool:
-    raw = get_ui_state("bg_sync_announce")
-    return raw != "0"  # default True
+def get_bg_sync_announce_categories() -> set:
+    """Category keys (see BG_SYNC_DEFAULT_INTERVALS) the user wants
+    spoken when background sync finds new content for them -- replaces
+    the old single all-or-nothing checkbox. Defaults to every category,
+    matching that checkbox's old default of True."""
+    raw = get_ui_state("bg_sync_announce_categories")
+    if raw is None:
+        return set(BG_SYNC_DEFAULT_INTERVALS)
+    try:
+        return set(json.loads(raw))
+    except (ValueError, TypeError):
+        return set(BG_SYNC_DEFAULT_INTERVALS)
 
 
-def set_bg_sync_announce(enabled: bool):
-    set_ui_state("bg_sync_announce", "1" if enabled else "0")
+def set_bg_sync_announce_categories(categories: set):
+    set_ui_state("bg_sync_announce_categories", json.dumps(sorted(categories)))
 
 
 def get_bg_sync_last(account_id: int, category: str):
@@ -1055,6 +1151,46 @@ def get_home_active_filter(account_id: int) -> str:
 
 def set_home_active_filter(account_id: int, feed_key: str):
     set_ui_state(f"home_active_filter:{account_id}", feed_key)
+
+
+# ---------------- sound pack ----------------
+
+def get_soundpack_selected() -> str:
+    """Empty string means "Silent / No sound" -- also the default for
+    an account that's never touched Settings > Sound."""
+    return get_ui_state("soundpack_selected") or ""
+
+
+def set_soundpack_selected(pack_name: str):
+    set_ui_state("soundpack_selected", pack_name or "")
+
+
+def get_soundpack_disabled_events() -> set:
+    """
+    Returns the set of event keys the user has explicitly UNCHECKED --
+    the inverse of what used to be stored (a list of enabled events).
+    Storing disabled events instead means any event key added to
+    soundpack.EVENT_KEYS in a future update (like embed_image/
+    embed_video/etc were) is enabled by default automatically, since
+    it simply won't be in this set yet -- the old enabled-list scheme
+    had the opposite (and wrong) behavior: a newly added event key was
+    never in the old saved list either, so it read as "not enabled"
+    until the user re-checked it manually. Confirmed as a real bug
+    when embed_image/embed_video/embed_link/embed_quote were added and
+    came up unchecked for accounts that had already saved Settings >
+    Sound before that.
+    """
+    raw = get_ui_state("soundpack_disabled_events")
+    if raw is None:
+        return set()
+    try:
+        return set(json.loads(raw))
+    except (ValueError, TypeError):
+        return set()
+
+
+def set_soundpack_disabled_events(events) -> None:
+    set_ui_state("soundpack_disabled_events", json.dumps(sorted(events)))
 
 
 def get_open_temp_tabs(account_id: int) -> list:

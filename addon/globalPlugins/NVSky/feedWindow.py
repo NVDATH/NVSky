@@ -23,6 +23,7 @@ from . import client
 from . import attachments
 from . import timeutils
 from . import uiutil
+from . import soundpack
 from .compose import ComposeDialog
 
 LAZY_LOAD_THRESHOLD = 3
@@ -33,7 +34,8 @@ MAX_NETWORK_PAGE_WALK = 5
 COLUMN_DISPLAY_NAME = "display_name"
 COLUMN_HANDLE = "handle"
 
-TAB_NAME = "Home"
+# Translators: Permanent tab label for the Home feed.
+TAB_NAME = _("Home")
 
 # Maps FeedWindow's filter RadioBox selection index to the feed_key used
 # for both local caching (feed_items.feed_key) and which server feed
@@ -49,12 +51,18 @@ FILTER_INDEX_TO_FEED_KEY = {0: "home", 1: "discover"}
 FEED_KEY_TO_FILTER_INDEX = {"home": 0, "discover": 1}
 
 REPORT_REASONS = [
-    ("Spam", "com.atproto.moderation.defs#reasonSpam"),
-    ("Violates community guidelines", "com.atproto.moderation.defs#reasonViolation"),
-    ("Misleading", "com.atproto.moderation.defs#reasonMisleading"),
-    ("Sexual content", "com.atproto.moderation.defs#reasonSexual"),
-    ("Rude or harassing", "com.atproto.moderation.defs#reasonRude"),
-    ("Other", "com.atproto.moderation.defs#reasonOther"),
+    # Translators: Report reason choice.
+    (_("Spam"), "com.atproto.moderation.defs#reasonSpam"),
+    # Translators: Report reason choice.
+    (_("Violates community guidelines"), "com.atproto.moderation.defs#reasonViolation"),
+    # Translators: Report reason choice.
+    (_("Misleading"), "com.atproto.moderation.defs#reasonMisleading"),
+    # Translators: Report reason choice.
+    (_("Sexual content"), "com.atproto.moderation.defs#reasonSexual"),
+    # Translators: Report reason choice.
+    (_("Rude or harassing"), "com.atproto.moderation.defs#reasonRude"),
+    # Translators: Report reason choice.
+    (_("Other"), "com.atproto.moderation.defs#reasonOther"),
 ]
 
 
@@ -80,6 +88,40 @@ def _format_post_time(iso_timestamp: str) -> str:
     return timeutils.format_timestamp(iso_timestamp, mode=mode, custom_pattern=pattern)
 
 
+def _embed_sound_event(embed_json: str):
+    """Maps an embed's $type to a soundpack event key, or None if the
+    post has no embed (or an embed type this doesn't cover). A quote
+    post with attached media (recordWithMedia) plays whichever media
+    sound matches what's actually attached (image/video), same fix as
+    _describe_embed's own recordWithMedia branch just above -- was
+    previously always "embed_quote" regardless of the attached media
+    type, which meant the sound (and the on-screen "Quote + media"
+    text) never actually told the image/video apart even though
+    _extract_embed_info (client.py) already resolves that distinction."""
+    if not embed_json:
+        return None
+    try:
+        embed = json.loads(embed_json)
+    except (ValueError, TypeError):
+        return None
+    embed_type = embed.get("$type", "")
+    if "recordWithMedia" in embed_type:
+        if embed.get("images"):
+            return "embed_image"
+        if embed.get("video_url") or embed.get("video_alt") is not None:
+            return "embed_video"
+        return "embed_quote"
+    if "images" in embed_type:
+        return "embed_image"
+    if "video" in embed_type:
+        return "embed_video"
+    if "record" in embed_type:
+        return "embed_quote"
+    if "external" in embed_type:
+        return "embed_link"
+    return None
+
+
 def _describe_embed(embed_json: str) -> str:
     if not embed_json:
         return ""
@@ -93,18 +135,33 @@ def _describe_embed(embed_json: str) -> str:
     if "images" in embed_type:
         images = embed.get("images", [])
         alts = [img.get("alt") for img in images if img.get("alt")]
-        label = f"Image ({len(images)})" if len(images) > 1 else "Image"
+        # Translators: Embed summary for a post with more than one image. {} is the count.
+        # Translators: Embed summary for a post with exactly one image.
+        label = _("Image ({})").format(len(images)) if len(images) > 1 else _("Image")
         if alts:
-            label += f": {'; '.join(alts)}"
+            # Translators: Appended to an image embed summary to list each image's alt text. {} is a semicolon-separated list of alt texts.
+            label += _(": {}").format("; ".join(alts))
         return label
     if "video" in embed_type:
-        return "Video"
+        alt = embed.get("video_alt")
+        # Translators: Embed summary for a post with a video, showing its alt text. {} is the alt text.
+        # Translators: Embed summary for a post with a video and no alt text.
+        return _("Video: {}").format(alt) if alt else _("Video")
     if "recordWithMedia" in embed_type:
-        return "Quote + media"
+        if embed.get("images"):
+            # Translators: Embed summary for a quote post that also carries attached image(s).
+            return _("Quote + image")
+        if embed.get("video_url") or embed.get("video_alt") is not None:
+            # Translators: Embed summary for a quote post that also carries an attached video.
+            return _("Quote + video")
+        # Translators: Fallback embed summary for a quote post with media whose type couldn't be determined.
+        return _("Quote + media")
     if "record" in embed_type:
-        return "Quote post"
+        # Translators: Embed summary for a plain quote post.
+        return _("Quote post")
     if "external" in embed_type:
-        return "Link"
+        # Translators: Embed summary for a post with a link-preview card.
+        return _("Link")
     return ""
 
 
@@ -113,20 +170,28 @@ def _message_text(post: dict) -> str:
 
     if post.get("quoted_text"):
         quotedAuthor = post.get("quoted_author_handle")
-        who = f"@{quotedAuthor}" if quotedAuthor else "original post"
+        # Translators: Fallback quoted-author label when no handle is cached.
+        who = f"@{quotedAuthor}" if quotedAuthor else _("original post")
         # No em dash -- screen readers spell it out as two syllables.
-        text = f"{text} Quote from {who}: {post['quoted_text']}"
+        # Translators: Appended to a post's text to show the quoted post. First {} is the quoted post's text, second {} is who it's from (already localized).
+        text = _("{} Quote from {}: {}").format(text, who, post["quoted_text"])
 
     if post.get("reply_parent_uri"):
         replyToHandle = post.get("reply_to_handle")
         if replyToHandle:
-            text = f"Reply to @{replyToHandle}: {text}"
+            # Translators: Prefix on a reply's post text. First {} is the handle being replied to, second {} is the reply's own text.
+            text = _("Reply to @{}: {}").format(replyToHandle, text)
 
     # The Author column already shows who reposted it (see _authorLabel) --
     # this just needs to name the ORIGINAL author, not repeat the reposter.
     if post.get("is_repost"):
         originalHandle = post.get("handle") or post.get("author_did")
-        text = f"Reposted @{originalHandle}: {text}" if originalHandle else f"Reposted: {text}"
+        if originalHandle:
+            # Translators: Prefix on a repost's post text, naming the original author. First {} is their handle, second {} is the post text.
+            text = _("Reposted @{}: {}").format(originalHandle, text)
+        else:
+            # Translators: Prefix on a repost's post text when the original author isn't cached. {} is the post text.
+            text = _("Reposted: {}").format(text)
 
     return uiutil.single_line(text)
 
@@ -145,12 +210,20 @@ class RemovableTabMixin:
     """
 
     def _updateTitle(self):
+        # self._account may not exist on every RemovableTabMixin host's
+        # exact attribute name in theory, but every current host sets
+        # it in __init__ before this is ever called -- matches the
+        # pattern FeedListMixin._updateTitle/ChatWindow._updateTitle
+        # already use, which this was missing (title bar showed no
+        # account label at all, inconsistent with every other tab).
+        # Translators: Fallback account label in the window title when no account is active.
+        accountLabel = self._account["handle"] if getattr(self, "_account", None) else _("no account")
         notebook = self.GetParent()
         index = notebook.FindPage(self)
         if index != wx.NOT_FOUND:
             notebook.SetPageText(index, self.TAB_NAME)
             if index == notebook.GetSelection():
-                self.GetTopLevelParent().SetTitle(f"{self.TAB_NAME} - NVSky")
+                self.GetTopLevelParent().SetTitle(f"{self.TAB_NAME} - NVSky - {accountLabel}")
 
     def _jumpBackToOrigin(self):
         if not self._originTabKey:
@@ -183,17 +256,73 @@ class UserActionMixin:
         return item
 
     def _populateUserActionMenu(self, menu, did, handle, display_name=None):
-        self._addMenuItem(menu, "View user info", lambda: self.viewProfile(did))
-        self._addMenuItem(menu, "Copy profile URL", lambda: self.copyProfileUrl(did, handle))
-        self._addMenuItem(menu, "View timeline", lambda: self.showTimeline(did, handle))
-        self._addMenuItem(menu, "Show followers", lambda: self.showFollowers(did, handle, display_name))
-        self._addMenuItem(menu, "Show following", lambda: self.showFollowing(did, handle, display_name))
-        self._addMenuItem(menu, "Open profile on bsky.app",
-                           lambda: webbrowser.open(f"https://bsky.app/profile/{handle or did}"))
+        # Translators: User action menu item.
+        self._addMenuItem(menu, _("&View profile..."), lambda: self.viewProfile(did))
+        # Translators: User action menu item.
+        self._addMenuItem(menu, _("&Start chat..."), lambda: self.startChat(did, handle))
         menu.AppendSeparator()
-        self._addMenuItem(menu, "Follow / Unfollow", lambda: self._toggleRelation(did, handle, "follow"))
-        self._addMenuItem(menu, "Mute / Unmute", lambda: self._toggleRelation(did, handle, "mute"))
-        self._addMenuItem(menu, "Block / Unblock", lambda: self._toggleRelation(did, handle, "block"))
+
+        # Real state from cache when available -- no confirm dialog
+        # needed anymore since the label already tells the truth
+        # (matches the optimistic Like/Repost/Mute-thread pattern).
+        # Falls back to the old ambiguous toggle (network check +
+        # confirm) if this author was never cached from a post/
+        # notification yet.
+        cached = db.get_author(did)
+        if cached is not None:
+            followingUri = cached.get("viewer_following")
+            isMuted = bool(cached.get("viewer_muted"))
+            blockingUri = cached.get("viewer_blocking")
+            # Translators: User action menu item (already following).
+            # Translators: User action menu item (not yet following).
+            self._addMenuItem(menu, _("Un&follow") if followingUri else _("&Follow"),
+                               lambda: self._toggleRelationCached(did, handle, "follow", followingUri))
+            # Translators: User action menu item (already muted).
+            # Translators: User action menu item (not yet muted).
+            self._addMenuItem(menu, _("Un&mute") if isMuted else _("Mu&te"),
+                               lambda: self._toggleRelationCached(did, handle, "mute", isMuted))
+            # Translators: User action menu item (already blocked).
+            # Translators: User action menu item (not yet blocked).
+            self._addMenuItem(menu, _("Un&block") if blockingUri else _("&Block"),
+                               lambda: self._toggleRelationCached(did, handle, "block", blockingUri))
+        else:
+            # Translators: User action menu item, ambiguous fallback when relation state isn't cached.
+            self._addMenuItem(menu, _("&Follow / Unfollow"), lambda: self._toggleRelation(did, handle, "follow"))
+            # Translators: User action menu item, ambiguous fallback when relation state isn't cached.
+            self._addMenuItem(menu, _("Mu&te / Unmute"), lambda: self._toggleRelation(did, handle, "mute"))
+            # Translators: User action menu item, ambiguous fallback when relation state isn't cached.
+            self._addMenuItem(menu, _("&Block / Unblock"), lambda: self._toggleRelation(did, handle, "block"))
+        menu.AppendSeparator()
+
+        browseMenu = wx.Menu()
+        # Translators: Submenu item under "Show...", opens the user's timeline.
+        self._addMenuItem(browseMenu, _("&Timeline..."), lambda: self.showTimeline(did, handle, display_name))
+        # Translators: Submenu item under "Show...", opens the user's followers list.
+        self._addMenuItem(browseMenu, _("&Followers..."), lambda: self.showFollowers(did, handle, display_name))
+        # Translators: Submenu item under "Show...", opens who the user follows.
+        self._addMenuItem(browseMenu, _("Follo&wing..."), lambda: self.showFollowing(did, handle, display_name))
+        # Translators: Submenu item under "Show...", opens followers you both share.
+        self._addMenuItem(browseMenu, _("Kn&own followers..."), lambda: self.showKnownFollowers(did, handle, display_name))
+        # Translators: Submenu item under "Show...", opens lists the user is on.
+        self._addMenuItem(browseMenu, _("&Lists..."), lambda: self.showUserLists(did, handle, display_name))
+        # Translators: User action submenu label.
+        menu.AppendSubMenu(browseMenu, _("Sho&w..."))
+        # Translators: User action menu item.
+        self._addMenuItem(menu, _("&Add to list..."), lambda: self.addToList(did, handle, display_name))
+        menu.AppendSeparator()
+
+        copyMenu = wx.Menu()
+        # Translators: Submenu item under "Copy...", copies the user's bsky.app profile URL.
+        self._addMenuItem(copyMenu, _("Copy &profile URL"), lambda: self.copyProfileUrl(did, handle))
+        # Translators: Submenu item under "Copy...", opens the user's profile in a web browser.
+        self._addMenuItem(copyMenu, _("&Open on bsky.app"),
+                           lambda: webbrowser.open(f"https://bsky.app/profile/{handle or did}"))
+        # Translators: User action submenu label.
+        menu.AppendSubMenu(copyMenu, _("&Copy..."))
+        menu.AppendSeparator()
+
+        # Translators: User action menu item.
+        self._addMenuItem(menu, _("&Report user..."), lambda: self._reportActor(did, handle))
 
     def showUserActionMenu(self, did, handle, display_name=None):
         menu = wx.Menu()
@@ -206,9 +335,11 @@ class UserActionMixin:
         # replaces the old UserTimelineDialog popup. Needs the real
         # MainWindow, same reasoning as _openUserListTab below.
         from . import get_main_window
+        from . import feedTabs
         mainWindow = get_main_window()
         if mainWindow is None:
-            nvdaUi.message("Open NVSky's main window first.")
+            # Translators: Announced when an action needs MainWindow but it isn't open.
+            nvdaUi.message(_("Open NVSky's main window first."))
             return
 
         identity = {"kind": "user_timeline", "key": did}
@@ -221,7 +352,7 @@ class UserActionMixin:
         originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
 
         ownerLabel = self._displayLabel(handle, display_name)
-        tab = UserTimelineTabWindow(mainWindow.notebook, did, ownerLabel, origin_key=originKey)
+        tab = feedTabs.UserTimelineTabWindow(mainWindow.notebook, did, ownerLabel, origin_key=originKey)
         mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
         account = db.get_active_account()
         if account is not None:
@@ -236,6 +367,11 @@ class UserActionMixin:
     def showFollowing(self, did, handle=None, display_name=None):
         self._openUserListTab("following", did, handle, display_name)
 
+    def showKnownFollowers(self, did, handle=None, display_name=None):
+        # _openUserListTab is already generic on kind -- no changes
+        # needed there, just a new kind string flowing through.
+        self._openUserListTab("known_followers", did, handle, display_name)
+
     def _openUserListTab(self, kind, did, handle=None, display_name=None):
         # Opens (or focuses an already-open) UserListTabWindow --
         # replaces the old UserListDialog popup. Needs the real
@@ -243,9 +379,11 @@ class UserActionMixin:
         # mixed into (e.g. ManageGroupMembersDialog) -- falls back to
         # a message if MainWindow isn't open at all.
         from . import get_main_window
+        from . import feedTabs
         mainWindow = get_main_window()
         if mainWindow is None:
-            nvdaUi.message("Open NVSky's main window first.")
+            # Translators: Announced when an action needs MainWindow but it isn't open.
+            nvdaUi.message(_("Open NVSky's main window first."))
             return
 
         identity = {"kind": "user_list", "key": f"{kind}:{did}"}
@@ -261,7 +399,7 @@ class UserActionMixin:
         originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
 
         ownerLabel = self._displayLabel(handle, display_name)
-        tab = UserListTabWindow(mainWindow.notebook, kind, did, ownerLabel, origin_key=originKey)
+        tab = feedTabs.UserListTabWindow(mainWindow.notebook, kind, did, ownerLabel, origin_key=originKey)
         mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
         account = db.get_active_account()
         if account is not None:
@@ -278,10 +416,12 @@ class UserActionMixin:
         mode = db.get_ui_state("column1_display") or COLUMN_DISPLAY_NAME
         if mode == COLUMN_DISPLAY_NAME and display_name:
             return display_name
-        return f"@{handle}" if handle else "unknown user"
+        # Translators: Fallback user label when neither display name nor handle is known.
+        return f"@{handle}" if handle else _("unknown user")
 
     def viewProfile(self, did):
-        _announce_now("Loading profile, please wait...")
+        # Translators: Announced while loading a user's profile.
+        _announce_now(_("Loading profile, please wait..."))
 
         def worker():
             try:
@@ -298,10 +438,12 @@ class UserActionMixin:
     @uiutil.safe_ui_callback
     def _onProfileFetched(self, profile, error):
         if error:
-            nvdaUi.message(f"Could not load profile: {error}")
+            # Translators: Announced when loading a profile fails. {} is the error message.
+            nvdaUi.message(_("Could not load profile: {}").format(error))
             return
+        from . import feedTabs
         gui.mainFrame.prePopup()
-        dlg = ProfileDialog(self, profile)
+        dlg = feedTabs.ProfileDialog(self, profile)
         dlg.Show()
 
     def _copyToClipboard(self, text: str):
@@ -315,6 +457,122 @@ class UserActionMixin:
         label = f"@{handle}" if handle else did
         _announce_now(f"Profile URL for {label} copied to clipboard.")
 
+    def startChat(self, did, handle):
+        # Opens (or focuses an already-open) ConvoTabWindow for this
+        # user -- a genuinely NEW tab, not a switch into the shared
+        # Chat tab (that would jump the user's Chat tab to a different
+        # conversation than whatever they had selected there before).
+        # Same pattern as ChatWindow._openInNewTab.
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            # Translators: Announced when an action needs MainWindow but it isn't open.
+            nvdaUi.message(_("Open NVSky's main window first."))
+            return
+        account = db.get_active_account()
+        if account is None:
+            # Translators: Announced when trying to start a chat with no active account.
+            nvdaUi.message(_("No active account."))
+            return
+        if not account.get("chat_supported", 1):
+            # Translators: Announced when the active account doesn't support DMs.
+            nvdaUi.message(_("This account doesn't support direct messages."))
+            return
+        if did == account.get("did"):
+            # BUG FIX: previously this went straight to the network and
+            # surfaced the server's raw "Convos may only contain two
+            # members" XrpcError to the user verbatim. Caught here
+            # instead, before any request is made.
+            # Translators: Announced when trying to start a chat with your own account.
+            nvdaUi.message(_("You can't start a chat with yourself."))
+            return
+        label = f"@{handle}" if handle else did
+        # Translators: Announced while starting a new chat. {} is the recipient's label.
+        _announce_now(_("Starting chat with {}, please wait...").format(label))
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                try:
+                    availability = client.get_convo_availability(atprotoClient, [did])
+                    canChat = getattr(availability, "can_chat", getattr(availability, "canChat", True))
+                except Exception:
+                    canChat = True
+                if not canChat:
+                    # Translators: Reported when the recipient doesn't accept messages from this account. {} is their label.
+                    wx.CallAfter(self._onStartChatDone, None, _("{} isn't accepting messages from you.").format(label))
+                    return
+                convo = client.get_or_create_convo_for_member(atprotoClient, did)
+                client.sync_convos(atprotoClient, account["id"], account["did"])
+                error = None
+            except Exception as e:
+                convo = None
+                error = str(e)
+            wx.CallAfter(self._onStartChatDone, convo, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onStartChatDone(self, convo, error):
+        if error or not convo or not convo.get("id"):
+            # Translators: Fallback error when the server doesn't explain why opening a chat failed.
+            errorText = error or _("no conversation was returned")
+            # Translators: Announced when opening a chat fails. {} is the error message.
+            nvdaUi.message(_("Could not open chat: {}").format(errorText))
+            return
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            return
+        convoId = convo["id"]
+        identity = {"kind": "conversation", "key": convoId}
+        if mainWindow.focusTabByIdentity(identity):
+            return
+        account = db.get_active_account()
+        if account is None:
+            return
+        convoRow = db.get_convo(account["id"], convoId)
+        if convoRow is None:
+            # sync_convos above should have cached it already -- fall
+            # back to the shared Chat tab if it somehow isn't there yet.
+            mainWindow._openChatConvo(convoId)
+            return
+        from . import chatWindow
+        members = db.get_convo_members(account["id"], convoId)
+        activeIndex = mainWindow.notebook.GetSelection()
+        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
+        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
+        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+        panel = chatWindow.ConvoTabWindow(mainWindow.notebook, convoRow, account, members, origin_key=originKey)
+        tabLabel = db.describe_convo_from_members(convoRow, members)
+        # Translators: Title of a popped-out conversation tab. {} is the conversation's display name.
+        mainWindow.addTab(panel, _("Chat: {}").format(tabLabel), select=True, removable=True)
+        db.add_open_temp_tab(account["id"], {
+            "type": "conversation",
+            "key": convoId,
+            "convo_id": convoId,
+            "origin_key": originKey,
+        })
+
+    def addToList(self, did, handle, display_name=None):
+        account = db.get_active_account()
+        if account is None:
+            # Translators: Announced when trying to add a user to a list with no active account.
+            nvdaUi.message(_("No active account."))
+            return
+        from . import listsWindow
+        gui.mainFrame.prePopup()
+        dlg = listsWindow.AddToListDialog(self, account, did, handle, display_name)
+        dlg.Show()
+
+    def showUserLists(self, did, handle, display_name=None):
+        # Reuses the existing "Find lists by user..." dialog but skips
+        # the search step -- did/handle are already known here.
+        from . import listsWindow
+        gui.mainFrame.prePopup()
+        dlg = listsWindow.SubscribeListDialog(self, preselected_user={"did": did, "handle": handle, "display_name": display_name})
+        dlg.Show()
+
     def _toggleRelation(self, did, handle, kind):
         """
         Shared confirm-then-act flow for Follow/Mute/Block (kind is
@@ -326,7 +584,8 @@ class UserActionMixin:
         silently toggling. The menu itself still opens instantly either
         way -- only clicking one of these three items waits.
         """
-        nvdaUi.message("Checking status, please wait...")
+        # Translators: Announced while checking a user's follow/mute/block status.
+        nvdaUi.message(_("Checking status, please wait..."))
 
         def worker():
             try:
@@ -343,7 +602,8 @@ class UserActionMixin:
     @uiutil.safe_ui_callback
     def _onRelationStatusChecked(self, did, handle, kind, profile, error):
         if error:
-            nvdaUi.message(f"Could not check status: {error}")
+            # Translators: Announced when checking a user's status fails. {} is the error message.
+            nvdaUi.message(_("Could not check status: {}").format(error))
             return
 
         viewer = (profile or {}).get("viewer") or {}
@@ -351,15 +611,22 @@ class UserActionMixin:
 
         if kind == "follow":
             currentValue = viewer.get("following")
-            question = f"Unfollow {label}?" if currentValue else f"Follow {label}?"
+            # Translators: Confirmation to unfollow a user. {} is their label.
+            # Translators: Confirmation to follow a user. {} is their label.
+            question = _("Unfollow {}?").format(label) if currentValue else _("Follow {}?").format(label)
         elif kind == "mute":
             currentValue = viewer.get("muted")
-            question = f"Unmute {label}?" if currentValue else f"Mute {label}?"
+            # Translators: Confirmation to unmute a user. {} is their label.
+            # Translators: Confirmation to mute a user. {} is their label.
+            question = _("Unmute {}?").format(label) if currentValue else _("Mute {}?").format(label)
         else:
             currentValue = viewer.get("blocking")
-            question = f"Unblock {label}?" if currentValue else f"Block {label}?"
+            # Translators: Confirmation to unblock a user. {} is their label.
+            # Translators: Confirmation to block a user. {} is their label.
+            question = _("Unblock {}?").format(label) if currentValue else _("Block {}?").format(label)
 
-        confirm = wx.MessageDialog(self, question, "Confirm", wx.YES_NO | wx.NO_DEFAULT)
+        # Translators: Title of a Yes/No confirmation dialog.
+        confirm = wx.MessageDialog(self, question, _("Confirm"), wx.YES_NO | wx.NO_DEFAULT)
         confirmed = confirm.ShowModal() == wx.ID_YES
         confirm.Destroy()
         if not confirmed:
@@ -383,7 +650,8 @@ class UserActionMixin:
                 error = None
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onUserActionDone, "Done." if not error else None, error)
+            # Translators: Announced after a follow/mute/block action succeeds.
+            wx.CallAfter(self._onUserActionDone, _("Done.") if not error else None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -391,10 +659,110 @@ class UserActionMixin:
     def _onUserActionDone(self, message, error):
         if error:
             log.error(f"NVSky: user action failed: {error}")
-            nvdaUi.message(f"Action failed: {error}")
+            # Translators: Announced when a user action fails. {} is the error message.
+            nvdaUi.message(_("Action failed: {}").format(error))
             return
         if message:
             nvdaUi.message(message)
+
+    def _toggleRelationCached(self, did, handle, kind, currentValue):
+        label = f"@{handle}" if handle else did
+        if kind == "follow":
+            db.set_author_following(did, None if currentValue else "pending")
+            soundpack.play("unfollow" if currentValue else "follow")
+            # Translators: Announced after unfollowing a user. {} is their label.
+            # Translators: Announced after following a user. {} is their label.
+            nvdaUi.message(_("Unfollowed {}.").format(label) if currentValue else _("Followed {}.").format(label))
+        elif kind == "mute":
+            db.set_author_muted(did, not currentValue)
+            soundpack.play("block_mute")
+            # Translators: Announced after unmuting a user. {} is their label.
+            # Translators: Announced after muting a user. {} is their label.
+            nvdaUi.message(_("Unmuted {}.").format(label) if currentValue else _("Muted {}.").format(label))
+        else:
+            db.set_author_blocking(did, None if currentValue else "pending")
+            soundpack.play("block_mute")
+            # Translators: Announced after unblocking a user. {} is their label.
+            # Translators: Announced after blocking a user. {} is their label.
+            nvdaUi.message(_("Unblocked {}.").format(label) if currentValue else _("Blocked {}.").format(label))
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                if kind == "follow":
+                    resultValue = None if currentValue else client.follow_actor(atprotoClient, did)
+                    if currentValue:
+                        client.unfollow_actor(atprotoClient, currentValue)
+                elif kind == "mute":
+                    if currentValue:
+                        client.unmute_actor(atprotoClient, did)
+                    else:
+                        client.mute_actor(atprotoClient, did)
+                    resultValue = not currentValue
+                else:
+                    resultValue = None if currentValue else client.block_actor(atprotoClient, did)
+                    if currentValue:
+                        client.unblock_actor(atprotoClient, currentValue)
+                error = None
+            except Exception as e:
+                resultValue = currentValue
+                error = str(e)
+            wx.CallAfter(self._onRelationCachedDone, did, kind, currentValue, resultValue, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onRelationCachedDone(self, did, kind, previousValue, resultValue, error):
+        finalValue = previousValue if error else resultValue
+        if kind == "follow":
+            db.set_author_following(did, finalValue)
+        elif kind == "mute":
+            db.set_author_muted(did, finalValue)
+        else:
+            db.set_author_blocking(did, finalValue)
+        if error:
+            # Translators: Announced when a follow/mute/block action fails after the optimistic UI update. {} is the error message.
+            nvdaUi.message(_("Action failed: {}").format(error))
+
+    def _reportActor(self, did, handle):
+        # NOTE: was "for label, _ in REPORT_REASONS" -- bare `_` shadowed
+        # gettext within this function's scope. Renamed to avoid that trap.
+        labels = [label for label, _reasonCode in REPORT_REASONS]
+        # Translators: Prompt in the report-user reason picker.
+        # Translators: Title of the report-user reason picker.
+        dlg = wx.SingleChoiceDialog(self, _("Reason for reporting this user:"), _("Report user"), labels)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        reasonType = REPORT_REASONS[dlg.GetSelection()][1]
+        dlg.Destroy()
+
+        label = f"@{handle}" if handle else did
+        confirm = wx.MessageDialog(
+            self,
+            # Translators: Confirmation before sending a user report to Bluesky moderation. {} is the user's label.
+            _("Send this report for {} to Bluesky moderation?").format(label),
+            # Translators: Title of the confirm-report dialog.
+            _("Confirm report"), wx.YES_NO | wx.NO_DEFAULT
+        )
+        confirmed = confirm.ShowModal() == wx.ID_YES
+        confirm.Destroy()
+        if not confirmed:
+            return
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                client.create_actor_report(atprotoClient, did, reasonType)
+                error = None
+            except Exception as e:
+                error = str(e)
+            if not error:
+                soundpack.play("block_mute")
+            # Translators: Announced after successfully sending a user report.
+            wx.CallAfter(self._onUserActionDone, _("Report sent.") if not error else None, error)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 class UserListMixin:
@@ -411,9 +779,12 @@ class UserListMixin:
     """
 
     def _buildUserListColumns(self):
-        self.userList.InsertColumn(0, "Handle", width=180)
-        self.userList.InsertColumn(1, "Display name", width=180)
-        self.userList.InsertColumn(2, "Bio", width=300)
+        # Translators: Column header for a user's handle in a user list.
+        self.userList.InsertColumn(0, _("Handle"), width=180)
+        # Translators: Column header for a user's display name in a user list.
+        self.userList.InsertColumn(1, _("Display name"), width=180)
+        # Translators: Column header for a user's bio in a user list.
+        self.userList.InsertColumn(2, _("Bio"), width=300)
 
     def _insertUserRow(self, index, user):
         self.userList.InsertItem(index, f'@{user["handle"]}')
@@ -453,7 +824,8 @@ class UserListMixin:
     def onUserAction(self, evt=None):
         user = self._getFocusedUser()
         if user is None:
-            nvdaUi.message("No user selected.")
+            # Translators: Announced when the user-action menu (Alt+U) is invoked with no user focused.
+            nvdaUi.message(_("No user selected."))
             return
         self.showUserActionMenu(user["did"], user["handle"], user.get("display_name"))
 
@@ -464,6 +836,9 @@ class UserListMixin:
             return
         if keyCode == wx.WXK_F5 and not evt.ShiftDown() and not evt.ControlDown():
             self.onCheckForUpdates(None)
+            return
+        if evt.ControlDown() and keyCode == wx.WXK_DELETE:
+            self.onClearCache()
             return
         evt.Skip()
 
@@ -491,9 +866,12 @@ class EmbedViewMixin:
         images = [img for img in (embed.get("images") or []) if img.get("fullsize_url")]
         if len(images) == 1:
             url = images[0]["fullsize_url"]
-            self._addMenuItem(menu, "Open image", lambda: self._openEmbedImage(url))
-            self._addMenuItem(menu, "Send image to Be My Eyes", lambda: self._sendEmbedImageToBeMyEyes(url))
-            self._addMenuItem(menu, "Copy image to clipboard", lambda: self._copyEmbedImageToClipboard(url))
+            # Translators: Context menu item to open an attached image in the default viewer.
+            self._addMenuItem(menu, _("&Open image"), lambda: self._openEmbedImage(url))
+            # Translators: Context menu item to send an attached image to the Be My Eyes app.
+            self._addMenuItem(menu, _("&Send image to Be My Eyes"), lambda: self._sendEmbedImageToBeMyEyes(url))
+            # Translators: Context menu item to copy an attached image to the clipboard.
+            self._addMenuItem(menu, _("&Copy image to clipboard"), lambda: self._copyEmbedImageToClipboard(url))
             added = True
         elif len(images) > 1:
             for i, img in enumerate(images):
@@ -501,25 +879,49 @@ class EmbedViewMixin:
                 # "&" forces the digit itself as the access key -- the
                 # default would use the first letter ("I") for every
                 # item, since they'd all start with "Image".
-                label = f"Image &{i + 1}"
+                # Translators: Submenu label for one of several attached images. {} is the image's 1-based index.
+                label = _("Image &{}").format(i + 1)
                 imageMenu = wx.Menu()
-                self._addMenuItem(imageMenu, "Open", lambda url=url: self._openEmbedImage(url))
-                self._addMenuItem(imageMenu, "Send to Be My Eyes", lambda url=url: self._sendEmbedImageToBeMyEyes(url))
-                self._addMenuItem(imageMenu, "Copy to clipboard", lambda url=url: self._copyEmbedImageToClipboard(url))
+                # Translators: Context menu item to open an attached image in the default viewer.
+                self._addMenuItem(imageMenu, _("&Open"), lambda url=url: self._openEmbedImage(url))
+                # Translators: Context menu item to send an attached image to the Be My Eyes app.
+                self._addMenuItem(imageMenu, _("&Send to Be My Eyes"), lambda url=url: self._sendEmbedImageToBeMyEyes(url))
+                # Translators: Context menu item to copy an attached image to the clipboard.
+                self._addMenuItem(imageMenu, _("&Copy to clipboard"), lambda url=url: self._copyEmbedImageToClipboard(url))
                 menu.AppendSubMenu(imageMenu, label)
                 added = True
 
         videoUrl = embed.get("video_url")
         if videoUrl:
-            self._addMenuItem(menu, "Open video", lambda: self._openEmbedVideo(videoUrl))
-            self._addMenuItem(menu, "Copy video URL", lambda: self._copyEmbedUrl(videoUrl, "Video URL"))
+            # Translators: Context menu item to open an attached video in the default player.
+            self._addMenuItem(menu, _("Open &video"), lambda: self._openEmbedVideo(videoUrl))
+            # Translators: Context menu item to copy an attached video's URL.
+            self._addMenuItem(menu, _("Copy video &URL"), lambda: self._copyEmbedUrl(videoUrl, _("Video URL")))
+            added = True
+        elif embed.get("$type") == "app.bsky.embed.video":
+            # Optimistic insert right after posting a video (see
+            # compose.py's _insertOptimisticPost) only knows the embed
+            # TYPE, not its playlist URL yet -- that's only known once
+            # the server's own processed copy is synced back down.
+            # Previously this just silently produced no menu at all
+            # (added stayed False), which looked like a dead/broken
+            # menu item rather than "not ready yet".
+            self._addMenuItem(
+                menu,
+                # Translators: Disabled-looking menu item shown when a just-posted video hasn't finished processing on the server yet.
+                _("Video not ready yet (Check for updates first)"),
+                # Translators: Announced when trying to view a video embed that hasn't finished processing yet.
+                lambda: nvdaUi.message(_("This video was just posted -- press F5 to refresh, then try again.")),
+            )
             added = True
 
         linkUrl = embed.get("link_url")
         if linkUrl:
             title = embed.get("link_title") or linkUrl
-            self._addMenuItem(menu, f"Open link: {title}", lambda: webbrowser.open(linkUrl))
-            self._addMenuItem(menu, "Copy link URL", lambda: self._copyEmbedUrl(linkUrl, "Link URL"))
+            # Translators: Context menu item to open a post's link preview in a browser. {} is the link's title or URL.
+            self._addMenuItem(menu, _("Open &link: {}").format(title), lambda: webbrowser.open(linkUrl))
+            # Translators: Context menu item to copy a post's link-preview URL.
+            self._addMenuItem(menu, _("Copy link &URL"), lambda: self._copyEmbedUrl(linkUrl, _("Link URL")))
             added = True
 
         if not added:
@@ -529,10 +931,12 @@ class EmbedViewMixin:
 
     def _copyEmbedUrl(self, url, label):
         self._copyToClipboard(url)
-        _announce_now(f"{label} copied to clipboard.")
+        # Translators: Announced after copying an embed's URL to the clipboard. {} is already-translated (e.g. "Video URL").
+        _announce_now(_("{} copied to clipboard.").format(label))
 
     def _openEmbedImage(self, url):
-        _announce_now("Downloading image, please wait...")
+        # Translators: Announced while downloading an image to open it.
+        _announce_now(_("Downloading image, please wait..."))
 
         def worker():
             try:
@@ -541,36 +945,43 @@ class EmbedViewMixin:
                 error = None
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onActionDone, "Image opened." if not error else None, error)
+            # Translators: Announced after an image finishes opening.
+            wx.CallAfter(self._onActionDone, _("Image opened.") if not error else None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _sendEmbedImageToBeMyEyes(self, url):
-        _announce_now("Downloading image, please wait...")
+        # Translators: Announced while downloading an image to send it to Be My Eyes.
+        _announce_now(_("Downloading image, please wait..."))
 
         def worker():
             try:
                 path = attachments.download_to_temp(url, suffix=".jpg")
                 ok = attachments.send_to_bemyeyes(path)
-                error = None if ok else "Could not launch Be My Eyes. Is it installed?"
+                # Translators: Error shown when Be My Eyes can't be launched.
+                error = None if ok else _("Could not launch Be My Eyes. Is it installed?")
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onActionDone, "Sent to Be My Eyes." if not error else None, error)
+            # Translators: Announced after an image is sent to Be My Eyes.
+            wx.CallAfter(self._onActionDone, _("Sent to Be My Eyes.") if not error else None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _copyEmbedImageToClipboard(self, url):
         def announce_start():
             speech.cancelSpeech()
-            nvdaUi.message("Downloading image, please wait...")
+            # Translators: Announced while downloading an image to copy it to the clipboard.
+            nvdaUi.message(_("Downloading image, please wait..."))
 
         core.callLater(150, announce_start)
 
         def copy_and_notify(path):
             try:
                 ok = attachments.copy_image_to_clipboard(path)
-                error = None if ok else "Could not read the downloaded image."
-                self._onActionDone("Image copied to clipboard." if not error else None, error)
+                # Translators: Error shown when the downloaded image file can't be read for clipboard copy.
+                error = None if ok else _("Could not read the downloaded image.")
+                # Translators: Announced after an image is copied to the clipboard.
+                self._onActionDone(_("Image copied to clipboard.") if not error else None, error)
             except Exception as e:
                 self._onActionDone(None, str(e))
 
@@ -584,7 +995,8 @@ class EmbedViewMixin:
         threading.Thread(target=worker, daemon=True).start()
 
     def _openEmbedVideo(self, url):
-        _announce_now("Downloading video, please wait...")
+        # Translators: Announced while downloading a video to open it.
+        _announce_now(_("Downloading video, please wait..."))
 
         def worker():
             try:
@@ -593,19 +1005,21 @@ class EmbedViewMixin:
                 error = None
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onActionDone, "Video opened." if not error else None, error)
+            # Translators: Announced after a video finishes opening.
+            wx.CallAfter(self._onActionDone, _("Video opened.") if not error else None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     @uiutil.safe_ui_callback
     def _onActionDone(self, message, error):
         def announce_immediately(text):
-            speech.cancelSpeech()  # เธ•เธฑเธ”เธเธ—/เธซเธขเธธเธ”เน€เธชเธตเธขเธเธ—เธตเนเธเธณเธฅเธฑเธเธญเนเธฒเธเธเนเธญเธเธงเธฒเธกเนเธ ListCtrl เธ—เธฑเธเธ—เธต
-            nvdaUi.message(text)   # เธเธนเธ”เธเนเธญเธเธงเธฒเธกเธเธญเธเน€เธฃเธฒเนเธ—เธเธ—เธฑเธเธ—เธต
+            speech.cancelSpeech()  # cuts off the ListCtrl's own focus announcement
+            nvdaUi.message(text)   # speak ours instead
 
         if error:
             log.error(f"NVSky: action failed: {error}")
-            core.callLater(200, announce_immediately, f"Action failed: {error}")
+            # Translators: Announced when an embed action (open/copy/send) fails. {} is the error message.
+            core.callLater(200, announce_immediately, _("Action failed: {}").format(error))
             return
 
         if message:
@@ -678,7 +1092,7 @@ class FeedListMixin:
         # skip the (harmless but pointless) work there. wx.Notebook
         # hides non-active pages, so a background tab's IsShownOnScreen()
         # is False and this also skips tabs nobody's currently looking at.
-        mode, _ = timeutils.current_mode_and_pattern(db)
+        mode, _pattern = timeutils.current_mode_and_pattern(db)
         if mode not in ("relative_24h", "relative_always"):
             return
         if not self.postList.IsShownOnScreen():
@@ -692,7 +1106,8 @@ class FeedListMixin:
             timer.Stop()
 
     def _updateTitle(self):
-        accountLabel = self._account["handle"] if self._account else "no account"
+        # Translators: Fallback account label in the window title when no account is active.
+        accountLabel = self._account["handle"] if self._account else _("no account")
 
         # Panel-based tabs (FeedWindow, NotificationsWindow, and any
         # future Panel-based tab) keep the notebook tab label short
@@ -733,9 +1148,11 @@ class FeedListMixin:
         # so "X unread" doesn't mean anything useful there.
         if getattr(self, "_tracksUnread", True):
             unread = self._dbGetUnreadCount() if self._account else 0
-            self.statusBar.SetStatusText(f"{self.TAB_NAME} {unread} unread {len(self._posts)} total")
+            # Translators: Feed-tab status bar text. First {} is tab name, second {} is unread count, third {} is total count.
+            self.statusBar.SetStatusText(_("{} {} unread {} total").format(self.TAB_NAME, unread, len(self._posts)))
         else:
-            self.statusBar.SetStatusText(f"{self.TAB_NAME} {len(self._posts)} total")
+            # Translators: Feed-tab status bar text (no unread tracking). First {} is tab name, second {} is total count.
+            self.statusBar.SetStatusText(_("{} {} total").format(self.TAB_NAME, len(self._posts)))
 
     def _currentAuthorMode(self) -> str:
         return db.get_ui_state("column1_display") or COLUMN_DISPLAY_NAME
@@ -780,10 +1197,14 @@ class FeedListMixin:
         self._render()
 
     def _buildFeedListColumns(self):
-        self.postList.InsertColumn(0, "Embed", width=140)
-        self.postList.InsertColumn(1, "Author", width=180)
-        self.postList.InsertColumn(2, "Message", width=330)
-        self.postList.InsertColumn(3, "Posted", width=140)
+        # Translators: Column header for a post's embed summary (image/video/link/quote).
+        self.postList.InsertColumn(0, _("Embed"), width=140)
+        # Translators: Column header for a post's author.
+        self.postList.InsertColumn(1, _("Author"), width=180)
+        # Translators: Column header for a post's text.
+        self.postList.InsertColumn(2, _("Message"), width=330)
+        # Translators: Column header for when a post was posted/received.
+        self.postList.InsertColumn(3, _("Posted"), width=140)
 
     def _buildStandardFeedSizer(self, extra_top=None, extra_action_widgets=None):
         """
@@ -807,8 +1228,10 @@ class FeedListMixin:
         sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
+        # Translators: Button to open the Post action menu. Shows the Alt+A shortcut.
+        self.postActionButton = wx.Button(self, label=_("&Post action... (Alt+A)"))
+        # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
+        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
         actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.userActionButton)
         if extra_action_widgets:
@@ -830,6 +1253,7 @@ class FeedListMixin:
         self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
         self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
         self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onItemActivated)
+        self.postList.Bind(wx.EVT_CONTEXT_MENU, self.onPostAction)
         self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
     def _finishStandardFeedInit(self, sync_if_empty=False):
@@ -841,7 +1265,8 @@ class FeedListMixin:
         self._loadFromCache(reset=True)
 
         if self._account is None:
-            nvdaUi.message("No active account. Log in from Settings first.")
+            # Translators: Announced when opening a feed tab with no active account.
+            nvdaUi.message(_("No active account. Log in from Settings first."))
             return
 
         self._restoreFocusPosition(moveFocus=False)
@@ -936,7 +1361,8 @@ class FeedListMixin:
         # Notification/Received", no Message/Embed at all). Reading the
         # row itself is correct automatically everywhere.
         if not (1 <= n <= len(self._posts)):
-            nvdaUi.message(f"No item {n}.")
+            # Translators: Announced when Alt+number is pressed for a post index that doesn't exist. {} is the number.
+            nvdaUi.message(_("No item {}.").format(n))
             return
         newestFirst = db.get_ui_state("sort_order") != "oldest_first"
         index = (n - 1) if newestFirst else (len(self._posts) - n)
@@ -1048,6 +1474,10 @@ class FeedListMixin:
             post = self._posts[index]
             db.set_ui_state(self._focusStateKey(), post["uri"])
 
+            embedEvent = _embed_sound_event(post.get("embed_json"))
+            if embedEvent:
+                soundpack.play_debounced(embedEvent)
+
             if not post.get("is_read"):
                 self._markItemRead(post)
                 post["is_read"] = 1
@@ -1057,13 +1487,16 @@ class FeedListMixin:
 
     def onFetchPreviousPosts(self, evt):
         if self._account is None:
-            nvdaUi.message("No active account.")
+            # Translators: Announced when trying to fetch older posts with no active account.
+            nvdaUi.message(_("No active account."))
             return
         if self._loadingMore:
-            nvdaUi.message(f"Already fetching older {self.TAB_NAME} posts, please wait...")
+            # Translators: Announced when Shift+F5 is pressed while an older-posts fetch is already in progress. {} is the tab name.
+            nvdaUi.message(_("Already fetching older {} posts, please wait...").format(self.TAB_NAME))
             return
         if not self._posts:
-            nvdaUi.message(f"Nothing loaded yet in {self.TAB_NAME}.")
+            # Translators: Announced when trying to fetch older posts in an empty feed. {} is the tab name.
+            nvdaUi.message(_("Nothing loaded yet in {}.").format(self.TAB_NAME))
             return
         self._loadMore()
 
@@ -1098,7 +1531,9 @@ class FeedListMixin:
                 post["is_read"] = 1
                 self._updateStatusBar()
                 return
-        nvdaUi.message("No unread posts.")
+        soundpack.play("boundary")
+        # Translators: Announced when there's no unread post to jump to.
+        nvdaUi.message(_("No unread posts."))
 
     def _selectAllPosts(self):
         self._suppressFocusEvents = True
@@ -1107,7 +1542,8 @@ class FeedListMixin:
                 self.postList.SetItemState(i, wx.LIST_STATE_SELECTED, wx.LIST_STATE_SELECTED)
         finally:
             self._suppressFocusEvents = False
-        nvdaUi.message(f"{len(self._posts)} posts selected.")
+        # Translators: Announced after Ctrl+A selects every post. {} is the count.
+        nvdaUi.message(_("{} posts selected.").format(len(self._posts)))
 
     def _getSelectedPosts(self):
         # Was FeedWindow-only since the very first version of this file
@@ -1127,7 +1563,8 @@ class FeedListMixin:
         self._loadingMore = True
         oldestIndexedAt = min(p.get("feed_indexed_at") or p["indexed_at"] for p in self._posts)
 
-        nvdaUi.message(f"Loading older {self.TAB_NAME} posts, please wait...")
+        # Translators: Announced while fetching older posts. {} is the tab name.
+        nvdaUi.message(_("Loading older {} posts, please wait...").format(self.TAB_NAME))
         self._startLoadingBeep()
 
         def worker():
@@ -1136,7 +1573,7 @@ class FeedListMixin:
             error = None
             try:
                 atprotoClient = client.get_client_for_active_account()
-                for _ in range(MAX_NETWORK_PAGE_WALK):
+                for _walk in range(MAX_NETWORK_PAGE_WALK):
                     cursor = self._syncPage(atprotoClient, cursor, PAGE_SIZE)
                     foundOlder = bool(self._dbGetPage(before_indexed_at=oldestIndexedAt))
                     if foundOlder or not cursor:
@@ -1154,7 +1591,8 @@ class FeedListMixin:
         self._loadingMore = False
         self._stopLoadingBeep()
         if error:
-            nvdaUi.message(f"Could not load more {self.TAB_NAME} posts: {error}")
+            # Translators: Announced when fetching older posts fails. First {} is the tab name, second {} is the error message.
+            nvdaUi.message(_("Could not load more {} posts: {}").format(self.TAB_NAME, error))
             return
         self._olderCursor = cursor
         if foundOlder:
@@ -1168,33 +1606,38 @@ class FeedListMixin:
             self._restoreFocusPosition()
             addedCount = len(self._posts) - oldCount
             if addedCount <= 0:
-                nvdaUi.message(f"{self.TAB_NAME} load complete.")
+                # Translators: Announced when no genuinely new older posts were added. {} is the tab name.
+                nvdaUi.message(_("{} load complete.").format(self.TAB_NAME))
             elif addedCount == 1:
-                nvdaUi.message(f"1 older post loaded in {self.TAB_NAME}.")
+                # Translators: Announced after loading exactly one older post. {} is the tab name.
+                nvdaUi.message(_("1 older post loaded in {}.").format(self.TAB_NAME))
             else:
-                nvdaUi.message(f"{addedCount} older posts loaded in {self.TAB_NAME}.")
+                # Translators: Announced after loading several older posts. First {} is the count, second {} is the tab name.
+                nvdaUi.message(_("{} older posts loaded in {}.").format(addedCount, self.TAB_NAME))
         elif cursor:
             # Walked MAX_NETWORK_PAGE_WALK pages without turning up a new
             # cached post (e.g. a stretch of muted/hidden posts got
             # filtered out) -- the timeline itself isn't actually
             # exhausted since the cursor is still valid, so press
             # Shift+F5 again to keep looking further back.
-            nvdaUi.message(f"No older {self.TAB_NAME} posts found nearby -- press Shift+F5 again to keep looking back.")
+            # Translators: Announced when no new older posts were found in the pages walked so far. {} is the tab name.
+            nvdaUi.message(_("No older {} posts found nearby -- press Shift+F5 again to keep looking back.").format(self.TAB_NAME))
         else:
-            nvdaUi.message(f"No more {self.TAB_NAME} posts to load.")
+            soundpack.play("boundary")
+            # Translators: Announced when there are no more older posts to load at all. {} is the tab name.
+            nvdaUi.message(_("No more {} posts to load.").format(self.TAB_NAME))
 
     def _startLoadingBeep(self):
-        self._loadingTimer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self._onLoadingBeepTick, self._loadingTimer)
-        self._loadingTimer.Start(LOADING_BEEP_INTERVAL_MS)
-
-    def _onLoadingBeepTick(self, evt):
-        tones.beep(500, 50)
+        # Routed through soundpack's own looped progress indicator now
+        # (see soundpack.py's SoundEngine.start_progress/stop_progress)
+        # instead of a local wx.Timer -- that module already handles
+        # the beep-fallback-when-no-progress-sound-file case, so this
+        # method (kept under its old name -- every FeedListMixin call
+        # site still calls it unchanged) just delegates to it.
+        soundpack.start_progress()
 
     def _stopLoadingBeep(self):
-        if self._loadingTimer is not None:
-            self._loadingTimer.Stop()
-            self._loadingTimer = None
+        soundpack.stop_progress()
 
     def _syncForBulkCheck(self, atprotoClient):
         # Pure network+DB work, safe to call from Ctrl+F5's single
@@ -1252,13 +1695,15 @@ class FeedListMixin:
 
     def onCheckForUpdates(self, evt):
         if self._account is None:
-            nvdaUi.message("No active account.")
+            # Translators: Announced when checking for updates with no active account.
+            nvdaUi.message(_("No active account."))
             return
         if self._checkingUpdates:
             return
 
         self._checkingUpdates = True
-        nvdaUi.message(f"Checking {self.TAB_NAME} feed for updates, please wait...")
+        # Translators: Announced while checking a feed for updates. {} is the tab name.
+        nvdaUi.message(_("Checking {} feed for updates, please wait...").format(self.TAB_NAME))
         self._startLoadingBeep()
 
         def worker():
@@ -1278,7 +1723,8 @@ class FeedListMixin:
         self._stopLoadingBeep()
         if error:
             log.error(f"NVSky: check for updates failed: {error}")
-            nvdaUi.message(f"Check for updates failed: {error}")
+            # Translators: Announced when checking a feed for updates fails. {} is the error message.
+            nvdaUi.message(_("Check for updates failed: {}").format(error))
             return
 
         oldTopUri = self._posts[0]["uri"] if self._posts else None
@@ -1295,11 +1741,57 @@ class FeedListMixin:
                 newCount += 1
 
         if newCount == 0:
-            nvdaUi.message(f"No new posts in {self.TAB_NAME} feed.")
+            # Translators: Announced when checking a feed for updates finds nothing new. {} is the tab name.
+            nvdaUi.message(_("No new posts in {} feed.").format(self.TAB_NAME))
         elif newCount == 1:
-            nvdaUi.message(f"1 new post in {self.TAB_NAME} feed.")
+            # Translators: Announced when checking a feed for updates finds exactly one new post. {} is the tab name.
+            nvdaUi.message(_("1 new post in {} feed.").format(self.TAB_NAME))
         else:
-            nvdaUi.message(f"{newCount} new posts in {self.TAB_NAME} feed.")
+            # Translators: Announced when checking a feed for updates finds several new posts. First {} is the count, second {} is the tab name.
+            nvdaUi.message(_("{} new posts in {} feed.").format(newCount, self.TAB_NAME))
+
+    def onClearCache(self, evt=None):
+        # Clears this tab's cached posts only -- no auto-refresh,
+        # leaves reload timing to F5/bgsync.
+        if self._account is None:
+            # Translators: Announced when clearing cache with no active account.
+            nvdaUi.message(_("No active account."))
+            return
+        confirm = wx.MessageDialog(
+            self,
+            # Translators: Confirmation to clear a feed's cached posts. {} is the tab name.
+            _("Clear cached posts for {}? This can't be undone.").format(self.TAB_NAME),
+            # Translators: Title of the clear-cache confirmation dialog.
+            _("Clear cache"), wx.YES_NO | wx.NO_DEFAULT,
+        )
+        confirmed = confirm.ShowModal() == wx.ID_YES
+        confirm.Destroy()
+        if not confirmed:
+            return
+        self._doClearCache()
+
+    def _doClearCache(self):
+        db.clear_feed_key_cache(self._account["id"], self._feedKey)
+        self._loadFromCache(reset=True)
+
+        if self._posts:
+            # Still has items -- normal focus works fine.
+            self.postList.SetFocus()
+            return
+
+        # Empty list: a ListCtrl that just lost its last row via
+        # DeleteAllItems() while it already had real OS focus doesn't
+        # raise a fresh focus event (same HWND, no real transition),
+        # so NVDA gets stuck reporting "unknown" on the dead old row
+        # object. Rather than fighting that with fake focus bounces,
+        # send focus somewhere genuinely useful instead: the shared
+        # "Check for updates" toolbar button (present on every tab,
+        # never hidden) -- doubles as a natural nudge toward refreshing
+        # the now-empty list.
+        mainWindow = self.GetTopLevelParent()
+        checkButton = getattr(mainWindow, "checkUpdatesButton", None)
+        if checkButton is not None:
+            checkButton.SetFocus()
 
     # ---------------- window-level keyboard shortcuts (shared) ----------------
     # Consolidated from 5 near-identical copies (Home/Saved/Lists/ListTab/
@@ -1314,6 +1806,14 @@ class FeedListMixin:
     def onCharHook(self, evt):
         keyCode = evt.GetKeyCode()
 
+        if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers() and self.FindFocus() is self.postList:
+            self._checkListBoundaryBeforeKey(keyCode)
+        if evt.ControlDown() and keyCode == wx.WXK_DELETE:
+            self.onClearCache()
+            return
+        if keyCode == wx.WXK_DELETE and not evt.HasAnyModifiers() and self.FindFocus() is self.postList:
+            self.onDeletePostShortcut()
+            return
         if keyCode == wx.WXK_F5 and evt.ControlDown():
             evt.Skip()  # bubble up to MainWindow's checkAllOpenTabs
             return
@@ -1349,6 +1849,28 @@ class FeedListMixin:
             return
 
         evt.Skip()
+
+    def _checkListBoundaryBeforeKey(self, keyCode):
+        # Deterministic instead of comparing focus before/after via
+        # wx.CallAfter -- that approach fired on EVERY arrow press, not
+        # just at the real top/bottom, because EVT_CHAR_HOOK's own
+        # CallAfter callback ran before Windows had actually dispatched
+        # the key down to the native ListCtrl's own handler, so "after"
+        # always read back identical to "before" regardless of whether
+        # a real boundary was hit. self._posts is already the single
+        # source of truth for row order (matches _render's own sort),
+        # so the boundary can be computed directly from the CURRENT
+        # focused index without waiting on native behavior at all: Up
+        # from row 0, or Down from the last row, has nowhere left to go.
+        if not self._posts:
+            return
+        index = self.postList.GetFocusedItem()
+        if index == -1:
+            return
+        if keyCode == wx.WXK_UP and index == 0:
+            soundpack.play("boundary")
+        elif keyCode == wx.WXK_DOWN and index == len(self._posts) - 1:
+            soundpack.play("boundary")
 
     def _onAltNumber(self, n):
         self._announceNthNewestPost(n)
@@ -1405,7 +1927,7 @@ class FeedListMixin:
 
         n = len(self._posts)
         i = self.postList.GetFocusedItem()
-        for _ in range(n):
+        for _step in range(n):
             i += direction
             if i < 0 or i >= n:
                 break
@@ -1431,424 +1953,15 @@ class FeedListMixin:
                     self._jumpingToUser = False
                 return
 
-        nvdaUi.message(f"No more posts involving @{targetHandle} in that direction.")
+        soundpack.play("boundary")
+        # Translators: Announced when Left/Right jump-to-same-user runs out of matching posts. {} is the handle.
+        nvdaUi.message(_("No more posts involving @{} in that direction.").format(targetHandle))
 
     # ---------------- new post (SUPPORTS_NEW_POST) ----------------
 
     def onNewPost(self, evt=None):
         dlg = ComposeDialog(self, onClosed=None)
         dlg.Show()
-
-
-class ProfileDialog(UserActionMixin, wx.Dialog):
-    """Read-only profile info view. Press Alt+U for the user action menu (view/follow/mute/block/etc.)."""
-
-    def __init__(self, parent, profile: dict):
-        self._profile = profile
-        title = profile.get("display_name") or f"@{profile['handle']}"
-        super().__init__(parent, title=f"{title} - Profile", size=(500, 400))
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        info = (
-            f"Display name: {profile.get('display_name') or '(none)'}\n"
-            f"Handle: @{profile['handle']}\n"
-            f"Followers: {profile['followers_count']}\n"
-            f"Following: {profile['follows_count']}\n"
-            f"Posts: {profile['posts_count']}\n\n"
-            f"{profile.get('description') or '(no bio)'}"
-        )
-        textCtrl = wx.TextCtrl(self, value=info, style=wx.TE_MULTILINE | wx.TE_READONLY)
-        sizer.Add(textCtrl, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        closeBtn = wx.Button(self, label="&Close")
-        btnSizer = wx.BoxSizer(wx.HORIZONTAL)
-        btnSizer.Add(closeBtn, flag=wx.ALIGN_CENTER)
-        sizer.Add(btnSizer, flag=wx.ALIGN_CENTER | wx.ALL, border=10)
-
-        self.SetSizer(sizer)
-        self.CentreOnScreen()
-
-        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        if evt.AltDown() and evt.GetKeyCode() == ord("U"):
-            self.showUserActionMenu(self._profile["did"], self._profile["handle"], self._profile.get("display_name"))
-            return
-        evt.Skip()
-
-    def onClose(self, evt):
-        gui.mainFrame.postPopup()
-        self.Destroy()
-
-class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Panel):
-    """
-    Browsable user-list tab -- replaces the old UserListDialog and
-    covers three kinds: "followers"/"following" (fixed to one account's
-    did) and "search" (a people-search query, opened via Explore's
-    "Open in new tab"). F5 re-fetches from the network -- no local
-    cache/pagination, same fetch-once-per-refresh behavior the old
-    dialog had. Not persisted differently by kind -- all three
-    persist/restore the same way as any other temp tab.
-    """
-
-    _KIND_LABELS = {"followers": "followers", "following": "following", "search": "search results"}
-
-    def __init__(self, parent, kind, target, owner_label=None, origin_key=None):
-        super().__init__(parent)
-        self._account = db.get_active_account()
-        self._kind = kind  # "followers" / "following" / "search"
-        self._target = target  # did for followers/following, query for search
-        if kind in ("followers", "following"):
-            self.TAB_NAME = f"{kind.capitalize()} of {owner_label}"
-        else:
-            self.TAB_NAME = f"People search: {target}"
-        self.TAB_TEMP_TYPE = "user_list"
-        self.TAB_TEMP_KEY = f"{kind}:{target}"
-        self._originTabKey = origin_key
-        self._users = []
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        self.userList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self._buildUserListColumns()
-        sizer.Add(self.userList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.userActionButton = wx.Button(self, label="&User action... (Alt+U)")
-        actionRow.Add(self.userActionButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        self.statusBar = wx.StatusBar(self)
-        sizer.Add(self.statusBar, flag=wx.EXPAND)
-        self.SetSizer(sizer)
-
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        self.userList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onUserAction)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onUserListCharHook)
-
-        self._pendingIsInitial = True
-        cached = db.get_user_list_cache(self._account["id"], self.TAB_TEMP_KEY) if self._account else None
-        self._hadInitialCache = cached is not None
-        if cached is not None:
-            self._users = cached
-            self._renderUsers()
-        else:
-            self.statusBar.SetStatusText("Loading, please wait...")
-        self._fetch()
-
-    def onTabActivated(self):
-        nvdaUi.message(f"{self.TAB_NAME} tab")
-        self.userList.SetFocus()
-
-    def onTabRemoved(self):
-        if self._account is not None:
-            db.remove_open_temp_tab(self._account["id"], "user_list", self.TAB_TEMP_KEY)
-            db.delete_user_list_cache(self._account["id"], self.TAB_TEMP_KEY)
-        self._jumpBackToOrigin()
-
-    def _userListLabel(self):
-        return f"{self.TAB_NAME} -- {len(self._users)} total"
-
-    def onCheckForUpdates(self, evt=None):
-        if self._account is None:
-            nvdaUi.message("No active account.")
-            return
-        nvdaUi.message(f"Loading {self._KIND_LABELS[self._kind]}, please wait...")
-        self._pendingIsInitial = False
-        self._fetch()
-
-    def _fetch(self):
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                if self._kind == "followers":
-                    users = client.get_followers(atprotoClient, self._target)
-                elif self._kind == "following":
-                    users = client.get_follows(atprotoClient, self._target)
-                else:
-                    response = client.search_actors(atprotoClient, self._target)
-                    users = [
-                        {
-                            "did": a.did, "handle": a.handle,
-                            "display_name": getattr(a, "display_name", None),
-                            "description": getattr(a, "description", None),
-                        }
-                        for a in response.actors
-                    ]
-                error = None
-            except Exception as e:
-                users = None
-                error = str(e)
-            wx.CallAfter(self._onFetchDone, users, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onFetchDone(self, users, error):
-        label = self._KIND_LABELS[self._kind]
-        isInitial = self._pendingIsInitial
-        self._pendingIsInitial = False
-        if error:
-            if not self._users:
-                nvdaUi.message(f"Could not load {label}: {error}")
-                self.statusBar.SetStatusText(f"Could not load {label}.")
-            else:
-                nvdaUi.message(f"Could not refresh {label}: {error}")
-            return
-
-        users = users or []
-        changed = users != self._users
-        self._users = users
-        if self._account is not None:
-            db.set_user_list_cache(self._account["id"], self.TAB_TEMP_KEY, users)
-
-        # Cache-first pattern (same convention as FeedManagerPanel in
-        # settings.py): a silent background refresh that found no
-        # changes doesn't re-render or re-announce -- the cached view
-        # already shown at open is still accurate. First-ever load, a
-        # manual F5, or a background refresh that DID find changes
-        # renders and announces normally.
-        if not (isInitial and self._hadInitialCache and not changed):
-            self._renderUsers()
-            nvdaUi.message(f"{len(self._users)} {label} loaded.")
-
-class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
-    """
-    Full thread view, popped into its own removable tab -- replaces
-    ThreadDialog. NOT a FeedListMixin host: a thread is a tree
-    (ancestors + depth-first replies), not chronological pagination,
-    so there's no "load older" -- F5 always re-fetches the WHOLE thread
-    fresh (a genuinely new reply from someone else can appear this
-    way). Cache-first on open via db.get_user_list_cache/
-    set_user_list_cache under key f"thread:{root_uri}" -- same
-    convention UserListTabWindow uses, just reused here rather than a
-    separate helper since the shape (a plain list of dicts) is
-    identical.
-
-    Same reduced Post-action set as before conversion (Like, Copy,
-    Embed) -- Reply/Repost/Quote parity still deferred.
-    """
-
-    def __init__(self, parent, root_uri, posts, target_index, origin_key=None):
-        super().__init__(parent)
-        self._account = db.get_active_account()
-        self._rootUri = root_uri
-        self.TAB_TEMP_TYPE = "thread"
-        self.TAB_TEMP_KEY = root_uri
-        self._originTabKey = origin_key
-        self._posts = posts
-        self._targetUri = posts[target_index]["uri"] if posts and target_index < len(posts) else root_uri
-        self.TAB_NAME = self._makeTabName(posts)
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.postList.InsertColumn(0, "Author", width=140)
-        self.postList.InsertColumn(1, "Message", width=380)
-        self.postList.InsertColumn(2, "Posted", width=140)
-        self.postList.InsertColumn(3, "Embed", width=140)
-        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        self.statusBar = wx.StatusBar(self)
-        sizer.Add(self.statusBar, flag=wx.EXPAND)
-        self.SetSizer(sizer)
-
-        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onPostAction)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        self._renderThread(target_index=target_index)
-
-    def _makeTabName(self, posts):
-        if not posts:
-            return "Thread"
-        firstPost = posts[0]
-        preview = firstPost.get("text", "")
-        if len(preview) > 40:
-            preview = preview[:40] + "..."
-        label = self._displayLabel(firstPost.get("handle"), firstPost.get("display_name"))
-        return f"Thread: {label}: {preview}"
-
-    def onTabActivated(self):
-        nvdaUi.message(f"{self.TAB_NAME} tab")
-        self.postList.SetFocus()
-
-    def onTabRemoved(self):
-        if self._account is not None:
-            db.remove_open_temp_tab(self._account["id"], "thread", self._rootUri)
-            db.delete_user_list_cache(self._account["id"], f"thread:{self._rootUri}")
-        self._jumpBackToOrigin()
-
-    def onCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
-        if keyCode == wx.WXK_F5 and not evt.ShiftDown() and not evt.ControlDown():
-            self.onCheckForUpdates(None)
-            return
-        if evt.AltDown() and keyCode == ord("A"):
-            self.onPostAction()
-            return
-        if evt.AltDown() and keyCode == ord("U"):
-            self.onUserAction()
-            return
-        evt.Skip()
-
-    def _renderThread(self, target_index=None):
-        # Keeps whichever post is currently focused (by uri) unless
-        # target_index is given explicitly -- mirrors the "stay on the
-        # same message" principle used elsewhere (e.g. ChatWindow.
-        # _showMessages), since a re-fetch can insert a genuinely new
-        # reply anywhere in the list.
-        previousUri = None
-        if target_index is None:
-            focused = self._getFocusedPost()
-            if focused is not None:
-                previousUri = focused["uri"]
-
-        self.postList.Freeze()
-        try:
-            self.postList.DeleteAllItems()
-            for i, post in enumerate(self._posts):
-                depth = post.get("_thread_depth", 0)
-                prefix = "> " * depth
-                self.postList.InsertItem(i, self._displayLabel(post.get("handle"), post.get("display_name")))
-                self.postList.SetItem(i, 1, prefix + _message_text(post))
-                self.postList.SetItem(i, 2, _format_post_time(post.get("indexed_at")))
-                self.postList.SetItem(i, 3, _describe_embed(post.get("embed_json")))
-
-            if self._posts:
-                if target_index is not None:
-                    focusIndex = min(target_index, len(self._posts) - 1)
-                else:
-                    lookupUri = previousUri or self._targetUri
-                    focusIndex = next(
-                        (i for i, p in enumerate(self._posts) if p["uri"] == lookupUri), None
-                    )
-                    if focusIndex is None:
-                        focusIndex = min(
-                            next((i for i, p in enumerate(self._posts) if p["uri"] == self._targetUri), 0),
-                            len(self._posts) - 1,
-                        )
-                for i in range(self.postList.GetItemCount()):
-                    if i != focusIndex and self.postList.GetItemState(i, wx.LIST_STATE_SELECTED):
-                        self.postList.SetItemState(i, 0, wx.LIST_STATE_SELECTED)
-                self.postList.Focus(focusIndex)
-                self.postList.Select(focusIndex)
-                self.postList.EnsureVisible(focusIndex)
-        finally:
-            self.postList.Thaw()
-
-        self.statusBar.SetStatusText(f"{self.TAB_NAME} -- {len(self._posts)} posts")
-
-    def onCheckForUpdates(self, evt=None):
-        if self._account is None:
-            nvdaUi.message("No active account.")
-            return
-        nvdaUi.message("Loading thread, please wait...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                posts, targetIndex = client.get_thread(atprotoClient, self._targetUri)
-                error = None
-            except Exception as e:
-                posts, targetIndex = None, 0
-                error = str(e)
-            wx.CallAfter(self._onRefreshDone, posts, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onRefreshDone(self, posts, error):
-        if error:
-            nvdaUi.message(f"Could not refresh thread: {error}")
-            return
-        self._posts = posts or []
-        self.TAB_NAME = self._makeTabName(self._posts)
-        self._updateTitle()
-        self._renderThread()
-        if self._account is not None:
-            db.set_user_list_cache(self._account["id"], f"thread:{self._rootUri}", self._posts)
-        nvdaUi.message(f"{len(self._posts)} posts in thread.")
-
-    def _getFocusedPost(self):
-        index = self.postList.GetFocusedItem()
-        if 0 <= index < len(self._posts):
-            return self._posts[index]
-        return None
-
-    def onUserAction(self, evt=None):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-        self.showUserActionMenu(post.get("author_did"), post.get("handle"), post.get("display_name"))
-
-    def onPostAction(self, evt=None):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-
-        menu = wx.Menu()
-        isLiked = bool(post.get("viewer_like_uri"))
-        self._addMenuItem(menu, "Unlike" if isLiked else "Like", lambda: self._togglePostLike(post))
-        menu.AppendSeparator()
-
-        copyMenu = wx.Menu()
-        self._addMenuItem(copyMenu, "Copy post text", lambda: self._copyPostText(post))
-        self._addMenuItem(copyMenu, "Copy link to post", lambda: self._copyPostLink(post))
-        menu.AppendSubMenu(copyMenu, "Copy...")
-
-        embedMenu = self._buildViewEmbedMenu(post)
-        if embedMenu is not None:
-            menu.AppendSubMenu(embedMenu, "Embed...")
-
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _togglePostLike(self, post):
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                if post.get("viewer_like_uri"):
-                    client.unlike_post(atprotoClient, post["viewer_like_uri"])
-                    post["viewer_like_uri"] = None
-                    message = "Unliked."
-                else:
-                    like_uri = client.like_post(atprotoClient, post["uri"], post["cid"])
-                    post["viewer_like_uri"] = like_uri
-                    message = "Liked."
-                error = None
-            except Exception as e:
-                error = str(e)
-                message = None
-            wx.CallAfter(self._onActionDone, message, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _copyPostText(self, post):
-        self._copyToClipboard(post.get("text", ""))
-        _announce_now("Post text copied to clipboard.")
-
-    def _copyPostLink(self, post):
-        handle = post.get("handle") or post.get("author_did")
-        rkey = post["uri"].rsplit("/", 1)[-1]
-        url = f"https://bsky.app/profile/{handle}/post/{rkey}"
-        self._copyToClipboard(url)
-        _announce_now("Post URL copied to clipboard.")
 
 
 class ItemActionMixin:
@@ -1873,49 +1986,117 @@ class ItemActionMixin:
 
         self._showPostActionMenu(post)
 
+    def onDeletePostShortcut(self):
+        # Plain Delete key -- confirm dialog inside _deletePost still
+        # gates the actual removal, this just skips opening the menu.
+        if self.postList.GetSelectedItemCount() > 1:
+            # Translators: Announced when Delete is pressed with multiple posts selected.
+            nvdaUi.message(_("Delete needs a single post selected."))
+            return
+        post = self._getActionablePost()
+        if post is None:
+            return
+        isOwnPost = self._account and post.get("author_did") == self._account.get("did")
+        if isOwnPost:
+            self._deletePost(post)
+            return
+        # Not our own post -- but if it's OUR repost of someone else's
+        # post, Delete undoes the repost instead (same action as the
+        # "Undo repost" menu item, no confirm needed -- reversible,
+        # matches Like/Unlike's existing no-confirm behavior).
+        isOwnRepost = (
+            self._account and post.get("is_repost") and post.get("reposted_by_did") == self._account.get("did")
+        )
+        if isOwnRepost:
+            self._toggleRepost(post)
+            return
+        # Translators: Announced when Delete is pressed on a post that isn't the account's own.
+        nvdaUi.message(_("You can only delete your own posts."))
+
     def _showPostActionMenu(self, post):
         isOwnPost = self._account and post.get("author_did") == self._account.get("did")
 
         menu = wx.Menu()
 
         if isOwnPost:
-            self._addMenuItem(menu, "Edit who can reply...", lambda: self._editReplyPermissions(post))
-            self._addMenuItem(menu, "Delete post...", lambda: self._deletePost(post))
+            manageMenu = wx.Menu()
+            # Translators: Submenu item under "Manage post...".
+            self._addMenuItem(manageMenu, _("&Pin/unpin to profile..."), lambda: self._togglePinToProfile(post))
+            # Translators: Submenu item under "Manage post...".
+            self._addMenuItem(manageMenu, _("&Edit who can reply..."), lambda: self._editReplyPermissions(post))
+            # Translators: Submenu item under "Manage post...".
+            self._addMenuItem(manageMenu, _("&Delete post..."), lambda: self._deletePost(post))
+            # Translators: Post action submenu label, only shown on your own posts.
+            menu.AppendSubMenu(manageMenu, _("&Manage post..."))
             menu.AppendSeparator()
 
-        self._addMenuItem(menu, "Reply...", lambda: self._openReply(post))
-        self._addMenuItem(menu, "Undo repost" if post.get("viewer_repost_uri") else "Repost",
+        # Translators: Post action menu item.
+        self._addMenuItem(menu, _("&Reply..."), lambda: self._openReply(post))
+        # Translators: Post action menu item (already reposted).
+        # Translators: Post action menu item (not yet reposted).
+        self._addMenuItem(menu, _("Undo re&post") if post.get("viewer_repost_uri") else _("Re&post"),
                            lambda: self._toggleRepost(post))
-        self._addMenuItem(menu, "Quote post...", lambda: self._openQuote(post))
-        self._addMenuItem(menu, "View thread...", lambda: self._openThread(post))
+        # Translators: Post action menu item.
+        self._addMenuItem(menu, _("&Quote post..."), lambda: self._openQuote(post))
         menu.AppendSeparator()
 
         markMenu = wx.Menu()
-        self._addMenuItem(markMenu, "Read", lambda: self._setMarkRead(post, True))
-        self._addMenuItem(markMenu, "Unread", lambda: self._setMarkRead(post, False))
-        menu.AppendSubMenu(markMenu, "Mar&k as...")
+        # Translators: Submenu item under "Mark as...".
+        self._addMenuItem(markMenu, _("&Read"), lambda: self._setMarkRead(post, True))
+        # Translators: Submenu item under "Mark as...".
+        self._addMenuItem(markMenu, _("&Unread"), lambda: self._setMarkRead(post, False))
+        # Translators: Post action submenu label.
+        menu.AppendSubMenu(markMenu, _("Mar&k as..."))
 
         isLiked = bool(post.get("viewer_like_uri"))
-        self._addMenuItem(menu, "Unlike" if isLiked else "Like", lambda: self._togglePostLike(post))
-        self._addMenuItem(menu, "Unsave" if post.get("viewer_bookmarked") else "Save",
+        # Translators: Post action menu item (already liked).
+        # Translators: Post action menu item (not yet liked).
+        self._addMenuItem(menu, _("Un&like") if isLiked else _("&Like"), lambda: self._togglePostLike(post))
+        # Translators: Post action menu item (already saved).
+        # Translators: Post action menu item (not yet saved).
+        self._addMenuItem(menu, _("Un&save") if post.get("viewer_bookmarked") else _("&Save"),
                            lambda: self._toggleBookmark(post))
         menu.AppendSeparator()
 
         copyMenu = wx.Menu()
-        self._addMenuItem(copyMenu, "Copy post text", lambda: self._copyPostText(post))
-        self._addMenuItem(copyMenu, "Copy link to post", lambda: self._copyPostLink(post))
-        menu.AppendSubMenu(copyMenu, "Copy...")
+        # Translators: Submenu item under "Copy...", copies the post's text.
+        self._addMenuItem(copyMenu, _("Copy &post text"), lambda: self._copyPostText(post))
+        # Translators: Submenu item under "Copy...", copies a link to the post.
+        self._addMenuItem(copyMenu, _("Copy &link to post"), lambda: self._copyPostLink(post))
+        # Translators: Post action submenu label.
+        menu.AppendSubMenu(copyMenu, _("&Copy..."))
+
+        viewMenu = wx.Menu()
+        # Translators: Submenu item under "View...", opens the full thread.
+        self._addMenuItem(viewMenu, _("View &thread..."), lambda: self._openThread(post))
+        # Translators: Submenu item under "View...", opens who liked the post.
+        self._addMenuItem(viewMenu, _("View &likes..."), lambda: self._openUserListForPost("likes", post))
+        # Translators: Submenu item under "View...", opens who reposted the post.
+        self._addMenuItem(viewMenu, _("View &reposts..."), lambda: self._openUserListForPost("reposts", post))
+        # Translators: Submenu item under "View...", opens posts quoting this one.
+        self._addMenuItem(viewMenu, _("View &quotes..."), lambda: self._openQuotes(post))
+        # Translators: Post action submenu label.
+        menu.AppendSubMenu(viewMenu, _("&View..."))
 
         embedMenu = self._buildViewEmbedMenu(post)
         if embedMenu is not None:
-            menu.AppendSubMenu(embedMenu, "Embed...")
+            # Translators: Post action submenu label for viewing an embedded image/video/link.
+            menu.AppendSubMenu(embedMenu, _("&Embed..."))
         menu.AppendSeparator()
 
         moreMenu = wx.Menu()
-        self._addMenuItem(moreMenu, "Mute thread", lambda: self._muteThread(post))
-        self._addMenuItem(moreMenu, "Hide post for me", lambda: self._hidePost(post))
-        self._addMenuItem(moreMenu, "Report post...", lambda: self._reportPost(post))
-        menu.AppendSubMenu(moreMenu, "More...")
+        # Translators: Submenu item under "More...".
+        self._addMenuItem(moreMenu, _("&Share to chat..."), lambda: self._shareToChat(post))
+        isThreadMuted = bool(post.get("viewer_thread_muted"))
+        # Translators: Submenu item under "More..." (thread already muted).
+        # Translators: Submenu item under "More..." (thread not yet muted).
+        self._addMenuItem(moreMenu, _("Un&mute thread") if isThreadMuted else _("&Mute thread"), lambda: self._muteThread(post))
+        # Translators: Submenu item under "More...".
+        self._addMenuItem(moreMenu, _("&Hide post for me"), lambda: self._hidePost(post))
+        # Translators: Submenu item under "More...".
+        self._addMenuItem(moreMenu, _("&Report post..."), lambda: self._reportPost(post))
+        # Translators: Post action submenu label.
+        menu.AppendSubMenu(moreMenu, _("M&ore..."))
 
         self.PopupMenu(menu)
         menu.Destroy()
@@ -1923,9 +2104,12 @@ class ItemActionMixin:
     def _showBulkPostActionMenu(self, selectedCount):
         menu = wx.Menu()
         markMenu = wx.Menu()
-        self._addMenuItem(markMenu, f"Read ({selectedCount} selected)", lambda: self._markSelectedRead(True))
-        self._addMenuItem(markMenu, f"Unread ({selectedCount} selected)", lambda: self._markSelectedRead(False))
-        menu.AppendSubMenu(markMenu, "Mar&k as...")
+        # Translators: Bulk mark-read menu item. {} is the selected count.
+        self._addMenuItem(markMenu, _("Read ({} selected)").format(selectedCount), lambda: self._markSelectedRead(True))
+        # Translators: Bulk mark-unread menu item. {} is the selected count.
+        self._addMenuItem(markMenu, _("Unread ({} selected)").format(selectedCount), lambda: self._markSelectedRead(False))
+        # Translators: Post action submenu label.
+        menu.AppendSubMenu(markMenu, _("Mar&k as..."))
         self.PopupMenu(menu)
         menu.Destroy()
 
@@ -1933,15 +2117,19 @@ class ItemActionMixin:
         if read:
             db.mark_post_read(post["uri"])
             post["is_read"] = 1
-            message = "Marked as read."
+            # Translators: Announced after marking a post read.
+            message = _("Marked as read.")
         else:
             db.mark_post_unread(post["uri"])
             post["is_read"] = 0
-            message = "Marked as unread."
+            # Translators: Announced after marking a post unread.
+            message = _("Marked as unread.")
         self._updateStatusBar()
         _announce_now(message)
 
     def _togglePostLike(self, post):
+        wasLiked = bool(post.get("viewer_like_uri"))
+
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
@@ -1949,21 +2137,27 @@ class ItemActionMixin:
                     client.unlike_post(atprotoClient, post["viewer_like_uri"])
                     db.set_post_like_uri(post["uri"], None)
                     post["viewer_like_uri"] = None
-                    message = "Unliked."
+                    # Translators: Announced after unliking a post.
+                    message = _("Unliked.")
                 else:
                     like_uri = client.like_post(atprotoClient, post["uri"], post["cid"])
                     db.set_post_like_uri(post["uri"], like_uri)
                     post["viewer_like_uri"] = like_uri
-                    message = "Liked."
+                    # Translators: Announced after liking a post.
+                    message = _("Liked.")
                 error = None
             except Exception as e:
                 error = str(e)
                 message = None
+            if not error:
+                soundpack.play("unlike" if wasLiked else "like")
             wx.CallAfter(self._onActionDone, message, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _toggleBookmark(self, post):
+        wasBookmarked = bool(post.get("viewer_bookmarked"))
+
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
@@ -1971,16 +2165,20 @@ class ItemActionMixin:
                     client.unbookmark_post(atprotoClient, post["uri"])
                     db.set_post_bookmarked(post["uri"], False)
                     post["viewer_bookmarked"] = False
-                    message = "Removed from saved."
+                    # Translators: Announced after removing a post from Saved.
+                    message = _("Removed from saved.")
                 else:
                     client.bookmark_post(atprotoClient, post["uri"], post["cid"])
                     db.set_post_bookmarked(post["uri"], True)
                     post["viewer_bookmarked"] = True
-                    message = "Saved post success."
+                    # Translators: Announced after saving a post.
+                    message = _("Saved post success.")
                 error = None
             except Exception as e:
                 error = str(e)
                 message = None
+            if not error:
+                soundpack.play("unsave" if wasBookmarked else "save")
             wx.CallAfter(self._onBookmarkToggleDone, post, message, error)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1990,6 +2188,16 @@ class ItemActionMixin:
         self._onActionDone(message, error)
         if error:
             return
+        if not post.get("viewer_bookmarked"):
+            # BUG FIX: unsaving always drops the "saved" feed cache
+            # entry now, regardless of which tab the toggle happened
+            # from -- previously this only happened via SavedWindow's
+            # own _onBookmarkChanged below, so unsaving from Home/
+            # Notifications/etc left a stale row in the "saved" cache
+            # forever (confirmed: Saved tab kept showing it even after
+            # F5, since the DB row itself was never removed).
+            db.delete_feed_item(self._account["id"], "saved", post["uri"])
+            self._refreshOtherSavedTabs(post)
         # Default no-op -- only a tab that actually LISTS posts by their
         # saved status (SavedWindow) needs to react when one gets
         # unsaved. Home/Notifications don't list by bookmark status, so
@@ -1998,30 +2206,76 @@ class ItemActionMixin:
         if callable(onBookmarkChanged):
             onBookmarkChanged(post)
 
+    def _refreshOtherSavedTabs(self, post):
+        # Live-updates an already-open Saved tab if the unsave happened
+        # from somewhere else (e.g. Home) -- without this, Saved would
+        # only reflect the removal on its next full reload/F5.
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            return
+        for panel in mainWindow.getOpenTabs():
+            if panel is self or getattr(panel, "TAB_KEY", None) != "saved":
+                continue
+            for i, p in enumerate(getattr(panel, "_posts", [])):
+                if p["uri"] == post["uri"]:
+                    del panel._posts[i]
+                    panel._render()
+                    break
+
     def _copyPostText(self, post):
         self._copyToClipboard(post.get("text", ""))
-        _announce_now("Post text copied to clipboard.")
+        # Translators: Announced after copying a post's text to the clipboard.
+        _announce_now(_("Post text copied to clipboard."))
 
     def _copyPostLink(self, post):
         handle = post.get("handle") or post.get("author_did")
         rkey = post["uri"].rsplit("/", 1)[-1]
         url = f"https://bsky.app/profile/{handle}/post/{rkey}"
         self._copyToClipboard(url)
-        _announce_now("Post URL copied to clipboard.")
+        # Translators: Announced after copying a post's URL to the clipboard.
+        _announce_now(_("Post URL copied to clipboard."))
+
+    def _shareToChat(self, post):
+        if self._account is None:
+            # Translators: Announced when trying to share a post to chat with no active account.
+            nvdaUi.message(_("No active account."))
+            return
+        from . import chatWindow
+        gui.mainFrame.prePopup()
+        dlg = chatWindow.ShareToChatDialog(self, self._account, post)
+        dlg.Show()
 
     def _muteThread(self, post):
         root_uri = post.get("reply_parent_uri") or post["uri"]
+        wasMuted = bool(post.get("viewer_thread_muted"))
+        post["viewer_thread_muted"] = not wasMuted
+        db.set_post_thread_muted(post["uri"], not wasMuted)
+        # Translators: Announced after unmuting a thread.
+        # Translators: Announced after muting a thread.
+        self._onActionDone(_("Thread unmuted.") if wasMuted else _("Thread muted."), None)
 
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
-                client.mute_thread(atprotoClient, root_uri)
+                if wasMuted:
+                    client.unmute_thread(atprotoClient, root_uri)
+                else:
+                    client.mute_thread(atprotoClient, root_uri)
                 error = None
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onActionDone, "Thread muted." if not error else None, error)
+            wx.CallAfter(self._onMuteThreadDone, post, wasMuted, error)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onMuteThreadDone(self, post, wasMuted, error):
+        if not error:
+            return
+        post["viewer_thread_muted"] = wasMuted
+        db.set_post_thread_muted(post["uri"], wasMuted)
+        self._onActionDone(None, error)
 
     def onItemActivated(self, evt):
         post = self._getFocusedPost()
@@ -2060,11 +2314,14 @@ class ItemActionMixin:
                     self.postList.Focus(newIndex)
                     self.postList.Select(newIndex)
                 break
-        _announce_now("Post hidden.")
+        # Translators: Announced after hiding a post for the current account only.
+        _announce_now(_("Post hidden."))
 
     def _deletePost(self, post):
         confirm = wx.MessageDialog(
-            self, "Delete this post? This can't be undone.", "Delete post",
+            # Translators: Confirmation body for deleting your own post.
+            # Translators: Title of the delete-post confirmation dialog.
+            self, _("Delete this post? This can't be undone."), _("Delete post"),
             wx.YES_NO | wx.NO_DEFAULT
         )
         confirmed = confirm.ShowModal() == wx.ID_YES
@@ -2088,8 +2345,11 @@ class ItemActionMixin:
     def _onDeletePostDone(self, uri, error):
         if error:
             log.error(f"NVSky: delete post failed: {error}")
-            nvdaUi.message(f"Delete failed: {error}")
+            soundpack.play("error")
+            # Translators: Announced when deleting a post fails. {} is the error message.
+            nvdaUi.message(_("Delete failed: {}").format(error))
             return
+        soundpack.play("delete")
         for i, p in enumerate(self._posts):
             if p["uri"] == uri:
                 del self._posts[i]
@@ -2099,11 +2359,164 @@ class ItemActionMixin:
                     self.postList.Focus(newIndex)
                     self.postList.Select(newIndex)
                 break
-        nvdaUi.message("Post deleted.")
-        self.onCheckForUpdates(None)
+        # Translators: Announced after deleting a post.
+        nvdaUi.message(_("Post deleted."))
+
+    def _togglePinToProfile(self, post):
+        # No local cache of pinned-post state (unlike thread-mute/
+        # follow, Bluesky doesn't send this per-post) -- check the
+        # real server state first, same pattern _toggleRelation used
+        # before its cached upgrade.
+        # Translators: Announced while checking whether a post is pinned.
+        nvdaUi.message(_("Checking pin status, please wait..."))
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                pinnedUri = client.get_pinned_post_uri(atprotoClient)
+                error = None
+            except Exception as e:
+                pinnedUri = None
+                error = str(e)
+            wx.CallAfter(self._onPinStatusChecked, post, pinnedUri, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onPinStatusChecked(self, post, pinnedUri, error):
+        if error:
+            # Translators: Announced when checking pin status fails. {} is the error message.
+            nvdaUi.message(_("Could not check pin status: {}").format(error))
+            return
+        isPinned = pinnedUri == post["uri"]
+        # Translators: Confirmation to unpin a post from your profile.
+        # Translators: Confirmation to pin a post to your profile.
+        question = _("Unpin this post from your profile?") if isPinned else _("Pin this post to your profile?")
+        # Translators: Title of a Yes/No confirmation dialog.
+        confirm = wx.MessageDialog(self, question, _("Confirm"), wx.YES_NO | wx.NO_DEFAULT)
+        confirmed = confirm.ShowModal() == wx.ID_YES
+        confirm.Destroy()
+        if not confirmed:
+            return
+
+        # Translators: Announced after unpinning a post.
+        # Translators: Announced after pinning a post.
+        self._onActionDone(_("Post unpinned.") if isPinned else _("Post pinned."), None)
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                if isPinned:
+                    client.unpin_post_from_profile(atprotoClient)
+                else:
+                    client.pin_post_to_profile(atprotoClient, post["uri"], post["cid"])
+                workerError = None
+            except Exception as e:
+                workerError = str(e)
+            wx.CallAfter(self._onPinActionDone, workerError)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onPinActionDone(self, error):
+        if error:
+            self._onActionDone(None, error)
+
+    def _openQuotes(self, post):
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            # Translators: Announced when an action needs MainWindow but it isn't open.
+            nvdaUi.message(_("Open NVSky's main window first."))
+            return
+
+        identity = {"kind": "quotes", "key": post["uri"]}
+        if mainWindow.focusTabByIdentity(identity):
+            return
+
+        # Translators: Announced while loading a post's quotes.
+        _announce_now(_("Loading quotes, please wait..."))
+        soundpack.start_progress()
+        activeIndex = mainWindow.notebook.GetSelection()
+        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
+        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
+        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                quotes = client.get_post_quotes(atprotoClient, post["uri"])
+                error = None
+            except Exception as e:
+                quotes = []
+                error = str(e)
+            wx.CallAfter(self._onQuotesFetchedForOpen, post["uri"], quotes, error, originKey)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onQuotesFetchedForOpen(self, targetUri, quotes, error, originKey):
+        soundpack.stop_progress()
+        if error:
+            soundpack.play("error")
+            # Translators: Announced when loading a post's quotes fails. {} is the error message.
+            nvdaUi.message(_("Could not load quotes: {}").format(error))
+            return
+        from . import get_main_window
+        from . import feedTabs
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            return
+        tab = feedTabs.QuotesTabWindow(mainWindow.notebook, targetUri, quotes or [], origin_key=originKey)
+        mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
+        account = db.get_active_account()
+        if account is not None:
+            db.set_user_list_cache(account["id"], f"quotes:{targetUri}", quotes or [])
+            db.add_open_temp_tab(account["id"], {
+                "type": "quotes", "key": targetUri, "target_uri": targetUri, "origin_key": originKey,
+            })
+
+    def _openUserListForPost(self, kind, post):
+        from . import get_main_window
+        from . import feedTabs
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            # Translators: Announced when an action needs MainWindow but it isn't open.
+            nvdaUi.message(_("Open NVSky's main window first."))
+            return
+
+        identity = {"kind": "user_list", "key": f"{kind}:{post['uri']}"}
+        if mainWindow.focusTabByIdentity(identity):
+            return
+
+        activeIndex = mainWindow.notebook.GetSelection()
+        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
+        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
+        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+
+        authorHandle = post.get("handle") or post.get("author_did")
+        preview = (post.get("text") or "")[:40]
+        if len(post.get("text") or "") > 40:
+            preview += "..."
+        if authorHandle and preview:
+            # Translators: Owner label combining a post preview and its author, used in tab names like "Likes on {this}". First {} is the preview, second {} is the handle.
+            ownerLabel = _('"{}" by @{}').format(preview, authorHandle)
+        elif authorHandle:
+            ownerLabel = f"@{authorHandle}"
+        else:
+            ownerLabel = None
+        tab = feedTabs.UserListTabWindow(mainWindow.notebook, kind, post["uri"], ownerLabel, origin_key=originKey)
+        mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
+        account = db.get_active_account()
+        if account is not None:
+            db.add_open_temp_tab(account["id"], {
+                "type": "user_list", "key": f"{kind}:{post['uri']}",
+                "list_kind": kind, "post_uri": post["uri"], "owner_label": ownerLabel, "origin_key": originKey,
+            })
 
     def _editReplyPermissions(self, post):
-        _announce_now("Loading current reply settings, please wait...")
+        # Translators: Announced while loading a post's current reply-permission settings.
+        _announce_now(_("Loading current reply settings, please wait..."))
 
         def worker():
             try:
@@ -2122,7 +2535,8 @@ class ItemActionMixin:
     @uiutil.safe_ui_callback
     def _onReplyPermissionsLoaded(self, post, threadgate, disablesQuotes, error):
         if error:
-            nvdaUi.message(f"Could not load current reply settings: {error}")
+            # Translators: Announced when loading a post's reply settings fails. {} is the error message.
+            nvdaUi.message(_("Could not load current reply settings: {}").format(error))
             # Fall through anyway -- still let them set it, just without
             # the current values pre-selected.
 
@@ -2130,18 +2544,30 @@ class ItemActionMixin:
         rules = threadgate.get("rules", set())
         hasListRules = threadgate.get("has_list_rules", False)
 
-        dlg = wx.Dialog(self, title="Edit who can reply", style=wx.DEFAULT_DIALOG_STYLE)
+        # Translators: Title of the edit-who-can-reply dialog.
+        dlg = wx.Dialog(self, title=_("Edit who can reply"), style=wx.DEFAULT_DIALOG_STYLE)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        stateChoices = ["Allow anyone to reply", "Disable replies entirely", "Custom"]
+        stateChoices = [
+            # Translators: Reply-permission radio choice.
+            _("Allow anyone to reply"),
+            # Translators: Reply-permission radio choice.
+            _("Disable replies entirely"),
+            # Translators: Reply-permission radio choice.
+            _("Custom"),
+        ]
         stateIndex = {"everyone": 0, "nobody": 1, "custom": 2}.get(state, 0)
-        stateBox = wx.RadioBox(dlg, label="Who can reply", choices=stateChoices, style=wx.RA_SPECIFY_ROWS)
+        # Translators: Label for the who-can-reply radio group.
+        stateBox = wx.RadioBox(dlg, label=_("Who can reply"), choices=stateChoices, style=wx.RA_SPECIFY_ROWS)
         stateBox.SetSelection(stateIndex)
         sizer.Add(stateBox, flag=wx.ALL | wx.EXPAND, border=8)
 
-        followersCheck = wx.CheckBox(dlg, label="Allow your followers to reply")
-        followingCheck = wx.CheckBox(dlg, label="Allow people you follow to reply")
-        mentionedCheck = wx.CheckBox(dlg, label="Allow people you mention to reply")
+        # Translators: Checkbox in the edit-who-can-reply dialog.
+        followersCheck = wx.CheckBox(dlg, label=_("Allow your &followers to reply"))
+        # Translators: Checkbox in the edit-who-can-reply dialog.
+        followingCheck = wx.CheckBox(dlg, label=_("Allow people you follo&w to reply"))
+        # Translators: Checkbox in the edit-who-can-reply dialog.
+        mentionedCheck = wx.CheckBox(dlg, label=_("Allow people you &mention to reply"))
         followersCheck.SetValue("followers" in rules)
         followingCheck.SetValue("following" in rules)
         mentionedCheck.SetValue("mentioned" in rules)
@@ -2158,7 +2584,8 @@ class ItemActionMixin:
         if hasListRules:
             listWarning = wx.StaticText(
                 dlg,
-                label=(
+                # Translators: Warning shown when a post has list-based reply rules NVSky can't edit yet.
+                label=_(
                     "Note: this post also has list-based reply rules set "
                     "(e.g. from the Bluesky app). NVSky can't edit those "
                     "yet -- saving here will remove them."
@@ -2167,7 +2594,8 @@ class ItemActionMixin:
             listWarning.Wrap(350)
             sizer.Add(listWarning, flag=wx.ALL | wx.EXPAND, border=8)
 
-        quoteCheck = wx.CheckBox(dlg, label="Disable quote posts of this post")
+        # Translators: Checkbox in the edit-who-can-reply dialog.
+        quoteCheck = wx.CheckBox(dlg, label=_("Disable &quote posts of this post"))
         quoteCheck.SetValue(disablesQuotes)
         sizer.Add(quoteCheck, flag=wx.ALL, border=8)
 
@@ -2200,7 +2628,8 @@ class ItemActionMixin:
                 error = None
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onActionDone, "Reply permissions updated." if not error else None, error)
+            # Translators: Announced after successfully updating reply permissions.
+            wx.CallAfter(self._onActionDone, _("Reply permissions updated.") if not error else None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2241,10 +2670,13 @@ class ItemActionMixin:
         from . import get_main_window
         mainWindow = get_main_window()
         if mainWindow is None:
-            nvdaUi.message("Open NVSky's main window first.")
+            # Translators: Announced when an action needs MainWindow but it isn't open.
+            nvdaUi.message(_("Open NVSky's main window first."))
             return
 
-        _announce_now("Loading thread, please wait...")
+        # Translators: Announced while loading a whole thread.
+        _announce_now(_("Loading thread, please wait..."))
+        soundpack.start_progress()
 
         activeIndex = mainWindow.notebook.GetSelection()
         activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
@@ -2265,16 +2697,22 @@ class ItemActionMixin:
 
     @uiutil.safe_ui_callback
     def _onThreadFetchedForOpen(self, posts, targetIndex, error, originKey):
+        soundpack.stop_progress()
         if error:
-            nvdaUi.message(f"Could not load thread: {error}")
+            soundpack.play("error")
+            # Translators: Announced when loading a thread fails. {} is the error message.
+            nvdaUi.message(_("Could not load thread: {}").format(error))
             return
         posts = posts or []
         rootUri = posts[0]["uri"] if posts else None
         if rootUri is None:
-            nvdaUi.message("Could not load thread: no root post found.")
+            soundpack.play("error")
+            # Translators: Announced when a thread has no discoverable root post.
+            nvdaUi.message(_("Could not load thread: no root post found."))
             return
 
         from . import get_main_window
+        from . import feedTabs
         mainWindow = get_main_window()
         if mainWindow is None:
             return
@@ -2283,7 +2721,7 @@ class ItemActionMixin:
         if mainWindow.focusTabByIdentity(identity):
             return
 
-        tab = ThreadTabWindow(mainWindow.notebook, rootUri, posts, targetIndex, origin_key=originKey)
+        tab = feedTabs.ThreadTabWindow(mainWindow.notebook, rootUri, posts, targetIndex, origin_key=originKey)
         mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
         account = db.get_active_account()
         if account is not None:
@@ -2293,30 +2731,52 @@ class ItemActionMixin:
             })
 
     def _toggleRepost(self, post):
+        wasReposted = bool(post.get("viewer_repost_uri"))
+        previousUri = post.get("viewer_repost_uri")
+        post["viewer_repost_uri"] = None if wasReposted else "pending"
+        db.set_post_repost_uri(post["uri"], post["viewer_repost_uri"])
+        soundpack.play("unrepost" if wasReposted else "repost")
+        # Translators: Announced after undoing a repost.
+        # Translators: Announced after reposting.
+        self._onActionDone(_("Repost undone.") if wasReposted else _("Reposted."), None)
+
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
-                if post.get("viewer_repost_uri"):
-                    client.unrepost_post(atprotoClient, post["viewer_repost_uri"])
-                    db.set_post_repost_uri(post["uri"], None)
-                    post["viewer_repost_uri"] = None
-                    message = "Repost undone."
+                if wasReposted:
+                    client.unrepost_post(atprotoClient, previousUri)
+                    newUri = None
                 else:
-                    repost_uri = client.repost_post(atprotoClient, post["uri"], post["cid"])
-                    db.set_post_repost_uri(post["uri"], repost_uri)
-                    post["viewer_repost_uri"] = repost_uri
-                    message = "Reposted."
+                    newUri = client.repost_post(atprotoClient, post["uri"], post["cid"])
                 error = None
             except Exception as e:
+                newUri = None
                 error = str(e)
-                message = None
-            wx.CallAfter(self._onActionDone, message, error)
+            wx.CallAfter(self._onRepostDone, post, wasReposted, previousUri, newUri, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    @uiutil.safe_ui_callback
+    def _onRepostDone(self, post, wasReposted, previousUri, newUri, error):
+        if error:
+            post["viewer_repost_uri"] = previousUri
+            db.set_post_repost_uri(post["uri"], previousUri)
+            self._onActionDone(None, error)
+            return
+        if not wasReposted:
+            post["viewer_repost_uri"] = newUri
+            db.set_post_repost_uri(post["uri"], newUri)
+        onRepostChanged = getattr(self, "_onRepostChanged", None)
+        if callable(onRepostChanged):
+            onRepostChanged(post)
+
     def _reportPost(self, post):
-        labels = [label for label, _ in REPORT_REASONS]
-        dlg = wx.SingleChoiceDialog(self, "Reason for reporting this post:", "Report post", labels)
+        # NOTE: was "for label, _ in REPORT_REASONS" -- bare `_` shadowed
+        # gettext within this function's scope. Renamed to avoid that trap.
+        labels = [label for label, _reasonCode in REPORT_REASONS]
+        # Translators: Prompt in the report-post reason picker.
+        # Translators: Title of the report-post reason picker.
+        dlg = wx.SingleChoiceDialog(self, _("Reason for reporting this post:"), _("Report post"), labels)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
             return
@@ -2324,7 +2784,9 @@ class ItemActionMixin:
         dlg.Destroy()
 
         confirm = wx.MessageDialog(
-            self, "Send this report to Bluesky moderation?", "Confirm report", wx.YES_NO | wx.NO_DEFAULT
+            # Translators: Confirmation before sending a post report to Bluesky moderation.
+            # Translators: Title of the confirm-report dialog.
+            self, _("Send this report to Bluesky moderation?"), _("Confirm report"), wx.YES_NO | wx.NO_DEFAULT
         )
         confirmed = confirm.ShowModal() == wx.ID_YES
         confirm.Destroy()
@@ -2338,7 +2800,8 @@ class ItemActionMixin:
                 error = None
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onActionDone, "Report sent." if not error else None, error)
+            # Translators: Announced after successfully sending a post report.
+            wx.CallAfter(self._onActionDone, _("Report sent.") if not error else None, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2362,80 +2825,55 @@ class ItemActionMixin:
                 db.mark_post_unread(post["uri"])
                 post["is_read"] = 0
         self._updateStatusBar()
-        _announce_now(f"Marked {len(posts)} posts as {'read' if read else 'unread'}.")
+        if read:
+            # Translators: Announced after marking several posts read. {} is the count.
+            _announce_now(_("Marked {} posts as read.").format(len(posts)))
+        else:
+            # Translators: Announced after marking several posts unread. {} is the count.
+            _announce_now(_("Marked {} posts as unread.").format(len(posts)))
 
+    def _getRelevantUsers(self, post):
+        # Same reasoning as _markSelectedRead above -- lives on the
+        # mixin, not just FeedWindow. Confirmed via a real
+        # AttributeError that ExploreWindow called this without it
+        # existing anywhere on that class.
+        authorHandle = post.get("handle") or post.get("author_did")
+        # Translators: Label for the post's author in the "which user?" picker. {} is their handle.
+        users = [(_("{} (post author)").format(authorHandle), post["author_did"], authorHandle)]
+        seen = {post["author_did"]}
 
-class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
-    """
-    A user's own post timeline, popped into its own removable tab --
-    replaces UserTimelineDialog. Full FeedListMixin cache-first/
-    lazy-load machinery via client.sync_author_feed_page's feed_key
-    (f"user_timeline:{did}"). Not user-renameable.
-    """
+        if post.get("is_repost") and post.get("reposted_by_did"):
+            reposterDid = post["reposted_by_did"]
+            if reposterDid not in seen:
+                seen.add(reposterDid)
+                reposterHandle = post.get("reposted_by_handle") or reposterDid
+                # Translators: Label for who reposted this in the "which user?" picker. {} is their handle.
+                users.append((_("{} (reposted by)").format(reposterHandle), reposterDid, reposterHandle))
 
-    SUPPORTS_FOCUS_NEXT_UNREAD = True
-    SUPPORTS_SELECT_ALL = True
+        replyToDid = post.get("reply_to_did")
+        replyToHandle = post.get("reply_to_handle")
+        if replyToDid and replyToDid not in seen:
+            seen.add(replyToDid)
+            # Translators: Label for who this post is replying to in the "which user?" picker. {} is their handle.
+            users.append((_("{} (replying to)").format(replyToHandle or replyToDid), replyToDid, replyToHandle))
 
-    def __init__(self, parent, did: str, owner_label: str, origin_key: str = None):
-        super().__init__(parent)
+        facets_json = post.get("facets_json")
+        if facets_json:
+            try:
+                facets = json.loads(facets_json)
+            except (ValueError, TypeError):
+                facets = []
+            for facet in facets:
+                for feature in facet.get("features", []):
+                    if feature.get("$type") == "app.bsky.richtext.facet#mention":
+                        did = feature.get("did")
+                        if did and did not in seen:
+                            seen.add(did)
+                            author = db.get_author(did)
+                            handle = author["handle"] if author else did
+                            users.append((handle, did, handle))
 
-        self._account = db.get_active_account()
-        self.TAB_NAME = f"Timeline of {owner_label}"
-        self._did = did
-        self.TAB_TEMP_TYPE = "user_timeline"
-        self.TAB_TEMP_KEY = did
-        self._feedKey = f"user_timeline:{did}"
-        self._originTabKey = origin_key
-        self._initFeedListState()
-
-        self._buildStandardFeedSizer()
-        self._bindStandardFeedEvents()
-        self._finishStandardFeedInit(sync_if_empty=True)
-
-    def onTabActivated(self):
-        self._render()
-        if self._account is not None:
-            nvdaUi.message(f"{self.TAB_NAME} tab")
-            self._restoreFocusPosition()
-
-    def onTabRemoved(self):
-        for value in vars(self).values():
-            if isinstance(value, wx.Timer):
-                value.Stop()
-        if self._account is not None:
-            db.remove_open_temp_tab(self._account["id"], "user_timeline", self._did)
-        self._jumpBackToOrigin()
-
-    def _getActionablePost(self):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-        return post
-
-    def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
-
-    def _dbGetPage(self, before_indexed_at=None, limit=None):
-        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
-
-    def _dbGetUnreadCount(self):
-        return db.get_unread_count(self._account["id"], self._feedKey)
-
-    def _syncPage(self, atprotoClient, cursor, limit):
-        return client.sync_author_feed_page(atprotoClient, self._account["id"], self._did, cursor=cursor, limit=limit)
-
-    def _markItemRead(self, post):
-        db.mark_post_read(post["uri"])
-
-    def onUserAction(self, evt=None):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-        self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
+        return users
 
 
 class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
@@ -2457,7 +2895,8 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         self._initFeedListState()
 
         toolbarRow = wx.BoxSizer(wx.HORIZONTAL)
-        filterLabel = wx.StaticText(self, label="Feed &filter:")
+        # Translators: Label for the Home feed's filter dropdown.
+        filterLabel = wx.StaticText(self, label=_("Feed &filter:"))
         # wx.Choice, not RadioBox -- a saved feed can be added/removed/
         # reordered from Settings > Feed manager while Home is open, and
         # RadioBox can't add/remove choices after construction.
@@ -2492,7 +2931,8 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
             # speech loses the race against the focus change below and
             # never gets heard otherwise (same class of problem as the
             # Home/Notifications focus-stealing bug from earlier).
-            nvdaUi.message(f"{self.TAB_NAME} tab")
+            # Translators: Announced when switching to this tab. {} is the tab name.
+            nvdaUi.message(_("{} tab").format(self.TAB_NAME))
             self._restoreFocusPosition()
 
     # ---------------- filter ----------------
@@ -2512,9 +2952,11 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         try:
             self.filterChoice.Clear()
             self._filterChoiceMap = {}
-            self.filterChoice.Append("Following")
+            # Translators: Home feed filter choice for the standard chronological/algorithmic following feed.
+            self.filterChoice.Append(_("Following"))
             self._filterChoiceMap[0] = ("home", None)
-            self.filterChoice.Append("Discover")
+            # Translators: Home feed filter choice for Bluesky's Discover feed.
+            self.filterChoice.Append(_("Discover"))
             self._filterChoiceMap[1] = ("discover", None)
             for i, feed in enumerate(savedFeeds, start=2):
                 self.filterChoice.Append(feed["display_name"])
@@ -2583,6 +3025,23 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
     def _markItemRead(self, post):
         db.mark_post_read(post["uri"])
 
+    def _onRepostChanged(self, post):
+        # A repost row only exists in Home because I reposted it (you
+        # follow yourself implicitly) -- undoing it should drop the row,
+        # same pattern as SavedWindow._onBookmarkChanged for unsave.
+        if post.get("viewer_repost_uri") or not post.get("is_repost"):
+            return
+        db.delete_feed_item(self._account["id"], self._feedKey, post["uri"])
+        for i, p in enumerate(self._posts):
+            if p["uri"] == post["uri"]:
+                del self._posts[i]
+                self._render()
+                if self._posts:
+                    newIndex = min(i, len(self._posts) - 1)
+                    self.postList.Focus(newIndex)
+                    self.postList.Select(newIndex)
+                break
+
     def _getSelectedPosts(self):
         indices = []
         i = self.postList.GetFirstSelected()
@@ -2595,11 +3054,13 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         if post.get("is_read"):
             db.mark_post_unread(post["uri"])
             post["is_read"] = 0
-            message = "Marked as unread."
+            # Translators: Announced after marking a post unread.
+            message = _("Marked as unread.")
         else:
             db.mark_post_read(post["uri"])
             post["is_read"] = 1
-            message = "Marked as read."
+            # Translators: Announced after marking a post read.
+            message = _("Marked as read.")
         self._updateStatusBar()
         _announce_now(message)
 
@@ -2616,25 +3077,28 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         # resolve, unlike NotificationsWindow's version of this method.
         post = self._getFocusedPost()
         if post is None:
-            nvdaUi.message("No post selected.")
+            # Translators: Announced when the post-action menu is invoked with no post focused.
+            nvdaUi.message(_("No post selected."))
         return post
 
 # ---------------- user action menu (Alt+U) ----------------
 
     def onUserAction(self, evt=None):
         if self.postList.GetSelectedItemCount() > 1:
-            nvdaUi.message("User action needs a single post selected.")
+            # Translators: Announced when the user-action menu is invoked with multiple posts selected.
+            nvdaUi.message(_("User action needs a single post selected."))
             return
 
         post = self._getFocusedPost()
         if post is None:
-            nvdaUi.message("No post selected.")
+            # Translators: Announced when the user-action menu is invoked with no post focused.
+            nvdaUi.message(_("No post selected."))
             return
 
         users = self._getRelevantUsers(post)
 
         if len(users) == 1:
-            _, did, handle = users[0]
+            _label, did, handle = users[0]
             self.showUserActionMenu(did, handle)
             return
 
@@ -2651,7 +3115,8 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
         # unfollow/unmute/unblock) -- toggling needs a getProfile-style
         # relationship lookup that isn't wired up yet.
         authorHandle = post.get("handle") or post.get("author_did")
-        users = [(f"{authorHandle} (post author)", post["author_did"], authorHandle)]
+        # Translators: Label for the post's author in the "which user?" picker. {} is their handle.
+        users = [(_("{} (post author)").format(authorHandle), post["author_did"], authorHandle)]
         seen = {post["author_did"]}
 
         if post.get("is_repost") and post.get("reposted_by_did"):
@@ -2659,13 +3124,15 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
             if reposterDid not in seen:
                 seen.add(reposterDid)
                 reposterHandle = post.get("reposted_by_handle") or reposterDid
-                users.append((f"{reposterHandle} (reposted by)", reposterDid, reposterHandle))
+                # Translators: Label for who reposted this in the "which user?" picker. {} is their handle.
+                users.append((_("{} (reposted by)").format(reposterHandle), reposterDid, reposterHandle))
 
         replyToDid = post.get("reply_to_did")
         replyToHandle = post.get("reply_to_handle")
         if replyToDid and replyToDid not in seen:
             seen.add(replyToDid)
-            users.append((f"{replyToHandle or replyToDid} (replying to)", replyToDid, replyToHandle))
+            # Translators: Label for who this post is replying to in the "which user?" picker. {} is their handle.
+            users.append((_("{} (replying to)").format(replyToHandle or replyToDid), replyToDid, replyToHandle))
 
         facets_json = post.get("facets_json")
         if facets_json:
@@ -2690,2285 +3157,9 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
     # above) -- Escape/Ctrl+W are still deliberately not handled here:
     # Home is a permanent tab now, so both bubble up to MainWindow.
 
-class StarterPackDetailsDialog(wx.Dialog):
-    """Read-only starter pack info, plus the same actions available
-    from the results-list context menu -- so the user doesn't have to
-    close this and reopen the menu separately."""
-
-    def __init__(self, parent, pack, full):
-        self._pack = pack
-        record = getattr(full, "record", None)
-        title = getattr(record, "name", None) or "Starter pack"
-        super().__init__(parent, title=f"{title} - Starter pack", size=(500, 420))
-
-        profiles = getattr(full, "list_items_sample", None) or []
-        lines = [
-            f"Name: {title}",
-            f"Creator: @{full.creator.handle}",
-            f"Description: {getattr(record, 'description', '') or '(none)'}",
-            f"Members: {len(profiles)}",
-        ]
-        if profiles:
-            lines.append("")
-            lines.append("People included:")
-            lines.extend(f"  @{item.subject.handle}" for item in profiles)
-        feeds = getattr(full, "feeds", None) or []
-        if feeds:
-            lines.append("")
-            lines.append("Feeds included:")
-            lines.extend(f"  {f.display_name}" for f in feeds)
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        textCtrl = wx.TextCtrl(self, value="\n".join(lines), style=wx.TE_MULTILINE | wx.TE_READONLY)
-        sizer.Add(textCtrl, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        btnSizer = wx.BoxSizer(wx.HORIZONTAL)
-        followBtn = wx.Button(self, label="&Follow everyone in this pack")
-        openBtn = wx.Button(self, label="&Open on bsky.app")
-        closeBtn = wx.Button(self, label="&Close")
-        btnSizer.Add(followBtn, flag=wx.RIGHT, border=5)
-        btnSizer.Add(openBtn, flag=wx.RIGHT, border=5)
-        btnSizer.Add(closeBtn)
-        sizer.Add(btnSizer, flag=wx.ALIGN_CENTER | wx.ALL, border=10)
-
-        self.SetSizer(sizer)
-        self.CentreOnScreen()
-
-        followBtn.Bind(wx.EVT_BUTTON, lambda e: self._doFollow())
-        openBtn.Bind(wx.EVT_BUTTON, lambda e: self._doOpen())
-        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-    def _doFollow(self):
-        parent = self.GetParent()
-        pack = self._pack
-        self.Close()
-        parent._followStarterPack(pack)
-
-    def _doOpen(self):
-        parent = self.GetParent()
-        pack = self._pack
-        self.Close()
-        parent._openStarterPackInBrowser(pack)
-
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        evt.Skip()
-
-    def onClose(self, evt):
-        gui.mainFrame.postPopup()
-        self.Destroy()
-
-
-class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMixin, EmbedViewMixin, wx.Panel):
-    """Posts result type reuses FeedListMixin fully (search results
-    hydrated into the same posts cache via client.search_posts_hydrated,
-    same as notifications' resolve_posts -- Post action/React/Reply/
-    View thread all just work). People/Starter packs/Feeds are simpler
-    dedicated lists swapped in via Show/Hide, People reusing
-    UserActionMixin's menu the same way ManageGroupMembersDialog does.
-    _dbGetPage/_syncPage are unused stubs -- this never goes through
-    FeedListMixin's cache/pagination path, only _runSearch below."""
-
-    TAB_KEY = "explore"
-    SUPPORTS_SELECT_ALL = True
-    SUPPORTS_FOCUS_NEXT_UNREAD = True
-    RESULT_TYPES = ["Posts", "People", "Starter packs", "Feeds"]
-    SEARCH_DEBOUNCE_MS = 800
-
-    def _addAdvField(self, panel, sizer, label):
-        row = wx.BoxSizer(wx.HORIZONTAL)
-        row.Add(wx.StaticText(panel, label=label), flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
-        ctrl = wx.TextCtrl(panel)
-        row.Add(ctrl, proportion=1)
-        sizer.Add(row, flag=wx.EXPAND | wx.BOTTOM, border=5)
-        return ctrl
-
-    def __init__(self, parent):
-        super().__init__(parent)
-
-        self._account = db.get_active_account()
-        self.TAB_NAME = "Explore"
-        self._feedKey = "explore"
-        self._tracksUnread = False
-        self._initFeedListState()
-        self._users = []
-        self._starterPacks = []
-        self._feeds = []
-        self._advExpanded = False
-        self._sourceQuery = None
-        self._filters = {}
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        searchRow = wx.BoxSizer(wx.HORIZONTAL)
-        searchLabel = wx.StaticText(self, label="&Search:")
-        self.searchText = wx.TextCtrl(self)
-        searchRow.Add(searchLabel, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
-        searchRow.Add(self.searchText, proportion=1)
-        sizer.Add(searchRow, flag=wx.EXPAND | wx.ALL, border=10)
-
-        self.typeRadio = wx.RadioBox(
-            self, label="Result type", choices=self.RESULT_TYPES, majorDimension=1, style=wx.RA_SPECIFY_ROWS
-        )
-        sizer.Add(self.typeRadio, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        # LOW CONFIDENCE -- since/until/author/lang params never tested
-        # against a real server, recalled from general lexicon
-        # knowledge not a debug_dump. Only used for Posts.
-        # wx.CollapsiblePane instead of a checkbox -- it doesn't
-        # support native mnemonic dispatch, so the & in the label is
-        # cosmetic only; real Alt+V activation is wired up via a
-        # manual AcceleratorTable below (see onToggleAdvancedAccel).
-        # State text ("expanded"/"collapsed") is written into the
-        # label by hand rather than relying on any automatic
-        # accessible-state announcement.
-        # Plain wx.Button + wx.Panel instead of wx.CollapsiblePane --
-        # CollapsiblePane's internal child structure fires TWO
-        # accessibility events on Windows (its own UIA wrapper plus the
-        # underlying native disclosure triangle), which reads the
-        # label twice the first time focus lands on it -- confirmed
-        # unfixable from the wx/app side (see plan-13.md follow-up). A
-        # plain Button is a single atomic control and never has this.
-        self.advBtn = wx.Button(self, label="")
-        sizer.Add(self.advBtn, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        self.advPanel = wx.Panel(self)
-        advSizer = wx.BoxSizer(wx.VERTICAL)
-        self.advFromText = self._addAdvField(self.advPanel, advSizer, "&From handle:")
-        self.advSinceText = self._addAdvField(self.advPanel, advSizer, "S&ince (YYYY-MM-DD):")
-        self.advUntilText = self._addAdvField(self.advPanel, advSizer, "&Until (YYYY-MM-DD):")
-        self.advLangText = self._addAdvField(self.advPanel, advSizer, "&Language:")
-        self.advPanel.SetSizer(advSizer)
-        sizer.Add(self.advPanel, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-        self._setAdvExpanded(False, layout=False)
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        
-        self._buildFeedListColumns()
-        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        self.peopleList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self.userList = self.peopleList  # UserListMixin operates on self.userList
-        self._buildUserListColumns()
-        sizer.Add(self.peopleList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-        self.peopleList.Hide()
-
-        self.starterPacksList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self.starterPacksList.InsertColumn(0, "Name", width=200)
-        self.starterPacksList.InsertColumn(1, "Creator", width=180)
-        self.starterPacksList.InsertColumn(2, "Description", width=300)
-        sizer.Add(self.starterPacksList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-        self.starterPacksList.Hide()
-
-        self.feedsResultList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self.feedsResultList.InsertColumn(0, "Name", width=200)
-        self.feedsResultList.InsertColumn(1, "Creator", width=180)
-        self.feedsResultList.InsertColumn(2, "Description", width=250)
-        self.feedsResultList.InsertColumn(3, "Likes", width=80)
-        sizer.Add(self.feedsResultList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-        self.feedsResultList.Hide()
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        self.resultActionButton = wx.Button(self, label="Action...")
-        self.openInTabButton = wx.Button(self, label="Open in new &tab")
-        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.resultActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.openInTabButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        self.statusBar = wx.StatusBar(self)
-        sizer.Add(self.statusBar, flag=wx.EXPAND)
-
-        self.SetSizer(sizer)
-
-        self._debounceTimer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.onDebounceTimer, self._debounceTimer)
-        self.searchText.Bind(wx.EVT_TEXT, self.onSearchTextChanged)
-        self.typeRadio.Bind(wx.EVT_RADIOBOX, self.onTypeChanged)
-        self.advBtn.Bind(wx.EVT_BUTTON, self.onAdvBtnClick)
-        self._advToggleId = wx.NewIdRef()
-        self.Bind(wx.EVT_MENU, self.onToggleAdvancedAccel, id=self._advToggleId)
-        # Bound to this panel, not a true top-level window -- per
-        # testing, Alt+V won't fire while focus is already deep inside
-        # the pane's own child fields (advFromText etc). Accepted
-        # limitation rather than plumbing this up to MainWindow.
-        self.SetAcceleratorTable(wx.AcceleratorTable([(wx.ACCEL_ALT, ord("V"), self._advToggleId)]))
-        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        self.resultActionButton.Bind(wx.EVT_BUTTON, self.onResultAction)
-        self.openInTabButton.Bind(wx.EVT_BUTTON, lambda e: self._openInNewTab())
-        self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
-        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onItemActivated)
-        self.peopleList.Bind(wx.EVT_CONTEXT_MENU, self.onPeopleContextMenu)
-        self.starterPacksList.Bind(wx.EVT_CONTEXT_MENU, self.onStarterPackContextMenu)
-        self.feedsResultList.Bind(wx.EVT_CONTEXT_MENU, self.onFeedResultContextMenu)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        self._updateTitle()
-        self._showResultListForType()
-        self._updateStatusBar()
-
-    def _setAdvExpanded(self, expanded, layout=True):
-        self._advExpanded = expanded
-        self.advPanel.Show(expanded)
-        status = "expanded" if expanded else "collapsed"
-        self.advBtn.SetLabel(f"Ad&vanced search ({status})")
-        if layout:
-            self.Layout()
-
-    def onAdvBtnClick(self, evt):
-        self._setAdvExpanded(not self._advExpanded)
-        if self._advExpanded:
-            self.advFromText.SetFocus()
-
-    def onToggleAdvancedAccel(self, evt):
-        if self._currentType() != "Posts":
-            return
-        self._setAdvExpanded(not self._advExpanded)
-        self.advBtn.SetFocus()
-        
-    def _restoreFocusPosition(self, moveFocus=True):
-        if self.FindFocus() is self.searchText:
-            return  # never steal focus while the user is actively typing
-        if not getattr(self, "_didInitialFocus", False):
-            self._didInitialFocus = True
-            if moveFocus:
-                self.searchText.SetFocus()
-            return
-        # Later calls (F5/refresh, debounced re-search) fall through to
-        # the normal FeedListMixin behavior (focus the result list) --
-        # only the very first ever call goes to the search box.
-        super()._restoreFocusPosition(moveFocus=moveFocus)
-
-    def onTabActivated(self):
-        nvdaUi.message(f"{self.TAB_NAME} tab")
-        self.searchText.SetFocus()
-
-    def onCheckForUpdates(self, evt):
-        self._runSearch()
-
-    # ---------------- FeedListMixin contract -- unused, search bypasses the cache path ----------------
-
-    def _dbGetPage(self, before_indexed_at=None, limit=None):
-        if not self._feedKey:
-            return []
-        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
-
-    def _dbGetUnreadCount(self):
-        return 0
-
-    def _syncPage(self, atprotoClient, cursor, limit):
-        # NOTE: guard on _sourceQuery, not _feedKey -- _feedKey is set
-        # to a fixed "explore" placeholder from __init__ (so
-        # _dbGetPage works before any search), so it's always truthy
-        # and never actually guards anything here. _sourceQuery is the
-        # real "has a Posts search actually run yet" signal; without
-        # this guard, Ctrl+F5's checkAllOpenTabs hit this on every
-        # untouched Explore tab and called search_posts(q=None).
-        if not self._sourceQuery:
-            return None
-        return client.sync_search_page(
-            atprotoClient, self._account["id"], self._feedKey, self._sourceQuery, cursor=cursor, limit=limit,
-            author=self._filters.get("author"), since=self._filters.get("since"),
-            until=self._filters.get("until"), lang=self._filters.get("lang"),
-        )
-
-    def _markItemRead(self, post):
-        db.mark_post_read(post["uri"])
-
-    def _getSelectedPosts(self):
-        indices = []
-        i = self.postList.GetFirstSelected()
-        while i != -1:
-            indices.append(i)
-            i = self.postList.GetNextSelected(i)
-        return [self._posts[i] for i in indices if 0 <= i < len(self._posts)]
-
-    def _render(self):
-        super()._render()
-        if self._currentType() == "Posts":
-            self._updateActionButtons()
-
-    # ---------------- search ----------------
-
-    def onSearchTextChanged(self, evt):
-        self._debounceTimer.Stop()
-        if self.searchText.GetValue().strip():
-            self._debounceTimer.StartOnce(self.SEARCH_DEBOUNCE_MS)
-
-    def onDebounceTimer(self, evt):
-        self._runSearch()
-
-    def onTypeChanged(self, evt):
-        self._showResultListForType()
-        self._runSearch()
-
-    def _currentType(self):
-        return self.RESULT_TYPES[self.typeRadio.GetSelection()]
-
-    def onCharHook(self, evt):
-        # Alt+A/Alt+U for non-Posts result types needs to route to
-        # onResultAction/onPeopleContextMenu instead of the generic
-        # ItemActionMixin.onCharHook's onPostAction()/onUserAction() --
-        # those act on self.postList's focused post regardless of
-        # which result list actually has focus, so Alt+A on a stale
-        # Posts search's leftover focused post was firing instead of
-        # the Feeds/Starter packs/People action shown on the "Action..."
-        # button's own label. Posts stays on the normal mixin path.
-        if self._currentType() != "Posts":
-            keyCode = evt.GetKeyCode()
-            if evt.AltDown() and keyCode == ord("A"):
-                self.onResultAction()
-                return
-            if evt.AltDown() and keyCode == ord("U") and self._currentType() == "People":
-                self.onResultAction()
-                return
-            # Alt+1-9 (announce Nth newest post) and Shift+F5 (fetch
-            # older posts) both read/act on self._posts unconditionally
-            # in the generic ItemActionMixin handler below, same class
-            # of bug Alt+A had -- self._posts is Posts-search-only here,
-            # so these would announce a stale/empty post instead of
-            # doing anything meaningful for People/Starter packs/Feeds
-            # results. Space and Ctrl+A don't need the same treatment,
-            # they already guard on self.FindFocus() is self.postList.
-            if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
-                self._announceNthResult(keyCode - ord("0"))
-                return
-            if keyCode == wx.WXK_F5 and evt.ShiftDown():
-                return
-        super().onCharHook(evt)
-
-    def _announceNthResult(self, n):
-        listCtrl, data = {
-            "People": (self.peopleList, self._users),
-            "Starter packs": (self.starterPacksList, self._starterPacks),
-            "Feeds": (self.feedsResultList, self._feeds),
-        }[self._currentType()]
-        if not (1 <= n <= len(data)):
-            nvdaUi.message(f"No item {n}.")
-            return
-        index = n - 1
-        parts = [listCtrl.GetItemText(index, col) for col in range(listCtrl.GetColumnCount())]
-        _announce_now(", ".join(p for p in parts if p))
-
-    def _showResultListForType(self):
-        resultType = self._currentType()
-        self.postList.Show(resultType == "Posts")
-        self.peopleList.Show(resultType == "People")
-        self.starterPacksList.Show(resultType == "Starter packs")
-        self.feedsResultList.Show(resultType == "Feeds")
-        self.advBtn.Show(resultType == "Posts")
-        if resultType != "Posts":
-            self._setAdvExpanded(False, layout=False)
-        self._updateActionButtons()
-
-    def _userListLabel(self):
-        return f"{len(self._users)} people found."
-
-    def _updateActionButtons(self):
-        resultType = self._currentType()
-        counts = {"Posts": len(self._posts), "People": len(self._users),
-                  "Starter packs": len(self._starterPacks), "Feeds": len(self._feeds)}
-        hasResults = counts.get(resultType, 0) > 0
-        self.postActionButton.Show(resultType == "Posts" and hasResults)
-        self.userActionButton.Show(resultType == "Posts" and hasResults)
-        self.resultActionButton.Show(resultType != "Posts" and hasResults)
-        self.openInTabButton.Show(resultType in ("Posts", "People") and hasResults)
-        labels = {"People": "User action... (Alt+U)", "Starter packs": "Pack action... (Alt+A)", "Feeds": "Feed action... (Alt+A)"}
-        if resultType in labels:
-            self.resultActionButton.SetLabel(labels[resultType])
-        self.Layout()
-
-    def onResultAction(self, evt=None):
-        resultType = self._currentType()
-        if resultType == "People":
-            self.onPeopleContextMenu(None)
-        elif resultType == "Starter packs":
-            self.onStarterPackContextMenu(None)
-        elif resultType == "Feeds":
-            self.onFeedResultContextMenu(None)
-
-    def _getActionablePost(self):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-        return post
-
-    def onUserAction(self, evt=None):
-        if self.postList.GetSelectedItemCount() > 1:
-            nvdaUi.message("User action needs a single post selected.")
-            return
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-        users = self._getRelevantUsers(post)
-        if len(users) == 1:
-            _, did, handle = users[0]
-            self.showUserActionMenu(did, handle)
-            return
-        menu = wx.Menu()
-        for label, did, handle in users:
-            submenu = wx.Menu()
-            self._populateUserActionMenu(submenu, did, handle)
-            menu.AppendSubMenu(submenu, label)
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _runSearch(self):
-        query = self.searchText.GetValue().strip()
-        if not query or self._account is None:
-            return
-        resultType = self._currentType()
-
-        if resultType == "Posts":
-            self._sourceQuery = query
-            self._filters = {
-                "author": self.advFromText.GetValue().strip() or None,
-                "since": self.advSinceText.GetValue().strip() or None,
-                "until": self.advUntilText.GetValue().strip() or None,
-                "lang": self.advLangText.GetValue().strip() or None,
-            }
-            self._feedKey = _search_feed_key(query, self._filters)
-            # onCheckForUpdates (not _loadFromCache directly) is what
-            # actually calls _syncPage -- _loadFromCache alone only
-            # reads whatever's already cached under _feedKey, which is
-            # why a fresh query showed 0 and a repeated one silently
-            # showed stale results.
-            super().onCheckForUpdates(None)
-            return
-
-        nvdaUi.message("Searching...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                if resultType == "People":
-                    results = client.search_actors(atprotoClient, query)
-                elif resultType == "Starter packs":
-                    results = client.search_starter_packs(atprotoClient, query)
-                else:
-                    results = client.search_feeds(atprotoClient, query)
-                error = None
-            except Exception as e:
-                results = None
-                error = str(e)
-            wx.CallAfter(self._onSearchDone, resultType, query, results, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onSearchDone(self, resultType, query, results, error):
-        if query != self.searchText.GetValue().strip() or resultType != self._currentType():
-            return
-        if error is not None:
-            nvdaUi.message(f"Search failed: {error}")
-            return
-        if resultType == "People":
-            self._users = [
-                {
-                    "did": a.did, "handle": a.handle,
-                    "display_name": getattr(a, "display_name", None),
-                    "description": getattr(a, "description", None),
-                }
-                for a in results.actors
-            ]
-            self._renderUsers()
-            nvdaUi.message(f"{len(self._users)} people found.")
-        elif resultType == "Starter packs":
-            self._starterPacks = list(results.starter_packs)
-            self._renderStarterPacks()
-            nvdaUi.message(f"{len(self._starterPacks)} starter packs found.")
-        else:
-            self._feeds = list(getattr(results, "feeds", []))
-            self._renderFeeds()
-            nvdaUi.message(f"{len(self._feeds)} feeds found.")
-        self._updateActionButtons()
-
-    def onPeopleContextMenu(self, evt):
-        user = self._getFocusedUser()
-        if user is None:
-            return
-        self.showUserActionMenu(user["did"], user["handle"], user.get("display_name"))
-
-    def _renderStarterPacks(self):
-        self.starterPacksList.DeleteAllItems()
-        for i, pack in enumerate(self._starterPacks):
-            record = pack.record
-            self.starterPacksList.InsertItem(i, getattr(record, "name", "Starter pack"))
-            creator = getattr(pack, "creator", None)
-            self.starterPacksList.SetItem(i, 1, f"@{creator.handle}" if creator else "")
-            self.starterPacksList.SetItem(i, 2, (getattr(record, "description", None) or "").replace("\n", " "))
-        if self._starterPacks:
-            self.starterPacksList.Focus(0)
-            self.starterPacksList.Select(0)
-
-    def onStarterPackContextMenu(self, evt):
-        index = self.starterPacksList.GetFocusedItem()
-        if index == -1 or index >= len(self._starterPacks):
-            return
-        pack = self._starterPacks[index]
-        menu = wx.Menu()
-        self._addMenuItem(menu, "View pack details...", lambda: self._viewStarterPackDetails(pack))
-        self._addMenuItem(menu, "Follow everyone in this pack", lambda: self._followStarterPack(pack))
-        self._addMenuItem(menu, "Open on bsky.app", lambda: self._openStarterPackInBrowser(pack))
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _followStarterPack(self, pack):
-        nvdaUi.message("Following everyone in the pack...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                full = client.get_starter_pack_full(atprotoClient, pack.uri)
-                count = client.follow_starter_pack_members(atprotoClient, full)
-                error = None
-            except Exception as e:
-                count = 0
-                error = str(e)
-            wx.CallAfter(self._onFollowStarterPackDone, count, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onFollowStarterPackDone(self, count, error):
-        if error:
-            nvdaUi.message(f"Could not follow pack members: {error}")
-            return
-        nvdaUi.message(f"Followed {count} new {'person' if count == 1 else 'people'}.")
-
-    def _viewStarterPackDetails(self, pack):
-        nvdaUi.message("Loading pack details...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                full = client.get_starter_pack_full(atprotoClient, pack.uri)
-                error = None
-            except Exception as e:
-                full = None
-                error = str(e)
-            wx.CallAfter(self._onStarterPackDetailsDone, pack, full, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onStarterPackDetailsDone(self, pack, full, error):
-        if error or full is None:
-            nvdaUi.message(f"Could not load pack details: {error or 'no data returned'}")
-            return
-        StarterPackDetailsDialog(self, pack, full).Show()
-
-    def _openStarterPackInBrowser(self, pack):
-        rkey = pack.uri.rsplit("/", 1)[-1]
-        creator = getattr(pack, "creator", None)
-        webbrowser.open(f"https://bsky.app/starter-pack/{creator.handle if creator else ''}/{rkey}")
-
-    def _renderFeeds(self):
-        self.feedsResultList.DeleteAllItems()
-        for i, feedGen in enumerate(self._feeds):
-            self.feedsResultList.InsertItem(i, feedGen.display_name or "Feed")
-            creator = getattr(feedGen, "creator", None)
-            self.feedsResultList.SetItem(i, 1, f"@{creator.handle}" if creator else "")
-            self.feedsResultList.SetItem(i, 2, (feedGen.description or "").replace("\n", " "))
-            self.feedsResultList.SetItem(i, 3, str(getattr(feedGen, "like_count", 0) or 0))
-        if self._feeds:
-            self.feedsResultList.Focus(0)
-            self.feedsResultList.Select(0)
-
-    def onFeedResultContextMenu(self, evt):
-        index = self.feedsResultList.GetFocusedItem()
-        if index == -1 or index >= len(self._feeds):
-            return
-        feedGen = self._feeds[index]
-        menu = wx.Menu()
-        self._addMenuItem(menu, "View feed...", lambda: self._viewFeed(feedGen))
-        self._addMenuItem(menu, "Add to my feeds", lambda: self._addFeed(feedGen))
-        self._addMenuItem(
-            menu, "Open on bsky.app",
-            lambda: webbrowser.open(f"https://bsky.app/profile/{feedGen.creator.handle}/feed/{feedGen.uri.rsplit('/', 1)[-1]}"),
-        )
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _viewFeed(self, feedGen):
-        mainWindow = self.GetTopLevelParent()
-        name = feedGen.display_name or "Feed"
-        panel = FeedPreviewTabWindow(mainWindow.notebook, name, "feed", feedGen.uri, origin_key="explore")
-        mainWindow.addTab(panel, name, select=True, removable=True)
-        db.add_open_temp_tab(self._account["id"], {
-            "type": "search_preview", "key": panel._feedKey, "kind": "feed", "source_key": feedGen.uri,
-            "name": name, "origin_key": "explore",
-        })
-
-    def onPostAction(self, evt=None):
-        super().onPostAction(evt)
-
-    def _openSearchInNewTab(self):
-        if not self._feedKey or self._currentType() != "Posts":
-            nvdaUi.message("Search for posts first.")
-            return
-        mainWindow = self.GetTopLevelParent()
-        name = f'Search: {self._sourceQuery}'
-        panel = FeedPreviewTabWindow(
-            mainWindow.notebook, name, "search", self._sourceQuery,
-            filters=self._filters, feed_key=self._feedKey, origin_key="explore",
-        )
-        mainWindow.addTab(panel, name, select=True, removable=True)
-        db.add_open_temp_tab(self._account["id"], {
-            "type": "search_preview", "key": self._feedKey, "kind": "search", "source_key": self._sourceQuery,
-            "name": name, "filters": self._filters, "origin_key": "explore",
-        })
-
-    def _openInNewTab(self):
-        if self._currentType() == "People":
-            self._openUserSearchInNewTab()
-        else:
-            self._openSearchInNewTab()
-
-    def _openUserSearchInNewTab(self):
-        query = self.searchText.GetValue().strip()
-        if not query:
-            nvdaUi.message("Search for people first.")
-            return
-        mainWindow = self.GetTopLevelParent()
-        identity = {"kind": "user_list", "key": f"search:{query}"}
-        if mainWindow.focusTabByIdentity(identity):
-            return
-        tab = UserListTabWindow(mainWindow.notebook, "search", query, origin_key="explore")
-        mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
-        if self._account is not None:
-            db.add_open_temp_tab(self._account["id"], {
-                "type": "user_list", "key": f"search:{query}", "list_kind": "search",
-                "query": query, "origin_key": "explore",
-            })
-
-    def _getActionablePost(self):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-        return post
-
-    def onUserAction(self, evt=None):
-        if self.postList.GetSelectedItemCount() > 1:
-            nvdaUi.message("User action needs a single post selected.")
-            return
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-        users = self._getRelevantUsers(post)
-        if len(users) == 1:
-            _, did, handle = users[0]
-            self.showUserActionMenu(did, handle)
-            return
-        menu = wx.Menu()
-        for label, did, handle in users:
-            submenu = wx.Menu()
-            self._populateUserActionMenu(submenu, did, handle)
-            menu.AppendSubMenu(submenu, label)
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _addFeed(self, feedGen):
-        nvdaUi.message("Adding feed...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                added = client.add_feed_to_saved(atprotoClient, feedGen.uri)
-                error = None
-            except Exception as e:
-                added = False
-                error = str(e)
-            wx.CallAfter(self._onAddFeedDone, added, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onAddFeedDone(self, added, error):
-        if error:
-            nvdaUi.message(f"Could not add feed: {error}")
-            return
-        nvdaUi.message("Feed added." if added else "Already in your feeds.")
-
 
 def _search_feed_key(query, filters):
     filters = filters or {}
     parts = [query, filters.get("author") or "", filters.get("since") or "", filters.get("until") or "", filters.get("lang") or ""]
     return "search:" + "|".join(parts)
-
-
-class FeedPreviewTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
-    """Popped-out feed generator or pinned search -- structurally a
-    clone of ListTabWindow (real cached/paginated feed via
-    _dbGetPage/_syncPage), not a one-shot fetch. kind is "feed" or
-    "search"; source_key is the feed_uri or search query."""
-
-    SUPPORTS_FOCUS_NEXT_UNREAD = True
-    SUPPORTS_SELECT_ALL = True
-
-    def __init__(self, parent, tab_name: str, kind: str, source_key: str, filters: dict = None, feed_key: str = None, origin_key: str = None):
-        super().__init__(parent)
-
-        self._account = db.get_active_account()
-        self.TAB_NAME = tab_name
-        self._kind = kind
-        self._sourceKey = source_key
-        self._filters = filters or {}
-        self._feedKey = feed_key or (source_key if kind == "feed" else _search_feed_key(source_key, self._filters))
-        self._originTabKey = origin_key
-        self.TAB_TEMP_TYPE = "search_preview"
-        self.TAB_TEMP_KEY = self._feedKey
-        self._tracksUnread = True
-        self._initFeedListState()
-
-        extraWidgets = None
-        if kind == "feed":
-            self.addFeedButton = wx.Button(self, label="&Add to my feeds")
-            extraWidgets = [self.addFeedButton]
-
-        self._buildStandardFeedSizer(extra_action_widgets=extraWidgets)
-        self._bindStandardFeedEvents()
-        if kind == "feed":
-            self.addFeedButton.Bind(wx.EVT_BUTTON, lambda e: self._addFeedFromPreview())
-
-        self._finishStandardFeedInit(sync_if_empty=True)
-
-    def onTabActivated(self):
-        self._render()
-        if self._account is not None:
-            nvdaUi.message(f"{self.TAB_NAME} tab")
-            self._restoreFocusPosition()
-
-    def onTabRemoved(self):
-        for value in vars(self).values():
-            if isinstance(value, wx.Timer):
-                value.Stop()
-        if self._account:
-            db.remove_open_temp_tab(self._account["id"], self.TAB_TEMP_TYPE, self.TAB_TEMP_KEY)
-        self._jumpBackToOrigin()
-
-    def _getActionablePost(self):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-        return post
-
-    def onUserAction(self, evt=None):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-        self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
-
-    def _dbGetPage(self, before_indexed_at=None, limit=None):
-        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
-
-    def _dbGetUnreadCount(self):
-        return 0
-
-    def _syncPage(self, atprotoClient, cursor, limit):
-        if not self._sourceKey:
-            return None
-        if self._kind == "feed":
-            return client.sync_feed_generator_page(atprotoClient, self._account["id"], self._sourceKey, cursor=cursor, limit=limit)
-        return client.sync_search_page(
-            atprotoClient, self._account["id"], self._feedKey, self._sourceKey, cursor=cursor, limit=limit,
-            author=self._filters.get("author"), since=self._filters.get("since"),
-            until=self._filters.get("until"), lang=self._filters.get("lang"),
-        )
-
-    def _markItemRead(self, post):
-        db.mark_post_read(post["uri"])
-        
-
-    def _addFeedFromPreview(self):
-        self.addFeedButton.Disable()
-        nvdaUi.message("Adding feed...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                added = client.add_feed_to_saved(atprotoClient, self._sourceKey)
-                error = None
-            except Exception as e:
-                added = False
-                error = str(e)
-            wx.CallAfter(self._onAddFeedFromPreviewDone, added, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onAddFeedFromPreviewDone(self, added, error):
-        self.addFeedButton.Enable()
-        if error:
-            nvdaUi.message(f"Could not add feed: {error}")
-            return
-        nvdaUi.message("Feed added." if added else "Already in your feeds.")
-
-
-class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
-    TAB_KEY = "saved"
-
-    """
-    Saved posts (bookmarks) -- structurally identical to FeedWindow's
-    Home feed (real posts, same ItemActionMixin Post action menu
-    applies unchanged), just backed by feed_key "saved" / sync_saved()
-    instead of the Following timeline. No filter -- there's only one
-    "Saved" list, unlike Home's Following/Discover choice.
-
-    NOTE: unsaving a post from its own Post action menu (Alt+A -> Save/
-    Unsave, already shared via ItemActionMixin) toggles the bookmark on
-    the server but does NOT remove the row from this list immediately
-    -- same as everywhere else, that only happens on next Check for
-    updates (F5). Matches existing behavior elsewhere (e.g. Hide post),
-    not a new gap introduced here.
-    """
-
-    def __init__(self, parent):
-        super().__init__(parent)
-
-        self._account = db.get_active_account()
-        self.TAB_NAME = "Saved"
-        self._feedKey = "saved"
-        self._tracksUnread = False
-        self._initFeedListState()
-
-        self._buildStandardFeedSizer()
-        self._bindStandardFeedEvents()
-        self._finishStandardFeedInit()
-
-    def onTabActivated(self):
-        self._render()
-        if self._account is not None:
-            nvdaUi.message(f"{self.TAB_NAME} tab")
-            self._restoreFocusPosition()
-
-    def _getActionablePost(self):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-        return post
-
-    def _onBookmarkChanged(self, post):
-        if post.get("viewer_bookmarked"):
-            return  # re-saved (or still saved) -- nothing to remove
-        db.delete_feed_item(self._account["id"], self._feedKey, post["uri"])
-        for i, p in enumerate(self._posts):
-            if p["uri"] == post["uri"]:
-                del self._posts[i]
-                self._render()
-                if self._posts:
-                    newIndex = min(i, len(self._posts) - 1)
-                    self.postList.Focus(newIndex)
-                    self.postList.Select(newIndex)
-                break
-
-    def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
-
-    def _dbGetPage(self, before_indexed_at=None, limit=None):
-        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
-
-    def _dbGetUnreadCount(self):
-        return db.get_unread_count(self._account["id"], self._feedKey)
-
-    def _syncPage(self, atprotoClient, cursor, limit):
-        return client.sync_saved(atprotoClient, self._account["id"], cursor=cursor, limit=limit)
-
-    def _markItemRead(self, post):
-        db.mark_post_read(post["uri"])
-
-    def onUserAction(self, evt=None):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-        self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
-
-    # onCharHook is inherited from FeedListMixin -- no SUPPORTS_* flags
-    # needed here, this class never had Space/Ctrl+A/Left-Right/Ctrl+N.
-
-class AddListDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="Add list", size=(420, 320))
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        nameLabel = wx.StaticText(self, label="Name:")
-        self.nameText = wx.TextCtrl(self)
-        sizer.Add(nameLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
-        sizer.Add(self.nameText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        descLabel = wx.StaticText(self, label="Description (optional):")
-        self.descText = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(-1, 80))
-        sizer.Add(descLabel, flag=wx.LEFT | wx.RIGHT, border=10)
-        sizer.Add(self.descText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        self.purposeRadio = wx.RadioBox(
-            self, label="List type",
-            choices=[
-                "For browsing (see everyone's posts together as one timeline)",
-                "For moderation (mute or block this whole group of accounts)",
-            ],
-        )
-        sizer.Add(self.purposeRadio, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        btnSizer = wx.StdDialogButtonSizer()
-        okBtn = wx.Button(self, wx.ID_OK, label="Create")
-        cancelBtn = wx.Button(self, wx.ID_CANCEL)
-        btnSizer.AddButton(okBtn)
-        btnSizer.AddButton(cancelBtn)
-        btnSizer.Realize()
-        sizer.Add(btnSizer, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
-
-        self.SetSizer(sizer)
-        self.CentreOnScreen()
-        self.nameText.SetFocus()
-
-    def getValues(self):
-        purpose = client.LIST_PURPOSE_CURATE if self.purposeRadio.GetSelection() == 0 else client.LIST_PURPOSE_MOD
-        return self.nameText.GetValue().strip(), self.descText.GetValue().strip(), purpose
-
-
-class SubscribeListDialog(wx.Dialog):
-    """
-    Find someone else's lists by searching for their handle/name (same
-    typeahead search as Manage members below), then either open one of
-    their curation lists straight as a tab -- get_list_feed works off
-    any public list uri, no subscription needed, this is the "browse
-    their content" path -- or subscribe (mute/block) to one of their
-    moderation lists, which DOES need a real subscription since that's
-    what makes it apply to your own timeline.
-    """
-
-    def __init__(self, parent, on_subscribed=None):
-        self._userSuggestions = []
-        self._selectedUser = None
-        self._userLists = []
-        self._onSubscribed = on_subscribed
-
-        super().__init__(parent, title="Find lists by user", size=(480, 480))
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        userLabel = wx.StaticText(self, label="Search for a user by handle or name:")
-        self.userSearchText = wx.TextCtrl(self)
-        sizer.Add(userLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
-        sizer.Add(self.userSearchText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
-
-        self.userChoice = wx.Choice(self, choices=[])
-        sizer.Add(self.userChoice, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=5)
-
-        self.loadListsButton = wx.Button(self, label="Show their lists")
-        sizer.Add(self.loadListsButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-        self.loadListsButton.Hide()  # nothing to load until a user is picked
-
-        self.listsLabel = wx.StaticText(self, label="Their lists:")
-        self.listsCheckBox = gui.nvdaControls.CustomCheckListBox(self, choices=[])
-        sizer.Add(self.listsLabel, flag=wx.LEFT | wx.TOP, border=10)
-        sizer.Add(self.listsCheckBox, proportion=1, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.openTabButton = wx.Button(self, label="Open checked as tabs")
-        self.subscribeAsMuteButton = wx.Button(self, label="Subscribe checked (mute)")
-        self.subscribeAsBlockButton = wx.Button(self, label="Subscribe checked (block)")
-        actionRow.Add(self.openTabButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.subscribeAsMuteButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.subscribeAsBlockButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-        # Nothing to open/subscribe until their lists are actually loaded.
-        self.listsLabel.Hide()
-        self.listsCheckBox.Hide()
-        self.openTabButton.Hide()
-        self.subscribeAsMuteButton.Hide()
-        self.subscribeAsBlockButton.Hide()
-
-        closeBtn = wx.Button(self, label="&Close")
-        sizer.Add(closeBtn, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
-
-        self.SetSizer(sizer)
-        self.CentreOnScreen()
-
-        self.userSearchText.Bind(wx.EVT_TEXT, self.onUserSearchChanged)
-        self.loadListsButton.Bind(wx.EVT_BUTTON, self.onLoadLists)
-        self.openTabButton.Bind(wx.EVT_BUTTON, self.onOpenAsTabs)
-        self.subscribeAsMuteButton.Bind(wx.EVT_BUTTON, lambda e: self.onSubscribe("mute"))
-        self.subscribeAsBlockButton.Bind(wx.EVT_BUTTON, lambda e: self.onSubscribe("block"))
-        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        self.userSearchText.SetFocus()
-
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        evt.Skip()
-
-    def onClose(self, evt):
-        gui.mainFrame.postPopup()
-        parent = self.GetParent()
-        self.Destroy()
-        if parent is not None:
-            parent.subscribeButton.SetFocus()
-
-    def onUserSearchChanged(self, evt):
-        wx.CallLater(400, self._runUserSearch, self.userSearchText.GetValue())
-
-    def _runUserSearch(self, query):
-        if query != self.userSearchText.GetValue():
-            return  # a newer keystroke already superseded this debounce
-        if not query.strip():
-            self.userChoice.Set([])
-            self._userSuggestions = []
-            return
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                results = client.search_actors_typeahead(atprotoClient, query)
-                error = None
-            except Exception as e:
-                results = []
-                error = str(e)
-            wx.CallAfter(self._onUserSearchDone, results, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onUserSearchDone(self, results, error):
-        if error:
-            return
-        self._userSuggestions = results
-        self.userChoice.Set([f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in results])
-        self.loadListsButton.Show(bool(results))
-        self.Layout()
-        if results:
-            self.userChoice.SetSelection(0)
-
-    def onLoadLists(self, evt):
-        index = self.userChoice.GetSelection()
-        if not (0 <= index < len(self._userSuggestions)):
-            nvdaUi.message("Search for a user and pick one from the list first.")
-            return
-        self._selectedUser = self._userSuggestions[index]
-        nvdaUi.message(f'Loading lists for @{self._selectedUser["handle"]}, please wait...')
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                entries = client.get_lists(atprotoClient, self._selectedUser["did"])
-                error = None
-            except Exception as e:
-                entries = []
-                error = str(e)
-            wx.CallAfter(self._onUserListsLoaded, entries, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onUserListsLoaded(self, entries, error):
-        if error:
-            nvdaUi.message(f"Could not load their lists: {error}")
-            return
-        # getLists(actor=them) can also include lists THEY subscribed
-        # to (not just ones they created) -- only show ones they
-        # actually authored, showing back a list they merely subscribe
-        # to isn't useful here.
-        self._userLists = [e for e in entries if e["creator_did"] == self._selectedUser["did"]]
-        hasLists = bool(self._userLists)
-        self.listsLabel.Show(hasLists)
-        self.listsCheckBox.Show(hasLists)
-        self.openTabButton.Show(hasLists)
-        self.subscribeAsMuteButton.Show(hasLists)
-        self.subscribeAsBlockButton.Show(hasLists)
-        self.Layout()
-        self.listsCheckBox.Set([self._listChoiceLabel(l) for l in self._userLists])
-        self.listsCheckBox.CheckedItems = []
-        if hasLists:
-            self.listsCheckBox.SetSelection(0)
-        if not self._userLists:
-            nvdaUi.message(f'@{self._selectedUser["handle"]} has no public lists.')
-        else:
-            nvdaUi.message(f"{len(self._userLists)} lists loaded.")
-
-    def _listChoiceLabel(self, lst):
-        kind = "moderation list" if lst["purpose"] == client.LIST_PURPOSE_MOD else "curation list"
-        return f'{lst["name"]} ({kind})'
-
-    def onOpenAsTabs(self, evt):
-        checked = [self._userLists[i] for i in self.listsCheckBox.CheckedItems if 0 <= i < len(self._userLists)]
-        curateLists = [l for l in checked if l["purpose"] == client.LIST_PURPOSE_CURATE]
-        if not curateLists:
-            nvdaUi.message("Check at least one curation list first -- moderation lists don't have a timeline to open.")
-            return
-        mainWindow = self.GetParent().GetTopLevelParent()
-        account = db.get_active_account()
-        for i, lst in enumerate(curateLists):
-            tab = ListTabWindow(mainWindow.notebook, lst["uri"], lst["name"], origin_key="lists")
-            mainWindow.addTab(tab, lst["name"], select=(i == len(curateLists) - 1), removable=True)
-            if account is not None:
-                db.add_open_temp_tab(account["id"], {
-                    "type": "list", "key": lst["uri"], "list_uri": lst["uri"], "list_name": lst["name"],
-                    "origin_key": "lists",
-                })
-        nvdaUi.message(f"Opened {len(curateLists)} list{'s' if len(curateLists) != 1 else ''} as tabs.")
-
-    def onSubscribe(self, action):
-        checked = [self._userLists[i] for i in self.listsCheckBox.CheckedItems if 0 <= i < len(self._userLists)]
-        modLists = [l for l in checked if l["purpose"] == client.LIST_PURPOSE_MOD]
-        if not modLists:
-            nvdaUi.message("Check at least one moderation list first -- curation lists can't be muted/blocked, use Open checked as tabs instead.")
-            return
-
-        def worker():
-            errors = []
-            atprotoClient = client.get_client_for_active_account()
-            for lst in modLists:
-                try:
-                    if action == "mute":
-                        client.mute_actor_list(atprotoClient, lst["uri"])
-                    else:
-                        client.block_actor_list(atprotoClient, lst["uri"])
-                except Exception as e:
-                    errors.append(f'{lst["name"]}: {e}')
-            wx.CallAfter(self._onSubscribeDone, len(modLists) - len(errors), errors)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onSubscribeDone(self, successCount, errors):
-        if successCount:
-            nvdaUi.message(f"Subscribed to {successCount} list{'s' if successCount != 1 else ''}.")
-            if self._onSubscribed:
-                self._onSubscribed()
-        if errors:
-            nvdaUi.message("Some subscriptions failed: " + "; ".join(errors))
-
-
-class ManageMembersDialog(wx.Dialog):
-    """
-    Add/remove members for a list. Read-only (no Add/Remove controls)
-    if you're not the list's creator -- membership can only be edited
-    by the creator per the AT Protocol's own permission model.
-    """
-
-    def __init__(self, parent, list_info: dict):
-        self._listInfo = list_info
-        self._members = list(list_info.get("members", []))
-        self._isOwner = list_info["creator_did"] == db.get_active_account()["did"]
-        self._suggestions = []
-
-        super().__init__(parent, title=f"Manage members - {list_info['name']}", size=(500, 500))
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        self.memberList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.memberList.InsertColumn(0, "Handle", width=220)
-        self.memberList.InsertColumn(1, "Display name", width=220)
-        self._renderMembers()
-        sizer.Add(self.memberList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        if self._isOwner:
-            removeRow = wx.BoxSizer(wx.HORIZONTAL)
-            self.removeButton = wx.Button(self, label="Remove selected")
-            removeRow.Add(self.removeButton)
-            sizer.Add(removeRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-            self.removeButton.Show(bool(self._members))
-
-            addLabel = wx.StaticText(self, label="Add member (type a handle or name to search):")
-            sizer.Add(addLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
-            self.searchText = wx.TextCtrl(self)
-            sizer.Add(self.searchText, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=10)
-
-            self.suggestLabel = wx.StaticText(self, label="Search results:")
-            self.suggestionList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
-            sizer.Add(self.suggestLabel, flag=wx.LEFT | wx.TOP, border=10)
-            sizer.Add(self.suggestionList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-            self.addButton = wx.Button(self, label="Add selected users")
-            sizer.Add(self.addButton, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-            # Nothing to show/add until an actual search has results.
-            self.suggestLabel.Hide()
-            self.suggestionList.Hide()
-            self.addButton.Hide()
-        else:
-            note = wx.StaticText(self, label="You're not the creator of this list -- membership is read-only.")
-            sizer.Add(note, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        closeBtn = wx.Button(self, label="&Close")
-        sizer.Add(closeBtn, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
-
-        self.SetSizer(sizer)
-        self.CentreOnScreen()
-
-        if self._isOwner:
-            self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
-            self.searchText.Bind(wx.EVT_TEXT, self.onSearchTextChanged)
-            self.addButton.Bind(wx.EVT_BUTTON, self.onAddSuggestion)
-        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        if self._members:
-            self.memberList.Focus(0)
-            self.memberList.Select(0)
-        self.memberList.SetFocus()
-
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        evt.Skip()
-
-    def onClose(self, evt):
-        gui.mainFrame.postPopup()
-        parent = self.GetParent()
-        self.Destroy()
-        if parent is not None:
-            parent.manageMembersButton.SetFocus()
-
-    def _renderMembers(self):
-        self.memberList.Freeze()
-        try:
-            self.memberList.DeleteAllItems()
-            for i, m in enumerate(self._members):
-                self.memberList.InsertItem(i, f'@{m["handle"]}')
-                self.memberList.SetItem(i, 1, m.get("display_name") or "")
-        finally:
-            self.memberList.Thaw()
-
-    def onRemove(self, evt):
-        index = self.memberList.GetFocusedItem()
-        if not (0 <= index < len(self._members)):
-            nvdaUi.message("No member selected.")
-            return
-        member = self._members[index]
-
-        confirm = wx.MessageDialog(
-            self, f'Remove @{member["handle"]} from this list?', "Confirm remove", wx.YES_NO | wx.NO_DEFAULT
-        )
-        confirmed = confirm.ShowModal() == wx.ID_YES
-        confirm.Destroy()
-        if not confirmed:
-            return
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                client.remove_list_member(atprotoClient, member["listitem_uri"])
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onRemoveDone, index, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onRemoveDone(self, index, error):
-        if error:
-            nvdaUi.message(f"Could not remove member: {error}")
-            return
-        del self._members[index]
-        self._renderMembers()
-        self.removeButton.Show(bool(self._members))
-        self.Layout()
-        if self._members:
-            newIndex = min(index, len(self._members) - 1)
-            self.memberList.Focus(newIndex)
-            self.memberList.Select(newIndex)
-            self.memberList.EnsureVisible(newIndex)
-        nvdaUi.message("Member removed.")
-
-    def onSearchTextChanged(self, evt):
-        wx.CallLater(400, self._runSearch, self.searchText.GetValue())
-
-    def _runSearch(self, query):
-        if query != self.searchText.GetValue():
-            return  # a newer keystroke already superseded this debounce
-        if not query.strip():
-            self.suggestionList.Set([])
-            self._suggestions = []
-            return
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                results = client.search_actors_typeahead(atprotoClient, query)
-                error = None
-            except Exception as e:
-                results = []
-                error = str(e)
-            wx.CallAfter(self._onSearchDone, results, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onSearchDone(self, results, error):
-        if error:
-            return
-        self._suggestions = results
-        hasResults = bool(results)
-        self.suggestLabel.Show(hasResults)
-        self.suggestionList.Show(hasResults)
-        self.addButton.Show(hasResults)
-        self.Layout()
-        self.suggestionList.Set([f'@{r["handle"]} ({r.get("display_name") or "no display name"})' for r in results])
-        self.suggestionList.CheckedItems = []
-        if hasResults:
-            self.suggestionList.SetSelection(0)
-
-    def onAddSuggestion(self, evt):
-        indices = list(self.suggestionList.CheckedItems)
-        if not indices:
-            nvdaUi.message("No suggestions checked.")
-            return
-        actors = [self._suggestions[i] for i in indices if 0 <= i < len(self._suggestions)]
-        newActors = [a for a in actors if not any(m["did"] == a["did"] for m in self._members)]
-        if not newActors:
-            nvdaUi.message("Already in this list.")
-            return
-
-        def worker():
-            added = []
-            errors = []
-            atprotoClient = client.get_client_for_active_account()
-            for actor in newActors:
-                try:
-                    listitem_uri = client.add_list_member(atprotoClient, self._listInfo["uri"], actor["did"])
-                    added.append((actor, listitem_uri))
-                except Exception as e:
-                    errors.append(f'@{actor["handle"]}: {e}')
-            wx.CallAfter(self._onAddDone, added, errors)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onAddDone(self, added, errors):
-        for actor, listitem_uri in added:
-            self._members.append({
-                "listitem_uri": listitem_uri,
-                "did": actor["did"],
-                "handle": actor["handle"],
-                "display_name": actor.get("display_name"),
-            })
-        self._renderMembers()
-        self.removeButton.Show(bool(self._members))
-        self.Layout()
-        if self._members:
-            lastIndex = len(self._members) - 1
-            self.memberList.Focus(lastIndex)
-            self.memberList.Select(lastIndex)
-            self.memberList.EnsureVisible(lastIndex)
-        if added:
-            names = ", ".join(f'@{a["handle"]}' for a, _ in added)
-            nvdaUi.message(f"Added {names}.")
-        if errors:
-            nvdaUi.message("Some members could not be added: " + "; ".join(errors))
-
-
-class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
-    TAB_KEY = "lists"
-    # Same content shape as Home, so it gets the full shortcut set too
-    # (see plan-09.md) -- Alt+number/Alt+U still branch on list purpose
-    # via the _onAltNumber/_onAltU overrides below, independent of
-    # these flags.
-    SUPPORTS_NEW_POST = True
-    SUPPORTS_FOCUS_NEXT_UNREAD = True
-    SUPPORTS_SELECT_ALL = True
-    SUPPORTS_JUMP_TO_USER = True
-
-    """
-    "My lists" -- a flat tree of every list this account created or
-    subscribed to (mute/block), same set bsky.app's "My lists" page
-    shows. Selecting a curation list shows its timeline on the right
-    (a normal post list -- Post action/User action apply unchanged,
-    feed_key is just the list's own at:// uri, so FeedListMixin/
-    get_feed_page/check-for-updates all work exactly like Home/Saved).
-    Selecting a moderation list has no timeline (modlists aren't a
-    feed), so the right side swaps to a member roster instead.
-    List-level management (create/delete, open in its own tab, edit
-    membership, subscribe to someone else's moderation list) lives in
-    this tab's own local toolbar, not the shared MainWindow one.
-    """
-
-    def __init__(self, parent):
-        super().__init__(parent)
-
-        self._account = db.get_active_account()
-        self.TAB_NAME = "Lists"
-        self._lists = []
-        self._selectedList = None  # the dict for whichever tree row is selected
-        self._feedKey = None
-        self._initFeedListState()
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        splitRow = wx.BoxSizer(wx.HORIZONTAL)
-
-        self.listTree = wx.TreeCtrl(
-            self, style=wx.TR_HAS_BUTTONS | wx.TR_HIDE_ROOT | wx.TR_SINGLE | wx.TR_LINES_AT_ROOT
-        )
-        self._listRoot = self.listTree.AddRoot("Lists")
-        splitRow.Add(self.listTree, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
-
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self._buildFeedListColumns()
-        splitRow.Add(self.postList, proportion=2, flag=wx.EXPAND)
-
-        self.memberList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.memberList.InsertColumn(0, "Handle", width=220)
-        self.memberList.InsertColumn(1, "Display name", width=220)
-        splitRow.Add(self.memberList, proportion=2, flag=wx.EXPAND)
-        self.memberList.Hide()
-
-        sizer.Add(splitRow, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-        # Nothing is focused/selectable at construction time yet --
-        # _showSelectedList()/_updateActionButtons() re-show these once
-        # a curation list with posts actually gets focused.
-        self.postActionButton.Hide()
-        self.userActionButton.Hide()
-
-        toolbarRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.addListButton = wx.Button(self, label="Add list...")
-        self.removeListButton = wx.Button(self, label="Remove list")
-        self.showInNewTabButton = wx.Button(self, label="Show in new tab")
-        self.manageMembersButton = wx.Button(self, label="Manage members...")
-        self.subscribeButton = wx.Button(self, label="Find lists by user...")
-        for button in (self.addListButton, self.removeListButton, self.showInNewTabButton, self.manageMembersButton, self.subscribeButton):
-            button.Hide()
-        #self.addListButton.Hide()
-        # Remove/Show in new tab/Manage members moved into the list
-        # tree's context menu (see onListContextMenu) -- mirrors Chat's
-        # conversation-tree menu. "Add list..." moved to the shared
-        # toolbar's New-post button (becomes "New list..." on this tab,
-        # see mainWindow.py's onNewPost) -- kept as a real widget
-        # (just hidden) rather than deleted so onAddList()'s existing
-        # focus-restore calls (parent.addListButton.SetFocus()-style,
-        # if any) don't need touching.
-        toolbarRow.Add(self.subscribeButton, flag=wx.RIGHT, border=5)
-        sizer.Add(toolbarRow, flag=wx.ALL, border=10)
-
-# note: removeListButton/showInNewTabButton/manageMembersButton are intentionally left OUT of toolbarRow.Add() above -- only subscribeButton gets added now, the other three just aren't placed in a sizer (still constructed further down where .Bind() references them, but never shown).
-
-        self.statusBar = wx.StatusBar(self)
-        sizer.Add(self.statusBar, flag=wx.EXPAND)
-
-        self.SetSizer(sizer)
-
-        self.addListButton.Bind(wx.EVT_BUTTON, self.onAddList)
-        self.removeListButton.Bind(wx.EVT_BUTTON, self.onRemoveList)
-        self.showInNewTabButton.Bind(wx.EVT_BUTTON, self.onShowInNewTab)
-        self.manageMembersButton.Bind(wx.EVT_BUTTON, self.onManageMembers)
-        self.subscribeButton.Bind(wx.EVT_BUTTON, self.onSubscribeViaLink)
-        self.listTree.Bind(wx.EVT_TREE_SEL_CHANGED, self.onListSelected)
-        self.listTree.Bind(wx.EVT_TREE_ITEM_MENU, self.onListContextMenu)
-        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
-        self.postList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onItemActivated)
-        self.memberList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onMemberAction)
-        self.memberList.Bind(wx.EVT_CONTEXT_MENU, self.onMemberContextMenu)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        self._updateTitle()
-        self._loadListsFromCache()
-
-        if self._account is None:
-            nvdaUi.message("No active account. Log in from Settings first.")
-
-    # ---------------- MainWindow integration hooks ----------------
-
-    def onTabActivated(self):
-        nvdaUi.message(f"{self.TAB_NAME} tab")
-        self.listTree.SetFocus()
-
-    def _restoreFocusPosition(self, moveFocus=True):
-        # Lists behaves like Chat: the tree is this tab's "home"
-        # control, not whichever list happens to be showing on the
-        # right -- MainWindow's addTab()/_focusPanel() call this
-        # expecting to land real focus somewhere sane on tab open, and
-        # for this tab that's always the tree. The per-list post-
-        # scroll-position restore (used when switching which list is
-        # selected, see _showSelectedList below) is a separate concern
-        # and calls FeedListMixin._restoreFocusPosition directly
-        # instead of going through this override.
-        if moveFocus:
-            self.listTree.SetFocus()
-
-    # ---------------- lists tree ----------------
-
-    def _loadListsFromCache(self):
-        self.listTree.Freeze()
-        try:
-            self.listTree.DeleteAllItems()
-            self._listRoot = self.listTree.AddRoot("Lists")
-            self._lists = db.get_lists(self._account["id"]) if self._account else []
-
-            for lst in self._lists:
-                item = self.listTree.AppendItem(self._listRoot, self._listLabel(lst))
-                self.listTree.SetItemData(item, lst["list_uri"])
-
-            firstItem, _cookie = self.listTree.GetFirstChild(self._listRoot)
-            if firstItem.IsOk():
-                self.listTree.SelectItem(firstItem)
-            else:
-                self._selectedList = None
-                self.postList.DeleteAllItems()
-                self.memberList.DeleteAllItems()
-                self.postActionButton.Hide()
-                self.userActionButton.Hide()
-                self.Layout()
-        finally:
-            self.listTree.Thaw()
-
-        self._updateListsStatusBar()
-        self._updateToolbarVisibility()
-        # Deliberately NOT auto-syncing from the server here anymore.
-        # This used to fire unconditionally on every __init__ (i.e.
-        # every MainWindow open), unlike the other 4 permanent tabs
-        # which only ever load from local cache at construction time
-        # -- this was Stage 2 of the original crash-hardening plan
-        # (plan-07.md), agreed on but never actually done; Stage 0's
-        # safe_ui_callback fix made the resulting race SAFE at the
-        # Python level (caught RuntimeError instead of a hard crash)
-        # but never removed the race itself. Confirmed by testing
-        # (see plan-09.md): every "quick close after opening
-        # MainWindow" crash report so far shows this exact background
-        # sync's completion handler as the immediately-preceding
-        # event, every time, regardless of which tab the user actually
-        # interacted with -- removing the automatic call here matches
-        # ListsWindow's behavior to the other 4 tabs (cache-only on
-        # open, sync only ever on explicit user action -- F5/Shift+F5/
-        # after add-list/remove-list/subscribe, which still call
-        # _syncListsFromServer() directly and are untouched by this).
-
-    def _updateToolbarVisibility(self):
-        # No-op now -- Remove/Show in new tab/Manage members live in
-        # the list tree's context menu (see onListContextMenu), which
-        # naturally only appears on an actual item, so there's nothing
-        # left to show/hide here. Kept as a callable stub since it's
-        # still called from a couple of places below.
-        pass
-
-    def onListContextMenu(self, evt):
-        item = evt.GetItem()
-        if not item.IsOk() or item == self._listRoot:
-            return
-        self.listTree.SelectItem(item)
-
-        menu = wx.Menu()
-        removeItem = menu.Append(wx.ID_ANY, "Remove list")
-        openTabItem = menu.Append(wx.ID_ANY, "Show in new tab")
-        membersItem = menu.Append(wx.ID_ANY, "Manage members...")
-        self.Bind(wx.EVT_MENU, lambda e: self.onRemoveList(), removeItem)
-        self.Bind(wx.EVT_MENU, lambda e: self.onShowInNewTab(), openTabItem)
-        self.Bind(wx.EVT_MENU, lambda e: self.onManageMembers(), membersItem)
-
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _listLabel(self, lst):
-        kind = "moderation list" if lst["purpose"] == client.LIST_PURPOSE_MOD else "curation list"
-        suffix = ", muted" if lst["purpose"] == client.LIST_PURPOSE_MOD and lst.get("muted") else ""
-        return f'{lst["name"]} ({kind}{suffix})'
-
-    def _updateListsStatusBar(self):
-        self.statusBar.SetStatusText(f"Lists {len(self._lists)} total")
-
-    def _syncListsFromServer(self):
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                entries = client.get_lists(atprotoClient, self._account["did"])
-                for entry in entries:
-                    db.upsert_list({
-                        "account_id": self._account["id"],
-                        "list_uri": entry["uri"],
-                        "cid": entry["cid"],
-                        "name": entry["name"],
-                        "description": entry["description"],
-                        "purpose": entry["purpose"],
-                        "creator_did": entry["creator_did"],
-                        "creator_handle": entry["creator_handle"],
-                        "muted": int(entry["muted"]),
-                        "blocked_uri": entry["blocked_uri"],
-                    })
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onSyncListsDone, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onSyncListsDone(self, error):
-        if error:
-            log.error(f"NVSky: list sync failed: {error}")
-            nvdaUi.message(f"Could not refresh lists: {error}")
-            return
-        selectedUri = self._selectedList["list_uri"] if self._selectedList else None
-        self._lists = db.get_lists(self._account["id"])
-        self.listTree.Freeze()
-        try:
-            self.listTree.DeleteAllItems()
-            self._listRoot = self.listTree.AddRoot("Lists")
-            for lst in self._lists:
-                item = self.listTree.AppendItem(self._listRoot, self._listLabel(lst))
-                self.listTree.SetItemData(item, lst["list_uri"])
-
-            item, cookie = self.listTree.GetFirstChild(self._listRoot)
-            selected = False
-            while item.IsOk():
-                if self.listTree.GetItemData(item) == selectedUri:
-                    self.listTree.SelectItem(item)
-                    selected = True
-                    break
-                item, cookie = self.listTree.GetNextChild(self._listRoot, cookie)
-            if not selected:
-                firstItem, _cookie = self.listTree.GetFirstChild(self._listRoot)
-                if firstItem.IsOk():
-                    self.listTree.SelectItem(firstItem)
-                else:
-                    self._selectedList = None
-                    self.postList.DeleteAllItems()
-                    self.memberList.DeleteAllItems()
-                    self.postActionButton.Hide()
-                    self.userActionButton.Hide()
-                    self.Layout()
-        finally:
-            self.listTree.Thaw()
-        self._updateListsStatusBar()
-        self._updateToolbarVisibility()
-
-    def onListSelected(self, evt):
-        item = evt.GetItem()
-        if item.IsOk() and item != self._listRoot:
-            listUri = self.listTree.GetItemData(item)
-            self._selectedList = next((l for l in self._lists if l["list_uri"] == listUri), None)
-            self._showSelectedList()
-        evt.Skip()
-
-    def _showSelectedList(self):
-        if self._selectedList is None:
-            return
-        if self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
-            self.postList.Hide()
-            self.memberList.Show()
-            self.postActionButton.Hide()
-            self.userActionButton.Hide()
-            self.Layout()
-            self._loadMembersLive()
-        else:
-            self.memberList.Hide()
-            self.postList.Show()
-            self.Layout()
-            self._feedKey = self._selectedList["list_uri"]
-            self._loadFromCache(reset=True)
-            FeedListMixin._restoreFocusPosition(self, moveFocus=False)
-
-    # ---------------- curation list timeline (FeedListMixin hooks) ----------------
-
-    def _getActionablePost(self):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-        return post
-
-    def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
-
-    def _dbGetPage(self, before_indexed_at=None, limit=None):
-        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
-
-    def _dbGetUnreadCount(self):
-        return db.get_unread_count(self._account["id"], self._feedKey)
-
-    def _syncPage(self, atprotoClient, cursor, limit):
-        return client.sync_list_feed(atprotoClient, self._account["id"], self._feedKey, cursor=cursor, limit=limit)
-
-    def _markItemRead(self, post):
-        db.mark_post_read(post["uri"])
-
-    def onUserAction(self, evt=None):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-        self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
-
-    # ---------------- moderation list members ----------------
-
-    def _loadMembersLive(self):
-        self.memberList.DeleteAllItems()
-        nvdaUi.message("Loading members, please wait...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                info = client.get_list(atprotoClient, self._selectedList["list_uri"])
-                error = None
-            except Exception as e:
-                info = None
-                error = str(e)
-            wx.CallAfter(self._onMembersLoaded, info, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onMembersLoaded(self, info, error):
-        if error:
-            nvdaUi.message(f"Could not load members: {error}")
-            return
-        self._currentMembers = info["members"]
-        self.memberList.Freeze()
-        try:
-            self.memberList.DeleteAllItems()
-            for i, m in enumerate(self._currentMembers):
-                self.memberList.InsertItem(i, f'@{m["handle"]}')
-                self.memberList.SetItem(i, 1, m.get("display_name") or "")
-        finally:
-            self.memberList.Thaw()
-        self.statusBar.SetStatusText(f"{self._selectedList['name']} {len(self._currentMembers)} members")
-        if self._currentMembers:
-            self.memberList.Focus(0)
-            self.memberList.Select(0)
-
-    def _getFocusedMember(self):
-        index = self.memberList.GetFocusedItem()
-        if 0 <= index < len(self._currentMembers):
-            return self._currentMembers[index]
-        return None
-
-    def onMemberAction(self, evt=None):
-        member = self._getFocusedMember()
-        if member is None:
-            nvdaUi.message("No member selected.")
-            return
-        self.showUserActionMenu(member["did"], member["handle"], member.get("display_name"))
-
-    def onMemberContextMenu(self, evt):
-        self.onMemberAction()
-
-    # ---------------- toolbar actions ----------------
-
-    def onAddList(self, evt=None):
-        if self._account is None:
-            nvdaUi.message("No active account.")
-            return
-        gui.mainFrame.prePopup()
-        dlg = AddListDialog(self)
-        result = dlg.ShowModal()
-        name, description, purpose = dlg.getValues()
-        dlg.Destroy()
-        gui.mainFrame.postPopup()
-        self.addListButton.SetFocus()
-        if result != wx.ID_OK:
-            return
-        if not name:
-            nvdaUi.message("A list needs a name.")
-            return
-        self._createList(name, description, purpose)
-
-    def _createList(self, name, description, purpose):
-        nvdaUi.message("Creating list, please wait...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                client.create_list(atprotoClient, name, description, purpose)
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onCreateListDone, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onCreateListDone(self, error):
-        if error:
-            nvdaUi.message(f"Could not create list: {error}")
-            return
-        nvdaUi.message("List created.")
-        self._syncListsFromServer()
-
-    def onRemoveList(self, evt=None):
-        if self._selectedList is None:
-            nvdaUi.message("No list selected.")
-            return
-        if self._selectedList["creator_did"] != self._account["did"]:
-            nvdaUi.message("You can only remove a list you created -- use Find lists by user's Mute/Block to leave someone else's list.")
-            return
-
-        confirm = wx.MessageDialog(
-            self, f'Remove the list "{self._selectedList["name"]}"? This can\'t be undone.',
-            "Confirm remove", wx.YES_NO | wx.NO_DEFAULT,
-        )
-        confirmed = confirm.ShowModal() == wx.ID_YES
-        confirm.Destroy()
-        if not confirmed:
-            return
-
-        listUri = self._selectedList["list_uri"]
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                client.delete_list(atprotoClient, listUri)
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onRemoveListDone, listUri, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onRemoveListDone(self, listUri, error):
-        if error:
-            nvdaUi.message(f"Could not remove list: {error}")
-            return
-        db.delete_list(self._account["id"], listUri)
-        nvdaUi.message("List removed.")
-        self._selectedList = None
-        self._loadListsFromCache()
-
-    def onShowInNewTab(self, evt=None):
-        if self._selectedList is None:
-            nvdaUi.message("No list selected.")
-            return
-        if self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
-            nvdaUi.message("Moderation lists don't have a timeline to open in a tab.")
-            return
-        mainWindow = self.GetTopLevelParent()
-        tab = ListTabWindow(
-            mainWindow.notebook, self._selectedList["list_uri"], self._selectedList["name"], origin_key="lists"
-        )
-        mainWindow.addTab(tab, self._selectedList["name"], select=True, removable=True)
-        db.add_open_temp_tab(self._account["id"], {
-            "type": "list",
-            "key": self._selectedList["list_uri"],
-            "list_uri": self._selectedList["list_uri"],
-            "list_name": self._selectedList["name"],
-            "origin_key": "lists",
-        })
-
-    def onManageMembers(self, evt=None):
-        if self._selectedList is None:
-            nvdaUi.message("No list selected.")
-            return
-        nvdaUi.message("Loading members, please wait...")
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                info = client.get_list(atprotoClient, self._selectedList["list_uri"])
-                error = None
-            except Exception as e:
-                info = None
-                error = str(e)
-            wx.CallAfter(self._onManageMembersInfoReady, info, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onManageMembersInfoReady(self, info, error):
-        if error:
-            nvdaUi.message(f"Could not load list: {error}")
-            return
-        gui.mainFrame.prePopup()
-        dlg = ManageMembersDialog(self, info)
-        dlg.Show()
-
-    def onSubscribeViaLink(self, evt=None):
-        gui.mainFrame.prePopup()
-        dlg = SubscribeListDialog(self, on_subscribed=self._syncListsFromServer)
-        dlg.Show()
-
-    # ---------------- keyboard ----------------
-
-    # onCharHook is inherited from FeedListMixin -- Alt+number/Alt+U
-    # stay class-specific here since they branch on list purpose.
-
-    def _onAltNumber(self, n):
-        if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
-            self._announceNthNewestPost(n)
-
-    def _onAltU(self):
-        if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
-            self.onMemberAction()
-        else:
-            self.onUserAction()
-        
-    def _syncForBulkCheck(self, atprotoClient):
-        # Was calling self._syncListsFromServer(), which spawns its OWN
-        # separate background thread and its OWN separate
-        # client.get_client_for_active_account() login -- called from
-        # INSIDE the bulk-check flow's already-shared background thread,
-        # this raced a second concurrent login against the one
-        # checkAllOpenTabs already holds, exactly the class of bug the
-        # shared-thread design was meant to avoid (see MainWindow.
-        # checkAllOpenTabs' own comment). Also fire-and-forget, so this
-        # method's return value never reflected whether anything
-        # actually changed -- confirmed as the cause of "Lists doesn't
-        # announce AND doesn't update" during Ctrl+F5. Do the list-sync
-        # work directly here instead, synchronously, on the SAME
-        # atprotoClient/thread the caller already established.
-        beforeSnapshot = {l["list_uri"]: l.get("muted") for l in self._lists}
-        entries = client.get_lists(atprotoClient, self._account["did"])
-        for entry in entries:
-            db.upsert_list({
-                "account_id": self._account["id"],
-                "list_uri": entry["uri"],
-                "cid": entry["cid"],
-                "name": entry["name"],
-                "description": entry["description"],
-                "purpose": entry["purpose"],
-                "creator_did": entry["creator_did"],
-                "creator_handle": entry["creator_handle"],
-                "muted": int(entry["muted"]),
-                "blocked_uri": entry["blocked_uri"],
-            })
-        afterLists = db.get_lists(self._account["id"])
-        afterSnapshot = {l["list_uri"]: l.get("muted") for l in afterLists}
-        listsChanged = afterSnapshot != beforeSnapshot
-
-        curateChanged = False
-        if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
-            curateChanged = super()._syncForBulkCheck(atprotoClient)
-
-        return listsChanged or curateChanged
-
-    def _reloadAfterBulkCheck(self, moveFocus=True):
-        # _syncForBulkCheck above already wrote fresh list metadata to
-        # the DB synchronously -- rebuild the tree from it here instead
-        # of leaving it stale until the next explicit F5 (which still
-        # goes through the async _syncListsFromServer/_onSyncListsDone
-        # path unchanged).
-        selectedUri = self._selectedList["list_uri"] if self._selectedList else None
-        self._lists = db.get_lists(self._account["id"])
-        self.listTree.Freeze()
-        try:
-            self.listTree.DeleteAllItems()
-            self._listRoot = self.listTree.AddRoot("Lists")
-            for lst in self._lists:
-                item = self.listTree.AppendItem(self._listRoot, self._listLabel(lst))
-                self.listTree.SetItemData(item, lst["list_uri"])
-            item, cookie = self.listTree.GetFirstChild(self._listRoot)
-            selected = False
-            while item.IsOk():
-                if self.listTree.GetItemData(item) == selectedUri:
-                    self.listTree.SelectItem(item)
-                    selected = True
-                    break
-                item, cookie = self.listTree.GetNextChild(self._listRoot, cookie)
-            if not selected:
-                firstItem, _cookie = self.listTree.GetFirstChild(self._listRoot)
-                if firstItem.IsOk():
-                    self.listTree.SelectItem(firstItem)
-        finally:
-            self.listTree.Thaw()
-        self._updateListsStatusBar()
-
-        if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
-            super()._reloadAfterBulkCheck(moveFocus=moveFocus)
-        elif self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
-            self._loadMembersLive()
-
-    def onCheckForUpdates(self, evt):
-        self._syncListsFromServer()
-        if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
-            super().onCheckForUpdates(evt)
-        elif self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
-            self._loadMembersLive()
-
-
-class ListTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
-    """
-    A single curation list's timeline, popped out into its own
-    removable tab via Lists' "Show in new tab" -- structurally a clone
-    of SavedWindow fixed to one list_uri instead of a filter choice,
-    so it can stay open and be checked for updates independently of
-    the main Lists tab.
-    """
-
-    def __init__(self, parent, list_uri: str, list_name: str, origin_key: str = None):
-        super().__init__(parent)
-
-        self._account = db.get_active_account()
-        self.TAB_NAME = list_name
-        # Generic identity for MainWindow's remember-last-tab feature.
-        self.TAB_TEMP_TYPE = "list"
-        self.TAB_TEMP_KEY = list_uri
-        self._feedKey = list_uri
-        self._originTabKey = origin_key
-        self._initFeedListState()
-
-        self._buildStandardFeedSizer()
-        self._bindStandardFeedEvents()
-        self._finishStandardFeedInit(sync_if_empty=True)
-
-    def onTabActivated(self):
-        self._render()
-        if self._account is not None:
-            nvdaUi.message(f"{self.TAB_NAME} tab")
-            self._restoreFocusPosition()
-
-    def _getActionablePost(self):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-        return post
-
-    def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
-
-    def _dbGetPage(self, before_indexed_at=None, limit=None):
-        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
-
-    def _dbGetUnreadCount(self):
-        return db.get_unread_count(self._account["id"], self._feedKey)
-
-    def _syncPage(self, atprotoClient, cursor, limit):
-        return client.sync_list_feed(atprotoClient, self._account["id"], self._feedKey, cursor=cursor, limit=limit)
-
-    def _markItemRead(self, post):
-        db.mark_post_read(post["uri"])
-
-    def onUserAction(self, evt=None):
-        post = self._getFocusedPost()
-        if post is None:
-            nvdaUi.message("No post selected.")
-            return
-        self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
-
-    def onTabRemoved(self):
-        # MainWindow.removeCurrentTab() calls this (if present) right
-        # before DeletePage() -- see the mainWindow.py edit -- so a
-        # temp tab the user closes with Ctrl+W doesn't come back next
-        # time NVSky opens. Scans for every wx.Timer instance rather
-        # than calling _stopTimeRefreshTimer() by name (see plan-09.md
-        # -- MainWindow.onClose had the identical gap: only knew about
-        # _timeRefreshTimer and missed _loadingTimer, the F5-in-progress
-        # beep, which this tab can also start via onCheckForUpdates).
-        for value in vars(self).values():
-            if isinstance(value, wx.Timer):
-                value.Stop()
-        if self._account is not None:
-            db.remove_open_temp_tab(self._account["id"], "list", self._feedKey)
-        self._jumpBackToOrigin()
-
-    def onTabRenamed(self, newName):
-        # MainWindow.renameCurrentTab() calls this (if present) right
-        # after updating panel.TAB_NAME in memory -- persists the new
-        # name into this tab's existing db.get_open_temp_tabs() entry
-        # so it survives past this session (previously session-only).
-        # Overrides RemovableTabMixin's no-op stub -- ListTabWindow IS
-        # user-renameable, unlike the other RemovableTabMixin hosts.
-        if self._account is not None:
-            db.set_temp_tab_custom_name(self._account["id"], "list", self._feedKey, newName)
-    
-    # onCharHook is inherited from FeedListMixin -- no SUPPORTS_* flags
-    # needed here, this class never had Space/Ctrl+A/Left-Right/Ctrl+N.
-
-def _describe_notification(notif: dict) -> str:
-    reason = notif.get("reason")
-    subjectText = (notif.get("subject_text") or "").replace("\n", " ").strip()
-    label = {
-        "like": "Liked",
-        "repost": "Reposted",
-        "follow": "Followed you",
-        "reply": "Replied",
-        "mention": "Mentioned you",
-        "quote": "Quoted",
-    }.get(reason, reason or "Notification")
-
-    if reason == "follow":
-        return label
-    # Always show the original message when we have one -- the user
-    # shouldn't have to open the website to see what a like/repost/
-    # reply/mention/quote was actually about.
-    if subjectText:
-        return f"{label}: {subjectText}"
-    return label
-
-
-class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
-    TAB_KEY = "notifications"
-    SUPPORTS_FOCUS_NEXT_UNREAD = True
-    SUPPORTS_SELECT_ALL = True
-    TIME_COLUMN_INDEX = 2  # Author(0)/Notification(1)/Received(2) -- only 3 columns, not the usual 4
-
-    """
-    Notifications list -- likes, reposts, follows, replies, mentions,
-    quotes. Reuses FeedListMixin the same way FeedWindow does, but
-    backed by its own `notifications` table instead of posts/
-    feed_items, since a notification isn't shaped like a post.
-
-    Permanent tab embedded in MainWindow (same category as Home) --
-    no per-panel Close button/Escape/Ctrl+W handling, same as
-    FeedWindow's conversion.
-    """
-
-    def __init__(self, parent):
-        super().__init__(parent)
-
-        self._account = db.get_active_account()
-        self.TAB_NAME = "Notifications"
-        self._feedKey = "notifications"
-        self._initFeedListState()
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
-        self.postList.InsertColumn(0, "Author", width=180)
-        self.postList.InsertColumn(1, "Notification", width=400)
-        self.postList.InsertColumn(2, "Received", width=140)
-        sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
-
-        actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        self.postActionButton = wx.Button(self, label="Post action... (Alt+A)")
-        self.userActionButton = wx.Button(self, label="User action... (Alt+U)")
-        actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
-        actionRow.Add(self.userActionButton)
-        sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-
-        # Check for updates used to have its own button here -- now a
-        # toolbar-level button shared across every tab in MainWindow
-        # instead (see mainWindow.py). F5 still works as a keyboard
-        # shortcut while this tab has focus, via onCharHook below.
-        self.statusBar = wx.StatusBar(self)
-        sizer.Add(self.statusBar, flag=wx.EXPAND)
-
-        self.SetSizer(sizer)
-
-        self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
-        self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
-        self.postList.Bind(wx.EVT_LIST_ITEM_FOCUSED, self.onItemFocused)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
-        self._updateTitle()
-        self._loadFromCache(reset=True)
-
-        if self._account is None:
-            nvdaUi.message("No active account. Log in from Settings first.")
-        else:
-            # moveFocus=False -- see the matching comment in
-            # FeedWindow.__init__ for why (this panel gets constructed
-            # BEFORE MainWindow.addTab() adds it, so grabbing real
-            # focus here would steal it from whichever tab is actually
-            # meant to be visible).
-            self._restoreFocusPosition(moveFocus=False)
-
-    def onTabActivated(self):
-        self._render()
-        if self._account is not None:
-            nvdaUi.message(f"{self.TAB_NAME} tab")
-            self._restoreFocusPosition()
-
-    def _insertRow(self, index: int, notif: dict, mode: str):
-        self.postList.InsertItem(index, self._authorLabel(notif, mode))
-        self.postList.SetItem(index, 1, _describe_notification(notif))
-        self.postList.SetItem(index, 2, _format_post_time(notif.get("indexed_at")))
-
-    def _dbGetPage(self, before_indexed_at=None, limit=None):
-        return db.get_notification_page(self._account["id"], before_indexed_at=before_indexed_at, limit=limit)
-
-    def _dbGetUnreadCount(self):
-        return db.get_unread_notification_count(self._account["id"])
-
-    def _syncPage(self, atprotoClient, cursor, limit):
-        return client.sync_notifications(atprotoClient, self._account["id"], cursor=cursor, limit=limit)
-
-    def _markItemRead(self, notif):
-        db.mark_notification_read(notif["uri"])
-
-    def onUserAction(self, evt=None):
-        notif = self._getFocusedPost()
-        if notif is None:
-            nvdaUi.message("No notification selected.")
-            return
-        self.showUserActionMenu(notif["author_did"], notif["handle"], notif.get("display_name"))
-
-    # ---------------- post action menu (Alt+A) ----------------
-
-    def _getActionablePost(self):
-        notif = self._getFocusedPost()
-        if notif is None:
-            nvdaUi.message("No notification selected.")
-            return None
-
-        subjectUri = notif.get("subject_uri")
-        if not subjectUri:
-            if notif.get("reason") == "follow":
-                nvdaUi.message("Follow notifications have no post -- try User action (Alt+U) instead.")
-            else:
-                nvdaUi.message("This notification's post isn't available -- try Check for updates (F5) to resync.")
-            return None
-
-        post = db.get_post(subjectUri)
-        if post is None:
-            nvdaUi.message("This notification's post isn't cached yet -- try Check for updates (F5) to resync.")
-            return None
-        return post
-
-    def _showBulkPostActionMenu(self, selectedCount):
-        # Bulk reply/like/repost/etc. on several notifications' underlying
-        # posts still isn't coherent (that part stays single-item-only,
-        # via _getActionablePost above) -- but bulk mark read/unread IS
-        # meaningful: it marks the NOTIFICATIONS themselves, the same
-        # thing single-item read-tracking already does elsewhere in this
-        # tab, not their underlying posts.
-        menu = wx.Menu()
-        markMenu = wx.Menu()
-        self._addMenuItem(markMenu, f"Read ({selectedCount} selected)",
-                           lambda: self._markSelectedNotificationsRead(True))
-        self._addMenuItem(markMenu, f"Unread ({selectedCount} selected)",
-                           lambda: self._markSelectedNotificationsRead(False))
-        menu.AppendSubMenu(markMenu, "Mar&k as...")
-        self.PopupMenu(menu)
-        menu.Destroy()
-
-    def _markSelectedNotificationsRead(self, read: bool):
-        notifs = self._getSelectedPosts()
-        for notif in notifs:
-            if read:
-                db.mark_notification_read(notif["uri"])
-            else:
-                db.mark_notification_unread(notif["uri"])
-        # Reload from DB rather than patch in-memory state -- avoids
-        # guessing the notification dict's exact read-status key name,
-        # and guarantees the status bar's unread count matches reality.
-        self._loadFromCache(reset=True)
-        _announce_now("Marked as read." if read else "Marked as unread.")
-
-    # onCharHook is inherited from FeedListMixin (see SUPPORTS_* flags
-    # above). This also fixes a real bug: this class's old onCharHook
-    # never had the "Ctrl+F5 bubbles up to MainWindow" guard the other
-    # 4 tabs have, so Ctrl+F5 here was silently doing a single-tab F5
-    # sync instead of MainWindow.checkAllOpenTabs' full sweep.
 

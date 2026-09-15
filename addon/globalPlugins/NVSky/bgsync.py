@@ -20,22 +20,31 @@ PAGE_SIZE = 50
 
 def _home_feed_display_name(account_id: int, feed_key: str) -> str:
     if feed_key == "home":
-        return "Home"
+        # Translators: Display name for the Home timeline in sync-change announcements.
+        return _("Home")
     if feed_key == "discover":
-        return "Discover"
+        # Translators: Display name for the Discover feed in sync-change announcements.
+        return _("Discover")
     for feed in db.get_saved_feeds_cache(account_id):
         if feed.get("uri") == feed_key:
-            return feed.get("display_name") or "Home"
-    return "Home"
+            # Translators: Fallback display name for a saved feed with no cached name.
+            return feed.get("display_name") or _("Home")
+    # Translators: Display name for the Home timeline in sync-change announcements.
+    return _("Home")
 
 
 def _thread_display_name(posts: list) -> str:
     if not posts:
-        return "Thread"
+        # Translators: Fallback display name for a thread with no cached posts.
+        return _("Thread")
     first = posts[0]
     handle = first.get("handle") or first.get("author_did") or "?"
     preview = (first.get("text") or "")[:30]
-    return f"Thread: @{handle}: {preview}" if preview else f"Thread: @{handle}"
+    if preview:
+        # Translators: Thread display name with a text preview. First {} is the handle, second {} is a preview of the first post.
+        return _("Thread: @{}: {}").format(handle, preview)
+    # Translators: Thread display name with no text preview available. {} is the handle.
+    return _("Thread: @{}").format(handle)
 
 
 def sync_home(atprotoClient, account_id: int):
@@ -61,7 +70,8 @@ def sync_notifications(atprotoClient, account_id: int):
     client.sync_notifications(atprotoClient, account_id, limit=PAGE_SIZE)
     afterCount = db.get_unread_notification_count(account_id)
     if afterCount > beforeCount:
-        return True, ["Notifications"]
+        # Translators: Display name for the Notifications tab in sync-change announcements.
+        return True, [_("Notifications")]
     return False, []
 
 
@@ -72,7 +82,8 @@ def sync_saved(atprotoClient, account_id: int):
     after = db.get_feed_page(account_id, "saved", limit=1)
     newTopUri = after[0]["uri"] if after else None
     if newTopUri and newTopUri != oldTopUri:
-        return True, ["Saved"]
+        # Translators: Display name for the Saved tab in sync-change announcements.
+        return True, [_("Saved")]
     return False, []
 
 
@@ -97,14 +108,56 @@ def sync_chat(atprotoClient, account_id: int, my_did: str):
     return True, names
 
 
-def sync_lists(atprotoClient, account_id: int):
+def sync_lists(atprotoClient, account_id: int, my_did: str):
+    # Unlike Home (one active filter at a time), ListsWindow shows a
+    # TREE of every list at once -- so background sync covers every
+    # curation list I own, not just whichever one happens to be
+    # selected right now (no way for this pure function to know that
+    # anyway). Also covers any list open as its own ListTabWindow temp
+    # tab, which may belong to someone else entirely (e.g. opened via
+    # Find lists by user).
+    changed = False
     names = []
+
+    beforeLists = db.get_lists(account_id)
+    beforeSnapshot = {l["list_uri"]: (l.get("name"), l.get("muted")) for l in beforeLists}
+    try:
+        entries = client.get_lists(atprotoClient, my_did)
+        for entry in entries:
+            db.upsert_list({
+                "account_id": account_id,
+                "list_uri": entry["uri"],
+                "cid": entry["cid"],
+                "name": entry["name"],
+                "description": entry["description"],
+                "purpose": entry["purpose"],
+                "creator_did": entry["creator_did"],
+                "creator_handle": entry["creator_handle"],
+                "muted": int(entry["muted"]),
+                "blocked_uri": entry["blocked_uri"],
+            })
+    except Exception as e:
+        log.error(f"NVSky: background list-of-lists sync failed: {e}")
+    afterLists = db.get_lists(account_id)
+    afterSnapshot = {l["list_uri"]: (l.get("name"), l.get("muted")) for l in afterLists}
+    if afterSnapshot != beforeSnapshot:
+        changed = True
+        # Translators: Display name for the Lists tab in sync-change announcements.
+        names.append(_("Lists"))
+
+    targets = {}
+    for lst in afterLists:
+        if lst["purpose"] == client.LIST_PURPOSE_CURATE:
+            targets[lst["list_uri"]] = lst["name"]
     for entry in db.get_open_temp_tabs(account_id):
         if entry.get("type") != "list":
             continue
         listUri = entry.get("list_uri")
-        if not listUri:
-            continue
+        if listUri and listUri not in targets:
+            # Translators: Fallback display name for a list with no cached name.
+            targets[listUri] = entry.get("custom_name") or entry.get("list_name", _("List"))
+
+    for listUri, displayName in targets.items():
         before = db.get_feed_page(account_id, listUri, limit=1)
         oldTopUri = before[0]["uri"] if before else None
         try:
@@ -115,8 +168,9 @@ def sync_lists(atprotoClient, account_id: int):
         after = db.get_feed_page(account_id, listUri, limit=1)
         newTopUri = after[0]["uri"] if after else None
         if newTopUri and newTopUri != oldTopUri:
-            names.append(entry.get("custom_name") or entry.get("list_name", "List"))
-    return bool(names), names
+            changed = True
+            names.append(displayName)
+    return changed, names
 
 
 def sync_search(atprotoClient, account_id: int):
@@ -147,7 +201,8 @@ def sync_search(atprotoClient, account_id: int):
         after = db.get_feed_page(account_id, feedKey, limit=1)
         newTopUri = after[0]["uri"] if after else None
         if newTopUri and newTopUri != oldTopUri:
-            names.append(entry.get("custom_name") or entry.get("name", "Search"))
+            # Translators: Fallback display name for a search-preview tab with no cached name.
+            names.append(entry.get("custom_name") or entry.get("name", _("Search")))
     return bool(names), names
 
 
@@ -170,8 +225,10 @@ def sync_profile(atprotoClient, account_id: int):
             after = db.get_feed_page(account_id, feedKey, limit=1)
             newTopUri = after[0]["uri"] if after else None
             if newTopUri and newTopUri != oldTopUri:
-                owner = entry.get("owner_label", "user")
-                names.append(entry.get("custom_name") or f"Timeline of {owner}")
+                # Translators: Fallback owner label when a user-timeline tab has no name cached.
+                owner = entry.get("owner_label", _("user"))
+                # Translators: Display name for a user-timeline tab in sync-change announcements. {} is the account owner.
+                names.append(entry.get("custom_name") or _("Timeline of {}").format(owner))
         elif entryType == "user_list":
             kind = entry.get("list_kind")
             cacheKey = entry.get("key")
@@ -179,13 +236,29 @@ def sync_profile(atprotoClient, account_id: int):
                 continue
             before = db.get_user_list_cache(account_id, cacheKey)
             try:
-                if kind in ("followers", "following"):
+                if kind in ("followers", "following", "known_followers"):
                     did = entry.get("did")
                     if not did:
                         continue
+                    if kind == "followers":
+                        users = client.get_followers(atprotoClient, did)
+                    elif kind == "following":
+                        users = client.get_follows(atprotoClient, did)
+                    else:
+                        users = client.get_known_followers(atprotoClient, did)
+                elif kind in ("likes", "reposts"):
+                    # BUG FIX: these used to fall into the "search"
+                    # else-branch below, which requires entry["query"]
+                    # -- likes/reposts entries store "post_uri" instead
+                    # (see _openUserListForPost), so query was always
+                    # None and background sync silently skipped these
+                    # tabs every single tick since C shipped.
+                    postUri = entry.get("post_uri")
+                    if not postUri:
+                        continue
                     users = (
-                        client.get_followers(atprotoClient, did) if kind == "followers"
-                        else client.get_follows(atprotoClient, did)
+                        client.get_post_likes(atprotoClient, postUri) if kind == "likes"
+                        else client.get_post_reposted_by(atprotoClient, postUri)
                     )
                 else:
                     query = entry.get("query")
@@ -205,10 +278,29 @@ def sync_profile(atprotoClient, account_id: int):
                 continue
             db.set_user_list_cache(account_id, cacheKey, users)
             if users != (before or []):
-                if kind in ("followers", "following"):
-                    label = f"{kind.capitalize()} of {entry.get('owner_label', 'user')}"
+                if kind in ("followers", "following", "known_followers"):
+                    kindLabels = {
+                        # Translators: Kind label in a "{kind} of {owner}" sync-change summary.
+                        "followers": _("Followers"),
+                        # Translators: Kind label in a "{kind} of {owner}" sync-change summary.
+                        "following": _("Following"),
+                        # Translators: Kind label in a "{kind} of {owner}" sync-change summary.
+                        "known_followers": _("Known followers"),
+                    }
+                    # Translators: Composite display name for a followers/following list change. First {} is the kind, second {} is the account owner.
+                    label = _("{} of {}").format(kindLabels[kind], entry.get("owner_label", _("user")))
+                elif kind in ("likes", "reposts"):
+                    kindLabels = {
+                        # Translators: Kind label in a "{kind} on {post}" sync-change summary.
+                        "likes": _("Likes"),
+                        # Translators: Kind label in a "{kind} on {post}" sync-change summary.
+                        "reposts": _("Reposts"),
+                    }
+                    # Translators: Composite display name for a likes/reposts list change. First {} is the kind, second {} is the post owner.
+                    label = _("{} on {}").format(kindLabels[kind], entry.get("owner_label", _("post")))
                 else:
-                    label = f"People search: {entry.get('query', '')}"
+                    # Translators: Display name for a people-search tab in sync-change announcements. {} is the search query.
+                    label = _("People search: {}").format(entry.get("query", ""))
                 names.append(entry.get("custom_name") or label)
     return bool(names), names
 
@@ -240,7 +332,7 @@ SYNC_FUNCTIONS = {
     "notifications": (sync_notifications, False),
     "saved": (sync_saved, False),
     "chat": (sync_chat, True),
-    "lists": (sync_lists, False),
+    "lists": (sync_lists, True),
     "search": (sync_search, False),
     "profile": (sync_profile, False),
     "thread": (sync_thread, False),

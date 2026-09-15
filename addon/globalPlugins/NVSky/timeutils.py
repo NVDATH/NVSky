@@ -91,21 +91,42 @@ def format_timestamp(iso_timestamp: str, mode: str = "relative_24h", custom_patt
 
 def _relative_string(seconds: float, dtLocal: datetime.datetime, capAt24h: bool) -> str:
     if seconds < 60:
-        return "just now"
+        # Translators: Relative timestamp for under a minute old.
+        return _("just now")
     if seconds < 3600:
         minutes = int(seconds // 60)
-        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+        if minutes == 1:
+            # Translators: Relative timestamp, exactly one minute old.
+            return _("1 minute ago")
+        # Translators: Relative timestamp, several minutes old. {} is the count.
+        return _("{} minutes ago").format(minutes)
     if seconds < 86400:
         hours = int(seconds // 3600)
-        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        if hours == 1:
+            # Translators: Relative timestamp, exactly one hour old.
+            return _("1 hour ago")
+        # Translators: Relative timestamp, several hours old. {} is the count.
+        return _("{} hours ago").format(hours)
     if capAt24h:
         return dtLocal.strftime("%Y-%m-%d %H:%M:%S")
 
     days = int(seconds // 86400)
     if days < 30:
-        return f"{days} day{'s' if days != 1 else ''} ago"
+        if days == 1:
+            # Translators: Relative timestamp, exactly one day old.
+            return _("1 day ago")
+        # Translators: Relative timestamp, several days old. {} is the count.
+        return _("{} days ago").format(days)
     months = int(days // 30)
     if months < 12:
-        return f"{months} month{'s' if months != 1 else ''} ago"
+        if months == 1:
+            # Translators: Relative timestamp, exactly one month old.
+            return _("1 month ago")
+        # Translators: Relative timestamp, several months old. {} is the count.
+        return _("{} months ago").format(months)
     years = int(days // 365)
-    return f"{years} year{'s' if years != 1 else ''} ago"
+    if years == 1:
+        # Translators: Relative timestamp, exactly one year old.
+        return _("1 year ago")
+    # Translators: Relative timestamp, several years old. {} is the count.
+    return _("{} years ago").format(years)
