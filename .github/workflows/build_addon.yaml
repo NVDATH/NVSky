@@ -25,7 +25,7 @@ jobs:
           pip install scons markdown
 
       - name: Sync changelog into buildVars.py (for manifest changelog field)
-        run: python scripts/sync_changelog.md
+        run: python scripts/sync_changelog.py
 
       - name: Append Changelog to Readme
         run: |
