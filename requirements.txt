@@ -14,7 +14,7 @@ idna
 libipld
 pycparser
 pydantic
-pydantic_core
+pydantic_core==2.46.5
 sqlcipher3
 typing_extensions
 typing_inspection
