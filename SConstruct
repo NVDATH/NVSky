@@ -118,6 +118,7 @@ if not os.path.exists(lib_dir):
 subprocess.check_call([
     sys.executable, "-m", "pip", "install",
     "--upgrade",
+    "--no-compile",
     "-r", "requirements.txt",
     "--target", lib_dir,
     "--no-deps",
@@ -133,6 +134,12 @@ for item in os.listdir(lib_dir):
     item_path = os.path.join(lib_dir, item)
     if item.endswith(".dist-info") and os.path.isdir(item_path):
         shutil.rmtree(item_path)
+
+# sweep any __pycache__ dirs pip may still have generated despite --no-compile
+for root, dirs, _files in os.walk(lib_dir):
+    if "__pycache__" in dirs:
+        shutil.rmtree(os.path.join(root, "__pycache__"))
+        dirs.remove("__pycache__")
 
 # post-install cleanup: remove unwanted folders
 unwanted_dirs = ["bin", "share", "testrun"]

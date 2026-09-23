@@ -41,7 +41,11 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           if [ -f "changelog.md" ]; then
-            sed -n "/^## $VERSION/,/^## /p" changelog.md | sed '1d;$d' > release_notes.md
+            awk -v ver="$VERSION" '
+              $0 ~ "^## " ver "([[:space:]]|$)" { p=1; next }
+              p && /^## / { p=0 }
+              p { print }
+            ' changelog.md > release_notes.md
           fi
           if [ ! -s release_notes.md ]; then
             echo "Release for version $VERSION" > release_notes.md
