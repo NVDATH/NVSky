@@ -12,7 +12,9 @@ if _libDir not in sys.path:
 import wx
 import globalPluginHandler
 import gui
+import speech
 import ui
+import ui as nvdaUi
 import addonHandler
 from logHandler import log
 
@@ -23,12 +25,13 @@ from . import bgsync
 from . import client
 from . import uiutil
 from . import soundpack
+from . import attachments
 from .settings import NVSkySettingsDialog, LoginDialog
 from .feedWindow import *
 from .notificationsWindow import NotificationsWindow
 from .listsWindow import ListsWindow, ListTabWindow, AddListDialog, SubscribeListDialog, ManageMembersDialog, AddToListDialog
 from .exploreWindow import ExploreWindow, StarterPackDetailsDialog
-from .feedTabs import ThreadTabWindow, QuotesTabWindow, ProfileDialog, UserListTabWindow, UserTimelineTabWindow, FeedPreviewTabWindow, SavedWindow
+from .feedTabs import ThreadTabWindow, QuotesTabWindow, ProfileDialog, UserListTabWindow, UserTimelineTabWindow, FeedPreviewTabWindow, SavedWindow, LikesWindow
 from .mainWindow import MainWindow
 from .chatWindow import ChatWindow, ConvoTabWindow
 from .compose import ComposeDialog
@@ -44,7 +47,7 @@ BG_SYNC_TICK_MS = 60_000  # check once a minute which categories are due
 _activePlugin = None
 
 
-def rebuild_main_window_tabs():
+def rebuild_main_window_tabs(focus=False):
     """
     Tells an already-open MainWindow to rebuild every tab against
     whatever account is active now. Confirmed necessary via testing:
@@ -54,7 +57,7 @@ def rebuild_main_window_tabs():
     never found out an account had changed at all.
     """
     if _activePlugin is not None:
-        _activePlugin._rebuildTabs()
+        _activePlugin._rebuildTabs(focus)
 
 
 def get_main_window():
@@ -91,6 +94,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         global _activePlugin
         self._checkLibs()
         self._initDatabase()
+        attachments.cleanup_old_temp_files()
+        self._terminating = False
         self._mainWindow = None
         self._settingsDialog = None
 
@@ -118,8 +123,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._bgSyncTimer.Stop()
         except Exception:
             pass
+        self._terminating = True
         try:
-            soundpack.stop_progress()
+            soundpack.reset_progress()
         except Exception:
             pass
         try:
@@ -139,6 +145,20 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         db.close_all_connections()
         _activePlugin = None
         super().terminate()
+
+    def event_gainFocus(self, obj, nextHandler):
+        try:
+            skip = uiutil.jump_title_suppressed(obj.name)
+            rowText = None if skip else uiutil.jump_row_text_for(obj)
+        except Exception:
+            skip, rowText = False, None
+        if skip:
+            return
+        nextHandler()
+        if rowText:
+            # After Ctrl+J: drop NVDA's own announcement (parent controls) and speak just the row.
+            speech.cancelSpeech()
+            ui.message(rowText)
 
     def _checkLibs(self):
         libsToCheck = [
@@ -225,33 +245,37 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         chatSupported = account is None or bool(account.get("chat_supported", 1))
 
         homeTab = FeedWindow(self._mainWindow.notebook)
-        notificationsTab = NotificationsWindow(self._mainWindow.notebook)
-        exploreTab = ExploreWindow(self._mainWindow.notebook)
-        savedTab = SavedWindow(self._mainWindow.notebook)
-        listsTab = ListsWindow(self._mainWindow.notebook)
 
         # (kind, key, panel, label, removable) -- kind/key double as
         # the identity db.get_tab_order() entries are matched against.
         allTabs = [
             # Translators: Permanent tab label.
             ("permanent", "home", homeTab, _("Home"), False),
-            # Translators: Permanent tab label.
-            ("permanent", "notifications", notificationsTab, _("Notifications"), False),
-            # Translators: Permanent tab label.
-            ("permanent", "explore", exploreTab, _("Explore"), False),
-            # Translators: Permanent tab label.
-            ("permanent", "saved", savedTab, _("Saved"), False),
         ]
-        if chatSupported:
-            chatTab = ChatWindow(self._mainWindow.notebook)
+        enabledTabs = db.get_enabled_tabs()
+        notebook = self._mainWindow.notebook
+        if "notifications" in enabledTabs:
             # Translators: Permanent tab label.
-            allTabs.append(("permanent", "chat", chatTab, _("Chat"), False))
-        else:
+            allTabs.append(("permanent", "notifications", NotificationsWindow(notebook), _("Notifications"), False))
+        if "explore" in enabledTabs:
+            # Translators: Permanent tab label.
+            allTabs.append(("permanent", "explore", ExploreWindow(notebook), _("Explore"), False))
+        if "saved" in enabledTabs:
+            # Translators: Permanent tab label.
+            allTabs.append(("permanent", "saved", SavedWindow(notebook), _("Saved"), False))
+        if "likes" in enabledTabs:
+            # Translators: Permanent tab label.
+            allTabs.append(("permanent", "likes", LikesWindow(notebook), _("Likes"), False))
+        if "chat" in enabledTabs and chatSupported:
+            # Translators: Permanent tab label.
+            allTabs.append(("permanent", "chat", ChatWindow(notebook), _("Chat"), False))
+        elif "chat" in enabledTabs:
             log.info(f"NVSky: chat not supported for {account['handle']}, Chat tab skipped")
             # Translators: Announced when the active account doesn't support DMs, so the Chat tab is hidden.
             nvdaUi.message(_("This account doesn't support direct messages -- the Chat tab has been hidden."))
-        # Translators: Permanent tab label.
-        allTabs.append(("permanent", "lists", listsTab, _("Lists"), False))
+        if "lists" in enabledTabs:
+            # Translators: Permanent tab label.
+            allTabs.append(("permanent", "lists", ListsWindow(notebook), _("Lists"), False))
 
         if account is not None:
             for entry in db.get_open_temp_tabs(account["id"]):
@@ -281,7 +305,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 elif entry.get("type") == "user_list":
                     kind = entry.get("list_kind")
                     userListTab = None
-                    if kind in ("followers", "following"):
+                    if kind in ("followers", "following", "known_followers"):
                         did = entry.get("did")
                         if did:
                             # Translators: Fallback owner label when a restored followers/following tab has no name cached.
@@ -319,16 +343,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                         self._mainWindow.notebook, did, ownerLabel, origin_key=entry.get("origin_key"),
                     )
                     allTabs.append(("user_timeline", did, timelineTab, timelineTab.TAB_NAME, True))
-                elif entry.get("type") == "quotes":
-                    targetUri = entry.get("target_uri")
-                    cachedQuotes = db.get_user_list_cache(account["id"], f"quotes:{targetUri}") if targetUri else None
-                    if not targetUri or cachedQuotes is None:
-                        db.remove_open_temp_tab(account["id"], "quotes", entry.get("key"))
-                        continue
-                    quotesTab = QuotesTabWindow(
-                        self._mainWindow.notebook, targetUri, cachedQuotes, origin_key=entry.get("origin_key"),
-                    )
-                    allTabs.append(("quotes", targetUri, quotesTab, quotesTab.TAB_NAME, True))
                 elif entry.get("type") == "quotes":
                     targetUri = entry.get("target_uri")
                     cachedQuotes = db.get_user_list_cache(account["id"], f"quotes:{targetUri}") if targetUri else None
@@ -466,8 +480,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _onBgSyncCategoryDone(self, category, changed, names):
         if not changed:
             return
-        if category == "notifications":
-            soundpack.play("notification")
+        # "notification" sound covers every category with genuinely
+        # new content, not just the Notifications tab itself -- a new
+        # post appearing in Home/Lists/Chat/etc while background sync
+        # runs deserves the same audible cue.
+        soundpack.play("notification")
         if category in db.get_bg_sync_announce_categories() and names:
             if len(names) == 1:
                 # Translators: Announced when background sync finds a new post in one feed/list. {} is its name.
@@ -505,7 +522,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if category == "notifications":
             return tabKey == "notifications"
         if category == "saved":
-            return tabKey == "saved"
+            return tabKey in ("saved", "likes")
         if category == "chat":
             return tabKey == "chat" or tempType == "conversation"
         if category == "lists":
@@ -580,6 +597,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         targetIndex = self._mainWindow.findTabIndexByIdentity(lastTabIdentity)
         self._mainWindow.activateInitialTab(targetIndex)
         self._mainWindow.Show()
+        soundpack.play("main_open")
 
     def _runInitialFullSync(self):
         # Full sync of every category, ignoring per-category interval
@@ -619,7 +637,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 db.close_all_connections()
             wx.CallAfter(self._onInitialFullSyncDone, changedCategories)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback(check_app_closing=False)
     def _onInitialFullSyncDone(self, changedCategories):
@@ -643,7 +661,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Translators: Announced after the first-login full sync finishes.
         nvdaUi.message(_("Sync complete."))
 
-    def _rebuildTabs(self):
+    def _rebuildTabs(self, focus=False):
         """
         Called via the module-level rebuild_main_window_tabs() when the
         active account changes (Settings > Accounts) while MainWindow
@@ -662,15 +680,34 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         if self._mainWindow is None:
             return
+        notebook = self._mainWindow.notebook
+        previousIndex = notebook.GetSelection()
+        previousIdentity = (
+            self._mainWindow._getTabIdentity(notebook.GetPage(previousIndex)) if previousIndex != wx.NOT_FOUND else None
+        )
+        self._mainWindow._noFocusGrab = not focus
         self._mainWindow._activationSuppressed = True
-        self._mainWindow.notebook.DeleteAllPages()
+        for i in range(notebook.GetPageCount()):
+            for value in vars(notebook.GetPage(i)).values():
+                if isinstance(value, wx.Timer):
+                    value.Stop()
+        notebook.DeleteAllPages()
         self._buildTabs()
-        self._mainWindow._activationSuppressed = False
-        self._mainWindow._updateRemoveTabButton()
+        targetIndex = self._mainWindow.findTabIndexByIdentity(previousIdentity)
+        if focus:
+            self._mainWindow.activateInitialTab(targetIndex)
+        else:
+            if targetIndex != notebook.GetSelection():
+                notebook.SetSelection(targetIndex)
+            self._mainWindow._activationSuppressed = False
+            self._mainWindow._updateRemoveTabButton()
+        wx.CallAfter(setattr, self._mainWindow, "_noFocusGrab", False)
 
     def _onMainWindowClosed(self, evt):
         self._mainWindow = None
         gui.mainFrame.postPopup()
+        if not self._terminating:
+            soundpack.play("main_close")
         evt.Skip()
 
     script_openFeed.__doc__ = _("Open the NVSky main window")

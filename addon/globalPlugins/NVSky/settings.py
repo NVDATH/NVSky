@@ -1,11 +1,13 @@
 """
 NVSky settings UI.
 
-Registers as a category panel inside NVDA's main multi-category Settings
-dialog. Nested wx.Notebook pages, in this order: Accounts, General,
-Display, Sound, Profile.
+Standalone dialog with OK / Cancel / Apply. Nothing is saved until OK or
+Apply: local settings implement apply(), server-backed settings implement
+pendingTasks() (a list of _Task run in one background thread).
+Account actions (add/remove/switch) and Clear all cache stay immediate.
 """
 
+import os
 import re
 import threading
 import webbrowser
@@ -33,6 +35,15 @@ TIME_MODE_CHOICES = [
     ("Full date and time", "absolute"),
     ("Custom format...", "custom"),
 ]
+
+
+class _Task:
+    """One staged server-side change: run(client) on the worker thread, commit() on the UI thread after success."""
+
+    def __init__(self, label, run, commit):
+        self.label = label
+        self.run = run
+        self.commit = commit
 
 
 class LoginDialog(wx.Dialog):
@@ -130,6 +141,7 @@ class LoginDialog(wx.Dialog):
         self.result = account
         self.EndModal(wx.ID_OK)
 
+
 class AccountsPanel(wx.Panel):
     def __init__(self, parent, onAccountChanged=None):
         super().__init__(parent)
@@ -150,13 +162,13 @@ class AccountsPanel(wx.Panel):
         buttonRow = wx.BoxSizer(wx.HORIZONTAL)
         # Translators: Button to log into and add a new Bluesky account.
         self.addButton = wx.Button(self, label=_("&Add account..."))
-        # Translators: Button to remove the selected Bluesky account.
-        self.removeButton = wx.Button(self, label=_("&Remove account"))
         # Translators: Button to make the selected account the active one.
         self.setActiveButton = wx.Button(self, label=_("&Set as active"))
+        # Translators: Button to remove the selected Bluesky account.
+        self.removeButton = wx.Button(self, label=_("&Remove account"))
         buttonRow.Add(self.addButton, flag=wx.RIGHT, border=5)
-        buttonRow.Add(self.removeButton, flag=wx.RIGHT, border=5)
-        buttonRow.Add(self.setActiveButton)
+        buttonRow.Add(self.setActiveButton, flag=wx.RIGHT, border=5)
+        buttonRow.Add(self.removeButton)
         sizer.Add(buttonRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
         self.SetSizer(sizer)
@@ -189,10 +201,6 @@ class AccountsPanel(wx.Panel):
         self.Layout()
 
     def onTabActivated(self):
-        # Single deliberate real-focus grab, once, matching MainWindow's
-        # own tab-activation pattern -- replaces relying on native
-        # Tab-key traversal into accountList (the old double-announce
-        # trigger when this lived inside NVDA's nested Settings notebook).
         if self._accounts:
             self.accountList.SetFocus()
         else:
@@ -213,12 +221,6 @@ class AccountsPanel(wx.Panel):
             self.accountList.SetFocus()
             # Translators: Announced after successfully logging into a new account. {} is the account handle.
             nvdaUi.message(_("Logged in as {}").format(dlg.result["handle"]))
-            # This call was missing entirely -- onSetActive already had
-            # it, but a fresh login via "Add account..." never told
-            # anything it had happened. Confirmed as the cause of
-            # "removed the only account, logged back in, still looks
-            # stuck" -- an already-open MainWindow's tabs never found
-            # out a new account existed.
             if self._onAccountChanged:
                 self._onAccountChanged()
         dlg.Destroy()
@@ -264,6 +266,7 @@ class AccountsPanel(wx.Panel):
         if self._onAccountChanged:
             self._onAccountChanged()
 
+
 ENTER_ACTION_CHOICES = [
     ("view_thread", "View thread"),
     ("reply", "Reply"),
@@ -276,12 +279,12 @@ ENTER_ACTION_CHOICES = [
 BG_SYNC_CATEGORY_LABELS = [
     # Translators: Background sync category label (Home feed).
     ("home", _("Home")),
-    # Translators: Background sync category label (Chat).
-    ("chat", _("Chat")),
     # Translators: Background sync category label (Notifications).
     ("notifications", _("Notifications")),
     # Translators: Background sync category label (Saved posts).
-    ("saved", _("Saved")),
+    ("saved", _("Saved / Likes")),
+    # Translators: Background sync category label (Chat).
+    ("chat", _("Chat")),
     # Translators: Background sync category label (Lists).
     ("lists", _("Lists")),
     # Translators: Background sync category label (search results / feed previews).
@@ -292,10 +295,7 @@ BG_SYNC_CATEGORY_LABELS = [
     ("thread", _("Thread")),
 ]
 
-# Human-readable label per soundpack.EVENT_KEYS entry -- keys not
-# listed here fall back to the raw key string (shouldn't normally
-# happen, just a safety net if EVENT_KEYS gains an entry before this
-# dict is updated to match).
+# Human-readable label per soundpack.EVENT_KEYS entry.
 SOUND_EVENT_LABELS = {
     # Translators: Sound event label.
     "like": _("Like"),
@@ -337,6 +337,12 @@ SOUND_EVENT_LABELS = {
     "ready": _("Sync / loading finished"),
     # Translators: Sound event label.
     "max_length": _("Text exceeds the length limit"),
+    # Translators: Sound event label.
+    "content_warning": _("Content-warned post focused"),
+    # Translators: Sound event label.
+    "main_open": _("NVSky window opened"),
+    # Translators: Sound event label.
+    "main_close": _("NVSky window closed"),
 }
 
 
@@ -345,22 +351,14 @@ class GeneralPanel(wx.Panel):
         super().__init__(parent)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        note = wx.StaticText(
-            self,
-            # Translators: Explanatory note at the top of Settings > General.
-            label=_("Check intervals are saved but not applied automatically yet -- "
-                    "\"Check for updates\" in the feed window is still manual for now."),
-        )
-        sizer.Add(note, flag=wx.ALL, border=10)
-
         # Translators: Label for the Enter-key-action dropdown in Settings > General.
         enterLabel = wx.StaticText(self, label=_("Enter &key action on a post:"))
         sizer.Add(enterLabel, flag=wx.LEFT | wx.TOP, border=10)
 
-        self.enterActionChoice = wx.Choice(self, choices=[label for _, label in ENTER_ACTION_CHOICES])
+        self.enterActionChoice = wx.Choice(self, choices=[label for _key, label in ENTER_ACTION_CHOICES])
         currentEnterAction = db.get_ui_state("enter_action") or "view_thread"
         selectedIndex = next(
-            (i for i, (key, _) in enumerate(ENTER_ACTION_CHOICES) if key == currentEnterAction), 0
+            (i for i, (key, _label) in enumerate(ENTER_ACTION_CHOICES) if key == currentEnterAction), 0
         )
         self.enterActionChoice.SetSelection(selectedIndex)
         sizer.Add(self.enterActionChoice, flag=wx.LEFT | wx.TOP, border=10)
@@ -392,12 +390,12 @@ class GeneralPanel(wx.Panel):
         bgSyncFields = [
             # Translators: Background sync category label (Home feed).
             ("home", _("&Home")),
-            # Translators: Background sync category label (Chat).
-            ("chat", _("&Chat")),
             # Translators: Background sync category label (Notifications).
             ("notifications", _("&Notifications")),
             # Translators: Background sync category label (Saved posts).
-            ("saved", _("&Saved")),
+            ("saved", _("&Saved / Likes")),
+            # Translators: Background sync category label (Chat).
+            ("chat", _("&Chat")),
             # Translators: Background sync category label (Lists).
             ("lists", _("&Lists")),
             # Translators: Background sync category label (search results / feed previews).
@@ -420,9 +418,6 @@ class GeneralPanel(wx.Panel):
             sizer.Add(row, flag=wx.LEFT | wx.TOP, border=10)
             self._bgSyncSpins[category] = spin
 
-        # Operates on the active account -- lives here rather than the
-        # Accounts tab since it's a maintenance action, not account
-        # management.
         # Translators: Label above the "clear all cache" section in Settings > General.
         cacheLabel = wx.StaticText(self, label=_("All cached data (active account):"))
         sizer.Add(cacheLabel, flag=wx.LEFT | wx.TOP, border=10)
@@ -442,22 +437,17 @@ class GeneralPanel(wx.Panel):
 
         self.SetSizer(sizer)
 
-        self.enterActionChoice.Bind(wx.EVT_CHOICE, self.onChanged)
         self.clearCacheButton.Bind(wx.EVT_BUTTON, self.onClearCache)
-        for spin in self._bgSyncSpins.values():
-            spin.Bind(wx.EVT_SPINCTRL, self.onChanged)
-        self.bgSyncAnnounceList.Bind(wx.EVT_CHECKLISTBOX, self.onChanged)
 
     def onTabActivated(self):
         self.enterActionChoice.SetFocus()
 
-    def onChanged(self, evt):
+    def apply(self):
         db.set_ui_state("enter_action", ENTER_ACTION_CHOICES[self.enterActionChoice.GetSelection()][0])
         for category, spin in self._bgSyncSpins.items():
             db.set_bg_sync_interval(category, spin.GetValue())
         checkedCategories = {BG_SYNC_CATEGORY_LABELS[i][0] for i in self.bgSyncAnnounceList.CheckedItems}
         db.set_bg_sync_announce_categories(checkedCategories)
-        evt.Skip()
 
     def onClearCache(self, evt):
         account = db.get_active_account()
@@ -484,13 +474,7 @@ class GeneralPanel(wx.Panel):
         # Translators: Announced after clearing all cached data. {} is the account handle.
         nvdaUi.message(_("All cache cleared for {}").format(account["handle"]))
 
-        from . import rebuild_main_window_tabs
-        rebuild_main_window_tabs()
-
-        # If MainWindow is open, rebuild every tab from scratch so it
-        # reflects the now-empty cache immediately instead of showing
-        # stale in-memory data until the next manual switch/restart --
-        # same rebuild path used when the active account changes.
+        # Rebuild every tab so it reflects the now-empty cache.
         from . import rebuild_main_window_tabs
         rebuild_main_window_tabs()
 
@@ -500,17 +484,23 @@ class DisplayPanel(wx.Panel):
         super().__init__(parent)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Translators: Label for the "show author as display name or handle" radio group.
+        # Translators: Label for the feed sort-order dropdown.
+        sortLabel = wx.StaticText(self, label=_("Feed &order:"))
+        sizer.Add(sortLabel, flag=wx.LEFT | wx.TOP, border=10)
+        # Translators: Sort-order dropdown choices: newest posts first, oldest posts first.
+        self.sortOrderChoice = wx.Choice(self, choices=[_("Newest first"), _("Oldest first")])
+        currentSort = db.get_ui_state("sort_order") or "newest_first"
+        self.sortOrderChoice.SetSelection(0 if currentSort == "newest_first" else 1)
+        sizer.Add(self.sortOrderChoice, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+
+        # Translators: Label for the "show author as display name or handle" dropdown.
         authorLabel = wx.StaticText(self, label=_("Show &author as:"))
         sizer.Add(authorLabel, flag=wx.LEFT | wx.TOP, border=10)
-        self.authorModeRadio = wx.RadioBox(
-            # Translators: Radio option: show the author's display name.
-            # Translators: Radio option: show the author's @handle instead of display name.
-            self, choices=[_("Display name"), _("Handle")], majorDimension=1, style=wx.RA_SPECIFY_ROWS
-        )
+        # Translators: Author dropdown choices: the author's display name, the author's @handle.
+        self.authorModeChoice = wx.Choice(self, choices=[_("Display name"), _("Handle")])
         authorMode = db.get_ui_state("column1_display") or "display_name"
-        self.authorModeRadio.SetSelection(0 if authorMode == "display_name" else 1)
-        sizer.Add(self.authorModeRadio, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        self.authorModeChoice.SetSelection(0 if authorMode == "display_name" else 1)
+        sizer.Add(self.authorModeChoice, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
 
         # Translators: Label for the post-time-format dropdown.
         timeLabel = wx.StaticText(self, label=_("Post &time format:"))
@@ -519,6 +509,7 @@ class DisplayPanel(wx.Panel):
         currentMode = db.get_ui_state("time_format_mode") or "relative_24h"
         modeValues = [value for _label, value in TIME_MODE_CHOICES]
         self.timeModeChoice.SetSelection(modeValues.index(currentMode) if currentMode in modeValues else 0)
+        self.timeModeChoice.Bind(wx.EVT_CHOICE, lambda e: self._updateCustomPatternState())
         sizer.Add(self.timeModeChoice, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
 
         customLabel = wx.StaticText(
@@ -533,37 +524,115 @@ class DisplayPanel(wx.Panel):
         sizer.Add(self.customPatternCtrl, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, border=10)
 
         # Translators: Button that opens the strftime format reference page in a browser.
-        formatHelpButton = wx.Button(self, label=_("&strftime format reference..."))
-        formatHelpButton.Bind(wx.EVT_BUTTON, self.onFormatHelp)
-        sizer.Add(formatHelpButton, flag=wx.LEFT | wx.TOP, border=10)
+        self.formatHelpButton = wx.Button(self, label=_("&strftime format reference..."))
+        self.formatHelpButton.Bind(wx.EVT_BUTTON, self.onFormatHelp)
+        sizer.Add(self.formatHelpButton, flag=wx.LEFT | wx.TOP, border=10)
+        self._updateCustomPatternState()
 
-        # Translators: Label for the feed sort-order radio group.
-        sortLabel = wx.StaticText(self, label=_("Feed &order:"))
-        sizer.Add(sortLabel, flag=wx.LEFT | wx.TOP, border=10)
-        self.sortOrderRadio = wx.RadioBox(
-            # Translators: Radio option: show newest posts first.
-            # Translators: Radio option: show oldest posts first.
-            self, choices=[_("Newest first"), _("Oldest first")], majorDimension=1, style=wx.RA_SPECIFY_ROWS
+        # Translators: Label above the tabs checklist in Settings > Display.
+        tabsLabel = wx.StaticText(self, label=_("Show these ta&bs (Home is always shown):"))
+        sizer.Add(tabsLabel, flag=wx.LEFT | wx.TOP, border=10)
+        self.tabsList = gui.nvdaControls.CustomCheckListBox(
+            self, choices=[label for _key, label in OPTIONAL_TAB_CHOICES]
         )
-        currentSort = db.get_ui_state("sort_order") or "newest_first"
-        self.sortOrderRadio.SetSelection(0 if currentSort == "newest_first" else 1)
-        sizer.Add(self.sortOrderRadio, flag=wx.LEFT | wx.RIGHT | wx.TOP | wx.BOTTOM, border=10)
+        enabledTabs = db.get_enabled_tabs()
+        self.tabsList.CheckedItems = [
+            i for i, (key, _label) in enumerate(OPTIONAL_TAB_CHOICES) if key in enabledTabs
+        ]
+        self.tabsList.SetSelection(0)
+        sizer.Add(self.tabsList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP | wx.BOTTOM, border=10)
+
+        contentLabelNote = wx.StaticText(
+            self,
+            # Translators: Explanatory note above the content-label visibility list.
+            label=_(
+                "The first row turns adult content on or off, as in Bluesky's own settings; "
+                "while it is off, the adult categories (all except Nudity) are hidden. "
+                "Press Space on a row to cycle Show -> Warn -> Hide. \"Warn\" hides "
+                "the post's text and embed behind a content-warning placeholder -- "
+                "press Ctrl+Space on the focused post (in a feed) to hear it once. "
+                "\"Hide\" removes the post from feeds entirely. "
+                "Changes are saved when you press OK or Apply."
+            ),
+        )
+        contentLabelNote.Wrap(500)
+        sizer.Add(contentLabelNote, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+
+        # Translators: Status text while content label settings load.
+        self.contentLabelStatusLabel = wx.StaticText(self, label=_("Loading content label settings..."))
+        sizer.Add(self.contentLabelStatusLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+
+        # Translators: Label above the content-label categories list.
+        contentLabelListLabel = wx.StaticText(self, label=_("Content &label categories:"))
+        sizer.Add(contentLabelListLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        self.contentLabelList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        # Translators: Column header for a content label's display name.
+        self.contentLabelList.InsertColumn(0, _("Category"), width=220)
+        # Translators: Column header for a content label's current visibility.
+        self.contentLabelList.InsertColumn(1, _("Visibility"), width=120)
+        sizer.Add(self.contentLabelList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP | wx.BOTTOM, border=10)
+
+        notificationNote = wx.StaticText(
+            self,
+            # Translators: Explanatory note above the notification categories list.
+            label=_(
+                "Controls which activity notifies you (server-side -- affects the "
+                "official app too). Press Space on a row to cycle Off, Everyone, "
+                "People you follow (or just Off/On for categories with no filter). "
+                "Changes are saved when you press OK or Apply."
+            ),
+        )
+        notificationNote.Wrap(500)
+        sizer.Add(notificationNote, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+
+        # Translators: Status text while notification settings load.
+        self.notificationStatusLabel = wx.StaticText(self, label=_("Loading notification settings..."))
+        sizer.Add(self.notificationStatusLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+
+        # Translators: Label above the notification categories list.
+        notificationListLabel = wx.StaticText(self, label=_("&Notify me about:"))
+        sizer.Add(notificationListLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        self.notificationCategoryList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        # Translators: Column header for a notification category's name.
+        self.notificationCategoryList.InsertColumn(0, _("Category"), width=260)
+        # Translators: Column header for a notification category's current setting.
+        self.notificationCategoryList.InsertColumn(1, _("Notify from"), width=140)
+        sizer.Add(self.notificationCategoryList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP | wx.BOTTOM, border=10)
 
         self.SetSizer(sizer)
 
-        self.authorModeRadio.Bind(wx.EVT_RADIOBOX, self.onChanged)
-        self.timeModeChoice.Bind(wx.EVT_CHOICE, self.onChanged)
-        self.customPatternCtrl.Bind(wx.EVT_TEXT, self.onChanged)
-        self.sortOrderRadio.Bind(wx.EVT_RADIOBOX, self.onChanged)
+        self.contentLabelList.Bind(wx.EVT_CHAR_HOOK, self.onContentLabelCharHook)
+        self.notificationCategoryList.Bind(wx.EVT_CHAR_HOOK, self.onNotificationCategoryCharHook)
+
+        self.tabsChanged = False
+        self._contentLabelPrefs = {}
+        self._contentLabelBaseline = {}
+        self._contentLabelReady = False
+        self._contentLabelLoadedOnce = False
+        self._notificationPrefs = {}
+        self._notificationBaseline = {}
+        self._notificationReady = False
+        self._notificationLoadedOnce = False
 
     def onTabActivated(self):
-        self.authorModeRadio.SetFocus()
+        self.sortOrderChoice.SetFocus()
+        if not self._contentLabelLoadedOnce:
+            self._contentLabelLoadedOnce = True
+            self._loadContentLabelPrefs()
+        if not self._notificationLoadedOnce:
+            self._notificationLoadedOnce = True
+            self._loadNotificationPrefs()
+
+    def _updateCustomPatternState(self):
+        isCustom = TIME_MODE_CHOICES[self.timeModeChoice.GetSelection()][1] == "custom"
+        self.customPatternCtrl.Enable(isCustom)
+        self.formatHelpButton.Enable(isCustom)
 
     def onFormatHelp(self, evt):
         webbrowser.open(STRFTIME_REFERENCE_URL)
 
-    def onChanged(self, evt):
-        authorMode = "display_name" if self.authorModeRadio.GetSelection() == 0 else "handle"
+    def apply(self):
+        authorMode = "display_name" if self.authorModeChoice.GetSelection() == 0 else "handle"
         db.set_ui_state("column1_display", authorMode)
 
         timeMode = TIME_MODE_CHOICES[self.timeModeChoice.GetSelection()][1]
@@ -572,28 +641,290 @@ class DisplayPanel(wx.Panel):
         db.set_ui_state("time_format_custom_pattern", self.customPatternCtrl.GetValue())
         timeutils.invalidate_time_format_cache()
 
-        sortOrder = "newest_first" if self.sortOrderRadio.GetSelection() == 0 else "oldest_first"
+        sortOrder = "newest_first" if self.sortOrderChoice.GetSelection() == 0 else "oldest_first"
         db.set_ui_state("sort_order", sortOrder)
-        evt.Skip()
+
+        checkedTabs = {OPTIONAL_TAB_CHOICES[i][0] for i in self.tabsList.CheckedItems}
+        if checkedTabs != db.get_enabled_tabs():
+            db.set_enabled_tabs(checkedTabs)
+            self.tabsChanged = True
+
+    def pendingTasks(self):
+        return self._contentLabelTasks() + self._notificationTasks()
+
+    # ---------------- content label visibility ----------------
+
+    def _adultContentEnabled(self):
+        return self._contentLabelPrefs.get(client.ADULT_CONTENT_PREF_KEY, True)
+
+    def _renderContentLabels(self, target_index=None):
+        previouslyFocused = self.contentLabelList.GetFocusedItem()
+        self.contentLabelList.Freeze()
+        try:
+            self.contentLabelList.DeleteAllItems()
+            adultOn = self._adultContentEnabled()
+            # Translators: First row of the content label list, the master adult-content switch.
+            self.contentLabelList.InsertItem(0, _("Adult content"))
+            # Translators: State of the adult-content switch.
+            self.contentLabelList.SetItem(0, 1, _("Enabled") if adultOn else _("Disabled"))
+            for i, key in enumerate(client.CONTENT_LABEL_KEYS, start=1):
+                self.contentLabelList.InsertItem(i, CONTENT_LABEL_DISPLAY_NAMES.get(key, key))
+                if key in client.CONTENT_LABEL_ADULT_ONLY and not adultOn:
+                    # Translators: Visibility shown for a content label while adult content is off.
+                    visLabel = _("Hidden (adult content is off)")
+                else:
+                    visibility = client.label_setting(self._contentLabelPrefs, key)
+                    visLabel = dict(CONTENT_LABEL_VISIBILITY_CHOICES).get(visibility, visibility)
+                self.contentLabelList.SetItem(i, 1, visLabel)
+
+            if target_index is not None:
+                index = target_index
+            elif previouslyFocused != -1:
+                index = previouslyFocused
+            else:
+                index = 0
+            index = max(0, min(index, len(client.CONTENT_LABEL_KEYS)))
+            self.contentLabelList.Focus(index)
+            self.contentLabelList.Select(index)
+        finally:
+            self.contentLabelList.Thaw()
+
+    def _loadContentLabelPrefs(self):
+        # Translators: Status text while content label settings load.
+        self.contentLabelStatusLabel.SetLabel(_("Loading content label settings..."))
+        soundpack.start_progress()
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                prefs = client.get_content_label_prefs(atprotoClient)
+                error = None
+            except Exception as e:
+                prefs = None
+                error = str(e)
+            wx.CallAfter(self._onContentLabelPrefsLoaded, prefs, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback(check_app_closing=False)
+    def _onContentLabelPrefsLoaded(self, prefs, error):
+        soundpack.stop_progress()
+        if error:
+            # Translators: Status text when loading content label settings fails. {} is the error message.
+            self.contentLabelStatusLabel.SetLabel(_("Could not load content label settings: {}").format(error))
+            return
+        self._contentLabelPrefs = dict(prefs or {})
+        self._contentLabelBaseline = dict(self._contentLabelPrefs)
+        self._contentLabelReady = True
+        account = db.get_active_account()
+        if account is not None:
+            db.set_content_label_prefs_cache(account["id"], self._contentLabelPrefs)
+        self._renderContentLabels(target_index=0)
+        # Translators: Status text after content label settings finish loading.
+        self.contentLabelStatusLabel.SetLabel(_("Content label settings loaded."))
+
+    def reloadContentLabels(self):
+        # Account switched: pending edits belong to the old account, drop them.
+        self._contentLabelLoadedOnce = True
+        self._contentLabelReady = False
+        self._contentLabelPrefs = {}
+        self._contentLabelBaseline = {}
+        self._loadContentLabelPrefs()
+
+    def onContentLabelCharHook(self, evt):
+        # EVT_CHAR_HOOK, not EVT_LIST_KEY_DOWN: a plain ListCtrl consumes Space natively first.
+        if evt.GetKeyCode() != wx.WXK_SPACE or evt.HasAnyModifiers():
+            evt.Skip()
+            return
+        if self.FindFocus() is not self.contentLabelList:
+            evt.Skip()
+            return
+        index = self.contentLabelList.GetFocusedItem()
+        if index == -1 or index > len(client.CONTENT_LABEL_KEYS):
+            return
+        if not self._contentLabelReady:
+            # Translators: Announced when a settings list is changed before its data finished loading.
+            nvdaUi.message(_("Still loading, please wait."))
+            return
+        if index == 0:
+            self._contentLabelPrefs[client.ADULT_CONTENT_PREF_KEY] = not self._adultContentEnabled()
+            self._renderContentLabels(target_index=index)
+            return
+        labelKey = client.CONTENT_LABEL_KEYS[index - 1]
+        if labelKey in client.CONTENT_LABEL_ADULT_ONLY and not self._adultContentEnabled():
+            # Translators: Announced when changing a content label while adult content is off.
+            nvdaUi.message(_("Turn adult content on first."))
+            return
+        previousVisibility = client.label_setting(self._contentLabelPrefs, labelKey)
+        order = [k for k, _n in CONTENT_LABEL_VISIBILITY_CHOICES]
+        currentPos = order.index(previousVisibility) if previousVisibility in order else 0
+        self._contentLabelPrefs[labelKey] = order[(currentPos + 1) % len(order)]
+        self._renderContentLabels(target_index=index)
+
+    def _contentLabelTasks(self):
+        if not self._contentLabelReady:
+            return []
+        changes = {}
+        adultNow = self._adultContentEnabled()
+        if adultNow != self._contentLabelBaseline.get(client.ADULT_CONTENT_PREF_KEY, True):
+            changes[client.ADULT_CONTENT_PREF_KEY] = adultNow
+        for key in client.CONTENT_LABEL_KEYS:
+            now = client.label_setting(self._contentLabelPrefs, key)
+            if now != client.label_setting(self._contentLabelBaseline, key):
+                changes[key] = now
+        if not changes:
+            return []
+        snapshot = dict(self._contentLabelPrefs)
+
+        def run(atprotoClient):
+            for key, value in changes.items():
+                if key == client.ADULT_CONTENT_PREF_KEY:
+                    client.set_adult_content_enabled(atprotoClient, value)
+                else:
+                    client.set_content_label_pref(atprotoClient, key, value)
+
+        def commit():
+            self._contentLabelBaseline = dict(snapshot)
+            account = db.get_active_account()
+            if account is not None:
+                db.set_content_label_prefs_cache(account["id"], snapshot)
+
+        # Translators: Name of a settings group, used in "Could not save: {}" messages.
+        return [_Task(_("content labels"), run, commit)]
+
+    # ---------------- notification preferences ----------------
+
+    def _notificationStateFor(self, category, pref):
+        if not pref.get("list"):
+            return "off"
+        if category in client.NOTIFICATION_FILTERABLE_CATEGORIES:
+            return "following" if pref.get("include") == "follows" else "everyone"
+        return "on"
+
+    def _renderNotificationPrefs(self, target_index=None):
+        previouslyFocused = self.notificationCategoryList.GetFocusedItem()
+        self.notificationCategoryList.Freeze()
+        try:
+            self.notificationCategoryList.DeleteAllItems()
+            for i, category in enumerate(client.NOTIFICATION_ALL_CATEGORIES):
+                self.notificationCategoryList.InsertItem(i, NOTIFICATION_CATEGORY_DISPLAY_NAMES.get(category, category))
+                pref = self._notificationPrefs.get(category, {})
+                state = self._notificationStateFor(category, pref)
+                self.notificationCategoryList.SetItem(i, 1, NOTIFICATION_STATE_DISPLAY_NAMES.get(state, state))
+
+            if target_index is not None:
+                index = target_index
+            elif previouslyFocused != -1:
+                index = previouslyFocused
+            else:
+                index = 0
+            index = max(0, min(index, len(client.NOTIFICATION_ALL_CATEGORIES) - 1))
+            self.notificationCategoryList.Focus(index)
+            self.notificationCategoryList.Select(index)
+        finally:
+            self.notificationCategoryList.Thaw()
+
+    def _loadNotificationPrefs(self):
+        # Translators: Status text while notification settings load.
+        self.notificationStatusLabel.SetLabel(_("Loading notification settings..."))
+        soundpack.start_progress()
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                prefs = client.get_notification_prefs(atprotoClient)
+                error = None
+            except Exception as e:
+                prefs = None
+                error = str(e)
+            wx.CallAfter(self._onNotificationPrefsLoaded, prefs, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback(check_app_closing=False)
+    def _onNotificationPrefsLoaded(self, prefs, error):
+        soundpack.stop_progress()
+        if error:
+            # Translators: Status text when loading notification settings fails. {} is the error message.
+            self.notificationStatusLabel.SetLabel(_("Could not load notification settings: {}").format(error))
+            return
+        self._notificationPrefs = {k: dict(v) for k, v in (prefs or {}).items()}
+        self._notificationBaseline = {k: dict(v) for k, v in self._notificationPrefs.items()}
+        self._notificationReady = True
+        self._renderNotificationPrefs(target_index=0)
+        # Translators: Status text after notification settings finish loading.
+        self.notificationStatusLabel.SetLabel(_("Notification settings loaded."))
+
+    def reloadNotificationPrefs(self):
+        # Account switched: pending edits belong to the old account, drop them.
+        self._notificationLoadedOnce = True
+        self._notificationReady = False
+        self._notificationPrefs = {}
+        self._notificationBaseline = {}
+        self._loadNotificationPrefs()
+
+    def onNotificationCategoryCharHook(self, evt):
+        if evt.GetKeyCode() != wx.WXK_SPACE or evt.HasAnyModifiers():
+            evt.Skip()
+            return
+        if self.FindFocus() is not self.notificationCategoryList:
+            evt.Skip()
+            return
+        index = self.notificationCategoryList.GetFocusedItem()
+        if index == -1 or index >= len(client.NOTIFICATION_ALL_CATEGORIES):
+            return
+        if not self._notificationReady:
+            nvdaUi.message(_("Still loading, please wait."))
+            return
+        category = client.NOTIFICATION_ALL_CATEGORIES[index]
+        current = self._notificationPrefs.get(category, {})
+        isFilterable = category in client.NOTIFICATION_FILTERABLE_CATEGORIES
+        order = ["off", "everyone", "following"] if isFilterable else ["off", "on"]
+        currentState = self._notificationStateFor(category, current)
+        currentPos = order.index(currentState) if currentState in order else 0
+        newState = order[(currentPos + 1) % len(order)]
+
+        if newState == "off":
+            newListEnabled, newInclude = False, current.get("include")
+        elif newState == "on":
+            newListEnabled, newInclude = True, None
+        elif newState == "everyone":
+            newListEnabled, newInclude = True, "all"
+        else:  # "following"
+            newListEnabled, newInclude = True, "follows"
+
+        self._notificationPrefs[category] = {
+            "list": newListEnabled, "include": newInclude, "push": current.get("push", False),
+        }
+        self._renderNotificationPrefs(target_index=index)
+
+    def _notificationTasks(self):
+        if not self._notificationReady:
+            return []
+        changed = any(
+            self._notificationStateFor(c, self._notificationPrefs.get(c, {}))
+            != self._notificationStateFor(c, self._notificationBaseline.get(c, {}))
+            for c in client.NOTIFICATION_ALL_CATEGORIES
+        )
+        if not changed:
+            return []
+        snapshot = {k: dict(v) for k, v in self._notificationPrefs.items()}
+
+        def run(atprotoClient):
+            # set_notification_category writes every category from snapshot; its other arguments are unused.
+            client.set_notification_category(atprotoClient, snapshot, "follow", False, False)
+
+        def commit():
+            self._notificationBaseline = {k: dict(v) for k, v in snapshot.items()}
+
+        # Translators: Name of a settings group, used in "Could not save: {}" messages.
+        return [_Task(_("notification settings"), run, commit)]
+
 
 class FeedManagerPanel(wx.Panel):
-    """Settings > NVSky > Feed manager. List/reorder/pin/remove the
-    account's subscribed feeds (savedFeedsPrefV2, read+write via
-    client.py's get_saved_feeds_pref/reorder_saved_feeds/
-    set_feed_pinned/remove_feed_from_saved), plus a Browse & add
-    dialog (FeedBrowseDialog, feedWindow.py) reusing the same search
-    Explore's Feeds tab uses.
-    Renders from db's local saved-feeds cache immediately on open
-    (synchronous, before the panel is even shown) and refreshes from
-    the server silently in the background -- avoids blocking the
-    Settings dialog on a getPreferences+getFeedGenerators round trip
-    every time this page is opened. Every action (move/pin/remove) is
-    optimistic: the local list (and its cache) update immediately,
-    the server call happens in the background.
-    NOTE: browsed/managed feeds aren't wired into a Home tab filter
-    dropdown yet -- this panel only manages the saved-feeds list
-    itself, next step is making a saved feed actually viewable from
-    Home."""
+    """Settings > Feed manager. Reorder/pin/remove subscribed feeds; changes are
+    staged in self._feeds and sent on OK/Apply via the existing per-action writers.
+    self._baselineFeeds is what the server had when last loaded/saved."""
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -601,6 +932,7 @@ class FeedManagerPanel(wx.Panel):
         self._accountId = account["id"] if account else None
         # list of dicts: uri/display_name/creator_handle/pinned
         self._feeds = db.get_saved_feeds_cache(self._accountId) if self._accountId else []
+        self._baselineFeeds = [dict(f) for f in self._feeds]
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -637,12 +969,7 @@ class FeedManagerPanel(wx.Panel):
 
         self.SetSizer(sizer)
 
-        hasCached = bool(self._feeds)
-        for btn in (self.moveUpButton, self.moveDownButton, self.togglePinButton, self.removeButton):
-            if hasCached:
-                btn.Enable()
-            else:
-                btn.Disable()
+        self._setButtonsEnabled(bool(self._feeds))
 
         self.moveUpButton.Bind(wx.EVT_BUTTON, lambda evt: self.onMove(-1))
         self.moveDownButton.Bind(wx.EVT_BUTTON, lambda evt: self.onMove(1))
@@ -650,76 +977,50 @@ class FeedManagerPanel(wx.Panel):
         self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
         self.feedList.Bind(wx.EVT_LIST_ITEM_FOCUSED, lambda evt: (self._updatePinButtonLabel(), evt.Skip()))
 
-        # Render row 0 synchronously right now (Focus()/Select() only --
-        # see _render's docstring) -- same pattern as every other
-        # ListCtrl-backed panel in this dialog (MutedWordsPanel etc):
-        # Focus()/Select() alone, before this panel ever has real OS
-        # focus, is silent (doesn't fire a native focus-changed event),
-        # so there's no EVT_SET_FOCUS workaround needed here anymore now
-        # that this panel lives in its own standalone dialog instead of
-        # nested inside NVDA's own Settings notebook.
-        # Translators: Status text showing how many feeds are subscribed. {} is the count.
-        self.statusLabel.SetLabel(_("{} subscribed feed(s).").format(len(self._feeds)) if hasCached else _("Loading your feeds..."))
+        self._updateStatus()
         self._render(target_index=0)
 
-        # Deliberately NOT calling self._refresh() here anymore -- see
-        # onTabActivated below. Starting the background network sync
-        # eagerly at construction time (while some OTHER tab, e.g.
-        # Accounts, is still the one actually shown) meant it often
-        # finished BEFORE the user ever tabbed over here, so its
-        # completion handler's re-render landed in the same instant as
-        # onTabActivated's own deliberate feedList.SetFocus() -- two
-        # focus-worthy events on the same row, double-announced.
+        # The background refresh starts on first activation, not here, so it
+        # can't land at the same instant as the deliberate focus grab.
         self._refreshedOnce = False
 
+    def _setButtonsEnabled(self, enabled):
+        for btn in (self.moveUpButton, self.moveDownButton, self.togglePinButton, self.removeButton):
+            btn.Enable(enabled)
+
+    def _updateStatus(self):
+        if self._feeds or self._baselineFeeds:
+            # Translators: Status text showing how many feeds are subscribed. {} is the count.
+            self.statusLabel.SetLabel(_("{} subscribed feed(s).").format(len(self._feeds)))
+        else:
+            self.statusLabel.SetLabel(_("Loading your feeds..."))
+
     def reload(self):
-        # Account switched -- re-key the cache and start over the same
-        # way __init__ does (cached data first, then a silent refresh).
+        # Account switched: pending edits belong to the old account, drop them.
         account = db.get_active_account()
         self._accountId = account["id"] if account else None
         self._feeds = db.get_saved_feeds_cache(self._accountId) if self._accountId else []
-        hasCached = bool(self._feeds)
-        for btn in (self.moveUpButton, self.moveDownButton, self.togglePinButton, self.removeButton):
-            btn.Enable() if hasCached else btn.Disable()
-        self.statusLabel.SetLabel(_("{} subscribed feed(s).").format(len(self._feeds)) if hasCached else _("Loading your feeds..."))
+        self._baselineFeeds = [dict(f) for f in self._feeds]
+        self._setButtonsEnabled(bool(self._feeds))
+        self._updateStatus()
         self._render(target_index=0)
         self._refreshedOnce = False
 
     def onTabActivated(self):
-        # Unconditional, matching MutedWordsPanel's proven-working
-        # pattern -- SetFocus() on an empty ListCtrl is a harmless
-        # no-op (nothing to announce), no need to gate on self._feeds.
         self.feedList.SetFocus()
         if not self._refreshedOnce:
             self._refreshedOnce = True
             self._refresh()
 
     def _stillAlive(self):
-        # Best-effort guard against the Settings dialog having been
-        # closed while a background load/save was still in flight --
-        # doesn't fully rule out the NVDA-side "refreshGui on a
-        # destroyed sizer" crash (that happens inside NVDA's own later
-        # wx.CallAfter, outside this function's try/except reach), but
-        # avoids doing any further UI work once the dialog is gone,
-        # which is what triggers that stale callback in the first
-        # place.
         try:
             top = wx.GetTopLevelParent(self)
             return bool(top) and not top.IsBeingDeleted()
         except RuntimeError:
             return False
 
-    def _persistCache(self):
-        if self._accountId is not None:
-            db.set_saved_feeds_cache(self._accountId, self._feeds)
-
     def _notifyHomeFeedsChanged(self):
-        # Best-effort: if MainWindow's Home tab is currently open, tell
-        # it to rebuild its filter dropdown right away so an added/
-        # removed/reordered feed shows up without needing NVSky
-        # reopened. Silently does nothing if MainWindow isn't open --
-        # Home will just pick up the current db cache next time it's
-        # constructed anyway.
+        # Best effort: rebuild Home's filter dropdown if MainWindow is open.
         from . import get_main_window
         mainWindow = get_main_window()
         if mainWindow is None:
@@ -729,10 +1030,47 @@ class FeedManagerPanel(wx.Panel):
             if callable(refresh):
                 refresh()
 
+    # ---------------- staged changes ----------------
+
+    def _feedChanges(self):
+        baseUris = [f["uri"] for f in self._baselineFeeds]
+        curUris = [f["uri"] for f in self._feeds]
+        curSet = set(curUris)
+        removed = set(baseUris) - curSet
+        basePinned = {f["uri"]: f["pinned"] for f in self._baselineFeeds}
+        pinned = {f["uri"]: f["pinned"] for f in self._feeds if basePinned.get(f["uri"]) != f["pinned"]}
+        reordered = [u for u in baseUris if u in curSet] != curUris
+        return removed, pinned, reordered, curUris
+
+    def pendingTasks(self):
+        removed, pinned, reordered, curUris = self._feedChanges()
+        if not (removed or pinned or reordered):
+            return []
+        snapshot = [dict(f) for f in self._feeds]
+        orderedUris = curUris if reordered else []
+        accountId = self._accountId
+
+        def run(atprotoClient):
+            for uri in sorted(removed):
+                client.remove_feed_from_saved(atprotoClient, uri)
+            for uri, value in pinned.items():
+                if uri not in removed:
+                    client.set_feed_pinned(atprotoClient, uri, value)
+            if orderedUris and not client.reorder_saved_feeds(atprotoClient, orderedUris):
+                raise RuntimeError("the feed list changed on the server; refresh and try again")
+
+        def commit():
+            self._baselineFeeds = [dict(f) for f in snapshot]
+            if accountId is not None:
+                db.set_saved_feeds_cache(accountId, snapshot)
+            self._notifyHomeFeedsChanged()
+
+        # Translators: Name of a settings group, used in "Could not save: {}" messages.
+        return [_Task(_("feeds"), run, commit)]
+
+    # ---------------- refresh from server ----------------
+
     def _refresh(self):
-        # Silent background sync against the server -- never blocks
-        # the initial render, only corrects it once the real data is
-        # back (and only if the panel's still around to see it).
         soundpack.start_progress()
 
         def worker():
@@ -771,33 +1109,23 @@ class FeedManagerPanel(wx.Panel):
                 # Translators: Status text when loading subscribed feeds fails. {} is the error message.
                 self.statusLabel.SetLabel(_("Could not load your feeds: {}").format(error))
             return
-        for btn in (self.moveUpButton, self.moveDownButton, self.togglePinButton, self.removeButton):
-            btn.Enable()
+        self._setButtonsEnabled(True)
+        removed, pinned, reordered, _uris = self._feedChanges()
+        if removed or pinned or reordered:
+            # Never clobber the user's pending edits with a late refresh.
+            return
         if feeds == self._feeds:
-            # Nothing actually changed -- skip touching the ListCtrl
-            # entirely. _render() always does DeleteAllItems()+reinsert,
-            # which recreates native rows even at an unchanged focus
-            # index -- confirmed as the cause of the extra "reads N
-            # times" on first open, since this background completion
-            # lands right after onTabActivated's own deliberate
-            # feedList.SetFocus() with nothing genuinely new to show.
+            self._baselineFeeds = [dict(f) for f in feeds]
             return
         self._feeds = feeds
-        self._persistCache()
-        self.statusLabel.SetLabel(_("{} subscribed feed(s).").format(len(self._feeds)))
-        # Preserve whatever's currently focused (the user may already
-        # be navigating the cached list) rather than jumping back to
-        # row 0 again.
+        self._baselineFeeds = [dict(f) for f in feeds]
+        if self._accountId is not None:
+            db.set_saved_feeds_cache(self._accountId, feeds)
+        self._updateStatus()
         self._render()
         self._notifyHomeFeedsChanged()
 
     def _render(self, target_index=None):
-        # Focus()/Select() alone (not SetFocus()) only fires a native
-        # accessible focus event when the control ALREADY has real OS
-        # focus AND the item index is actually changing -- calling it
-        # unconditionally here is silent the rest of the time (e.g.
-        # during __init__, before this panel is ever shown). Same
-        # pattern MutedWordsPanel._renderWords already uses.
         previouslyFocused = self.feedList.GetFocusedItem()
         self.feedList.Freeze()
         try:
@@ -850,116 +1178,26 @@ class FeedManagerPanel(wx.Panel):
             nvdaUi.message(_("Can't move further."))
             return
         self._feeds[index], self._feeds[newIndex] = self._feeds[newIndex], self._feeds[index]
-        self._persistCache()
         self._render(target_index=newIndex)
-        self._saveOrder()
-        self._notifyHomeFeedsChanged()
-
-    def _saveOrder(self):
-        # Fire-and-forget: the list is already re-rendered (and
-        # cached) above, the order only matters for this add-on's own
-        # display (not reflected anywhere on bsky.app), so there's
-        # nothing further to tell the user about -- no button
-        # disabling, no "saved" message, just persist it quietly.
-        orderedUris = [f["uri"] for f in self._feeds]
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                client.reorder_saved_feeds(atprotoClient, orderedUris)
-            except Exception as e:
-                log.error("NVSky: background saved-feeds reorder failed: %s", e, exc_info=True)
-
-        threading.Thread(target=worker, daemon=True).start()
 
     def onTogglePin(self, evt):
         index = self._selectedIndex()
         if index is None:
             return
         feed = self._feeds[index]
-        newPinned = not feed["pinned"]
-        feed["pinned"] = newPinned
-        self._persistCache()
+        feed["pinned"] = not feed["pinned"]
         self._render(target_index=index)
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                client.set_feed_pinned(atprotoClient, feed["uri"], newPinned)
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onTogglePinDone, feed["uri"], newPinned, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback(check_app_closing=False)
-    def _onTogglePinDone(self, feed_uri, attemptedPinned, error):
-        if not self._stillAlive() or not error:
-            return
-        # Roll back the optimistic flip -- pin state actually matters
-        # (unlike display order), so a failure here needs to be both
-        # corrected and surfaced.
-        for feed in self._feeds:
-            if feed["uri"] == feed_uri:
-                feed["pinned"] = not attemptedPinned
-        self._persistCache()
-        self._render()
-        # Translators: Announced when un/pinning a feed fails. {} is the error message.
-        nvdaUi.message(_("Could not change pin: {}").format(error))
 
     def onRemove(self, evt):
         index = self._selectedIndex()
         if index is None:
             return
         feed = self._feeds[index]
-        confirm = wx.MessageDialog(
-            self,
-            # Translators: Confirmation body for removing a subscribed feed. {} is the feed's display name.
-            _('Remove "{}" from your feeds?').format(feed["display_name"]),
-            # Translators: Title of the confirm-remove-feed dialog.
-            _("Confirm remove"), wx.YES_NO | wx.NO_DEFAULT,
-        )
-        confirmed = confirm.ShowModal() == wx.ID_YES
-        confirm.Destroy()
-        if not confirmed:
-            return
-
-        # Optimistic: gone from the list (and cache) immediately, the
-        # server call happens in the background.
-        self._feeds = [f for f in self._feeds if f["uri"] != feed["uri"]]
-        self._persistCache()
-        self.statusLabel.SetLabel(_("{} subscribed feed(s).").format(len(self._feeds)))
+        del self._feeds[index]
+        self._updateStatus()
         # Translators: Announced after removing a feed. {} is the feed's display name.
         nvdaUi.message(_('Removed "{}".').format(feed["display_name"]))
         self._render(target_index=index)
-        self._notifyHomeFeedsChanged()
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                client.remove_feed_from_saved(atprotoClient, feed["uri"])
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onRemoveDone, index, feed, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback(check_app_closing=False)
-    def _onRemoveDone(self, index, feed, error):
-        if not self._stillAlive() or not error:
-            return
-        # Roll back -- put it back where it was, clamped to the
-        # current length.
-        insertAt = max(0, min(index, len(self._feeds)))
-        self._feeds.insert(insertAt, feed)
-        self._persistCache()
-        self.statusLabel.SetLabel(_("{} subscribed feed(s).").format(len(self._feeds)))
-        self._render(target_index=insertAt)
-        self._notifyHomeFeedsChanged()
-        # Translators: Announced when removing a feed fails. {} is the error message.
-        nvdaUi.message(_("Could not remove feed: {}").format(error))
 
 
 class SoundPanel(wx.Panel):
@@ -999,9 +1237,6 @@ class SoundPanel(wx.Panel):
         self._loadPackChoices()
         self._loadEventChecks()
 
-        self.packChoice.Bind(wx.EVT_CHOICE, self.onChanged)
-        self.eventList.Bind(wx.EVT_CHECKLISTBOX, self.onChanged)
-
     def onTabActivated(self):
         self.packChoice.SetFocus()
 
@@ -1025,7 +1260,7 @@ class SoundPanel(wx.Panel):
         if soundpack.EVENT_KEYS:
             self.eventList.SetSelection(0)
 
-    def onChanged(self, evt):
+    def apply(self):
         index = self.packChoice.GetSelection()
         packName = self._packNames[index] if 0 <= index < len(self._packNames) else soundpack.SILENT_PACK
         db.set_soundpack_selected(packName)
@@ -1035,10 +1270,12 @@ class SoundPanel(wx.Panel):
         db.set_soundpack_disabled_events(disabledKeys)
 
         soundpack.reload()
-        evt.Skip()
 
 
 class ProfilePanel(wx.Panel):
+    """Settings > Profile. Text edits and picked avatar/banner files are staged
+    and uploaded on OK/Apply."""
+
     def __init__(self, parent):
         super().__init__(parent)
 
@@ -1060,15 +1297,11 @@ class ProfilePanel(wx.Panel):
         self.bioCtrl = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(-1, 80))
         sizer.Add(self.bioCtrl, flag=wx.EXPAND | wx.LEFT | wx.RIGHT, border=10)
 
-        # Translators: Button to save the display name and bio.
-        self.saveTextButton = wx.Button(self, label=_("&Save display name && bio"))
-        sizer.Add(self.saveTextButton, flag=wx.LEFT | wx.TOP, border=10)
-
         avatarRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to change the profile avatar image.
+        # Translators: Button to choose a new profile avatar image.
         self.changeAvatarButton = wx.Button(self, label=_("Change &avatar..."))
-        # Translators: Button to change the profile banner image.
-        self.changeBannerButton = wx.Button(self, label=_("Change &banner..."))
+        # Translators: Button to choose a new profile banner image.
+        self.changeBannerButton = wx.Button(self, label=_("Change ban&ner..."))
         avatarRow.Add(self.changeAvatarButton, flag=wx.RIGHT, border=5)
         avatarRow.Add(self.changeBannerButton)
         sizer.Add(avatarRow, flag=wx.LEFT | wx.TOP, border=10)
@@ -1077,30 +1310,24 @@ class ProfilePanel(wx.Panel):
 
         self.nameCtrl.Disable()
         self.bioCtrl.Disable()
-        self.saveTextButton.Disable()
         self.changeAvatarButton.Disable()
         self.changeBannerButton.Disable()
 
-        self.saveTextButton.Bind(wx.EVT_BUTTON, self.onSaveText)
         self.changeAvatarButton.Bind(wx.EVT_BUTTON, lambda e: self.onChangeImage("avatar"))
         self.changeBannerButton.Bind(wx.EVT_BUTTON, lambda e: self.onChangeImage("banner"))
 
-        # Lazy -- only fetches once this tab is actually opened, not at
-        # dialog-construction time (every panel gets constructed eagerly
-        # by NVSkySettingsDialog.__init__ regardless of which tab is
-        # active) -- otherwise the progress sound/network call fires the
-        # instant Settings opens, before the user ever tabs here.
+        self._loaded = False
+        self._baselineName = ""
+        self._baselineBio = ""
+        self._pendingAvatar = None
+        self._pendingBanner = None
+        # Lazy: fetch only when this tab is first opened.
         self._loadedOnce = False
 
     def onTabActivated(self):
         if not self._loadedOnce:
             self._loadedOnce = True
             self._loadProfile()
-        # nameCtrl starts Disabled until profile data arrives (see
-        # _loadProfile/_onProfileLoaded) -- SetFocus() on a disabled
-        # wx.TextCtrl is a silent no-op on Windows, so this only does
-        # anything once loading has actually finished; _onProfileLoaded
-        # below covers the "still loading when tab was entered" case.
         elif self.nameCtrl.IsEnabled():
             self.nameCtrl.SetFocus()
 
@@ -1112,16 +1339,16 @@ class ProfilePanel(wx.Panel):
         return index != wx.NOT_FOUND and parent.GetPage(index) is self
 
     def reload(self):
-        # Same reasoning as MutedWordsPanel.reload() -- this tab is
-        # per-account too and needs to re-fetch when the active account
-        # changes elsewhere in the Settings dialog.
+        # Account switched: pending edits belong to the old account, drop them.
         self._loadedOnce = True
+        self._loaded = False
+        self._pendingAvatar = None
+        self._pendingBanner = None
         self.nameCtrl.Disable()
         self.bioCtrl.Disable()
-        self.saveTextButton.Disable()
         self.changeAvatarButton.Disable()
         self.changeBannerButton.Disable()
-        self.statusLabel.SetLabel("Loading profile...")
+        self.statusLabel.SetLabel(_("Loading profile..."))
         self._loadProfile()
 
     def _loadProfile(self):
@@ -1147,49 +1374,19 @@ class ProfilePanel(wx.Panel):
             # Translators: Status text when loading the profile fails. {} is the error message.
             self.statusLabel.SetLabel(_("Could not load profile: {}").format(error))
             return
-        self.nameCtrl.SetValue(profile.get("display_name") or "")
-        self.bioCtrl.SetValue(profile.get("description") or "")
+        self._baselineName = profile.get("display_name") or ""
+        self._baselineBio = profile.get("description") or ""
+        self.nameCtrl.SetValue(self._baselineName)
+        self.bioCtrl.SetValue(self._baselineBio)
         # Translators: Status text showing which account's profile is being edited. {} is the handle.
         self.statusLabel.SetLabel(_("Editing @{}").format(profile["handle"]))
         self.nameCtrl.Enable()
         self.bioCtrl.Enable()
-        self.saveTextButton.Enable()
         self.changeAvatarButton.Enable()
         self.changeBannerButton.Enable()
+        self._loaded = True
         if self._isActiveTabPage():
             self.nameCtrl.SetFocus()
-
-    def onSaveText(self, evt):
-        displayName = self.nameCtrl.GetValue()
-        description = self.bioCtrl.GetValue()
-        self.saveTextButton.Disable()
-        self.statusLabel.SetLabel("Saving...")
-        soundpack.start_progress()
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                client.update_profile_text(atprotoClient, displayName, description)
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onSaveTextDone, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onSaveTextDone(self, error):
-        soundpack.stop_progress()
-        self.saveTextButton.Enable()
-        if error:
-            # Translators: Status text when saving the profile fails. {} is the error message.
-            self.statusLabel.SetLabel(_("Failed to save: {}").format(error))
-            # Translators: Spoken announcement when saving the profile fails. {} is the error message.
-            nvdaUi.message(_("Failed to save profile: {}").format(error))
-            return
-        # Translators: Status text after successfully saving the profile.
-        self.statusLabel.SetLabel(_("Profile saved."))
-        nvdaUi.message(_("Profile saved."))
 
     def onChangeImage(self, kind):
         # Translators: File-picker dialog title for choosing a new avatar image.
@@ -1205,49 +1402,65 @@ class ProfilePanel(wx.Panel):
                 return
             path = dlg.GetPath()
 
-        button = self.changeAvatarButton if kind == "avatar" else self.changeBannerButton
-        button.Disable()
-        # Translators: Status text while uploading the avatar or banner image. {} is "avatar" or "banner".
-        self.statusLabel.SetLabel(_("Uploading {}...").format(kind))
-        soundpack.start_progress()
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                if kind == "avatar":
-                    client.update_profile_avatar(atprotoClient, path)
-                else:
-                    client.update_profile_banner(atprotoClient, path)
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onImageDone, kind, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onImageDone(self, kind, error):
-        soundpack.stop_progress()
-        button = self.changeAvatarButton if kind == "avatar" else self.changeBannerButton
-        button.Enable()
+        if kind == "avatar":
+            self._pendingAvatar = path
+        else:
+            self._pendingBanner = path
         # Translators: The word "Avatar", used in status/spoken messages about the profile image.
         # Translators: The word "Banner", used in status/spoken messages about the profile banner.
         kindLabel = _("Avatar") if kind == "avatar" else _("Banner")
-        if error:
-            # Translators: Status text when updating the avatar/banner fails. First {} is "Avatar"/"Banner", second {} is the error message.
-            self.statusLabel.SetLabel(_("Failed to update {}: {}").format(kindLabel, error))
-            nvdaUi.message(_("Failed to update {}: {}").format(kindLabel, error))
-            return
-        # Translators: Status text after successfully updating the avatar/banner. {} is "Avatar"/"Banner".
-        self.statusLabel.SetLabel(_("{} updated.").format(kindLabel))
-        nvdaUi.message(_("{} updated.").format(kindLabel))
+        # Translators: Announced after picking a profile image. First {} is "Avatar"/"Banner", second {} is the file name.
+        message = _("{} selected: {}. It uploads when you press OK or Apply.").format(kindLabel, os.path.basename(path))
+        self.statusLabel.SetLabel(message)
+        nvdaUi.message(message)
 
+    def _imageTask(self, kind, path):
+        def run(atprotoClient):
+            if kind == "avatar":
+                client.update_profile_avatar(atprotoClient, path)
+            else:
+                client.update_profile_banner(atprotoClient, path)
+
+        def commit():
+            if kind == "avatar":
+                self._pendingAvatar = None
+            else:
+                self._pendingBanner = None
+
+        # Translators: Name of a settings item, used in "Could not save: {}" messages.
+        # Translators: Name of a settings item, used in "Could not save: {}" messages.
+        return _Task(_("avatar") if kind == "avatar" else _("banner"), run, commit)
+
+    def pendingTasks(self):
+        if not self._loaded:
+            return []
+        tasks = []
+        name = self.nameCtrl.GetValue()
+        bio = self.bioCtrl.GetValue()
+        if name != self._baselineName or bio != self._baselineBio:
+            def runText(atprotoClient):
+                client.update_profile_text(atprotoClient, name, bio)
+
+            def commitText():
+                self._baselineName = name
+                self._baselineBio = bio
+
+            # Translators: Name of a settings group, used in "Could not save: {}" messages.
+            tasks.append(_Task(_("profile text"), runText, commitText))
+        if self._pendingAvatar:
+            tasks.append(self._imageTask("avatar", self._pendingAvatar))
+        if self._pendingBanner:
+            tasks.append(self._imageTask("banner", self._pendingBanner))
+        return tasks
 
 
 class MutedWordsPanel(wx.Panel):
+    """Settings > Muted words. Adds/removals are staged and sent on OK/Apply."""
+
     def __init__(self, parent):
         super().__init__(parent)
         self._words = []
+        self._baselineWords = []
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -1277,16 +1490,17 @@ class MutedWordsPanel(wx.Panel):
         self.addButton.Bind(wx.EVT_BUTTON, self.onAdd)
         self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
 
-        # Lazy -- same reasoning as ProfilePanel: don't fetch (and
-        # don't play the progress sound) until this tab is actually
-        # opened, not at Settings-dialog-construction time.
+        # Lazy: fetch only when this tab is first opened.
         self._loadedOnce = False
 
     def reload(self):
+        # Account switched: pending edits belong to the old account, drop them.
         self._loadedOnce = True
+        self._words = []
+        self._baselineWords = []
         self.addButton.Disable()
         self.removeButton.Disable()
-        self.statusLabel.SetLabel("Loading muted words...")
+        self.statusLabel.SetLabel(_("Loading muted words..."))
         self._load()
 
     def onTabActivated(self):
@@ -1351,14 +1565,11 @@ class MutedWordsPanel(wx.Panel):
             # Translators: Status text when loading muted words fails. {} is the error message.
             self.statusLabel.SetLabel(_("Could not load muted words: {}").format(error))
             return
-        self._words = words or []
+        self._words = list(words or [])
+        self._baselineWords = [dict(w) for w in self._words]
         self._renderWords(target_index=0)
         self.addButton.Enable()
         self.removeButton.Enable()
-        # This panel may have been the active page BEFORE data finished
-        # loading (see onTabActivated -- SetFocus() on an empty list has
-        # nothing to announce) -- grant real focus now, once, but only
-        # if the user hasn't since navigated to some other tab.
         if self._isActiveTabPage():
             self.wordList.SetFocus()
 
@@ -1382,118 +1593,71 @@ class MutedWordsPanel(wx.Panel):
             nvdaUi.message(_('"{}" is already muted.').format(value))
             return
 
-        # Optimistic: show it in the list right away, roll back on
-        # failure -- matches the convention used throughout chatWindow.py
-        # (reactions, mark-read, lock/unlock) instead of a "please wait"
-        # round trip for something this low-risk.
         self._words.append({"id": None, "value": value, "targets": ["content", "tag"]})
-        newIndex = len(self._words) - 1
-        self._renderWords(target_index=newIndex)
-        # No explicit "Added X" message -- Focus()/Select() inside
-        # _renderWords above already makes NVDA read the newly added
-        # row itself, so a separate spoken confirmation just repeats
-        # the same word back.
+        self._renderWords(target_index=len(self._words) - 1)
         self.wordList.SetFocus()
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                client.add_muted_word(atprotoClient, value)
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onAddDone, value, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onAddDone(self, value, error):
-        if not error:
-            return
-        # Roll back the optimistic add -- the server never actually
-        # applied it, so leaving it showing would be a lie.
-        self._words = [w for w in self._words if w["value"] != value]
-        self._renderWords()
-        # Translators: Announced when adding a muted word fails. First {} is the word/tag, second {} is the error message.
-        nvdaUi.message(_('Could not add "{}": {}').format(value, error))
 
     def onRemove(self, evt):
         index = self.wordList.GetFocusedItem()
         if index == -1 or index >= len(self._words):
             nvdaUi.message(_("No word selected."))
             return
-        removed = self._words[index]
-        value = removed["value"]
-
-        # Optimistic here too, for the same reason as onAdd -- and
-        # restores focus to the item that slides into the removed
-        # row's position (or the new last row), not back to the top.
+        value = self._words[index]["value"]
         del self._words[index]
-        newIndex = min(index, len(self._words) - 1)
-        self._renderWords(target_index=newIndex)
-        # _renderWords only updates the ListCtrl's internal item-focus
-        # marker (Focus()/Select()) -- if real OS focus was on
-        # removeButton (which is how this action normally gets
-        # triggered), it stays there unless explicitly moved back here.
+        self._renderWords(target_index=min(index, len(self._words) - 1))
         self.wordList.SetFocus()
         # Translators: Announced after removing a muted word. {} is the word/tag.
         nvdaUi.message(_('Removed "{}".').format(value))
 
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
+    def pendingTasks(self):
+        current = {w["value"] for w in self._words}
+        base = {w["value"] for w in self._baselineWords}
+        added = sorted(current - base)
+        removed = sorted(base - current)
+        if not (added or removed):
+            return []
+        snapshot = [dict(w) for w in self._words]
+
+        def run(atprotoClient):
+            for value in removed:
                 client.remove_muted_word(atprotoClient, value)
-                error = None
-            except Exception as e:
-                error = str(e)
-            wx.CallAfter(self._onRemoveDone, index, removed, error)
+            for value in added:
+                client.add_muted_word(atprotoClient, value)
 
-        threading.Thread(target=worker, daemon=True).start()
+        def commit():
+            self._baselineWords = [dict(w) for w in snapshot]
 
-    @uiutil.safe_ui_callback
-    def _onRemoveDone(self, index, removed, error):
-        if not error:
-            return
-        # Roll back -- put it back where it was, clamped to the
-        # current length.
-        insertAt = max(0, min(index, len(self._words)))
-        self._words.insert(insertAt, removed)
-        self._renderWords(target_index=insertAt)
-        # Translators: Announced when removing a muted word fails. First {} is the word/tag, second {} is the error message.
-        nvdaUi.message(_('Could not remove "{}": {}').format(removed["value"], error))
+        # Translators: Name of a settings group, used in "Could not save: {}" messages.
+        return [_Task(_("muted words"), run, commit)]
+
+
+ACTOR_LIST_CATEGORY_KEYS = ["muted", "blocked"]
 
 
 class MutedBlockedActorsPanel(wx.Panel):
     """
-    Settings > Muted users / Blocked users -- checklist-based bulk
-    unmute/unblock (CustomCheckListBox, same pattern as
-    ManageGroupMembersDialog/SubscribeListDialog's checklists) so
-    several accounts can be un-muted/un-blocked in one action. Always
-    re-fetched fresh on every tab activation, no local cache -- not
-    checked often enough to need one.
+    Settings > Muted users / Blocked users (one instance per category). The
+    list is re-fetched fresh on tab activation. "Undo checked" only stages the change:
+    checked users leave the list now and are unmuted/unblocked on OK/Apply.
 
-    A CustomCheckListBox constructed/Set() with zero items still
-    renders one blank-looking checkable row on Windows AND raises a
-    real wxAssertionError ("bad wxCheckListBox index") the moment NVDA
-    tries to read that row's state -- confirmed via a real crash log.
-    Same fix already used by ManageGroupMembersDialog/SubscribeListDialog
-    for the identical issue: hide the checklist entirely whenever there
-    are zero items (loading or genuinely empty, doesn't matter which),
-    and fall back focus to the Refresh button instead.
+    A CustomCheckListBox with zero items raises a real wxAssertionError on
+    Windows, so it stays hidden whenever there is nothing to show and focus
+    falls back to the Refresh button.
     """
 
-    def __init__(self, parent, kind: str):
+    def __init__(self, parent, category):
         super().__init__(parent)
-        self._kind = kind  # "muted" or "blocked"
+        self._category = category  # "muted" or "blocked"
         self._actors = []
+        self._pendingRemovals = {"muted": {}, "blocked": {}}  # category -> {did: actor}
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Translators: Initial status text while the muted/blocked user list loads.
+        # Translators: Initial status text while the user list loads.
         self.statusLabel = wx.StaticText(self, label=_("Loading, please wait..."))
-        sizer.Add(self.statusLabel, flag=wx.ALL, border=10)
+        sizer.Add(self.statusLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
 
-        # Translators: Label above the muted/blocked users checklist.
+        # Translators: Label above the users checklist.
         self.listLabel = wx.StaticText(self, label=_("&Users (check to select several):"))
         sizer.Add(self.listLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
         self.actorList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
@@ -1502,14 +1666,9 @@ class MutedBlockedActorsPanel(wx.Panel):
         self.actorList.Hide()
 
         buttonRow = wx.BoxSizer(wx.HORIZONTAL)
-        if kind == "muted":
-            # Translators: Button to unmute every checked user.
-            removeLabel = _("Un&mute checked")
-        else:
-            # Translators: Button to unblock every checked user.
-            removeLabel = _("Unbloc&k checked")
-        self.removeButton = wx.Button(self, label=removeLabel)
-        # Translators: Button to refresh the muted/blocked user list.
+        # Translators: Button to stage unmuting/unblocking the checked users. Relabeled per category.
+        self.removeButton = wx.Button(self, label=_("&Undo checked"))
+        # Translators: Button to refresh the user list.
         self.refreshButton = wx.Button(self, label=_("&Refresh"))
         buttonRow.Add(self.removeButton, flag=wx.RIGHT, border=5)
         buttonRow.Add(self.refreshButton)
@@ -1524,6 +1683,20 @@ class MutedBlockedActorsPanel(wx.Panel):
         self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
         self.refreshButton.Bind(wx.EVT_BUTTON, lambda e: self._load())
 
+        self._updateRemoveButtonLabel()
+
+    def _currentCategory(self):
+        return self._category
+
+    def _updateRemoveButtonLabel(self):
+        labels = {
+            # Translators: Button to unmute every checked user.
+            "muted": _("Un&mute checked"),
+            # Translators: Button to unblock every checked user.
+            "blocked": _("Unbloc&k checked"),
+        }
+        self.removeButton.SetLabel(labels[self._currentCategory()])
+
     def onTabActivated(self):
         if self._actors:
             self.actorList.SetFocus()
@@ -1532,6 +1705,8 @@ class MutedBlockedActorsPanel(wx.Panel):
         self._load()
 
     def reload(self):
+        # Account switched: pending edits belong to the old account, drop them.
+        self._pendingRemovals = {"muted": {}, "blocked": {}}
         self._load()
 
     def _isActiveTabPage(self):
@@ -1545,18 +1720,23 @@ class MutedBlockedActorsPanel(wx.Panel):
         # Translators: Fallback shown for a user with no display name. Used as "@handle ({})".
         return f'@{actor["handle"]} ({actor.get("display_name") or _("no display name")})'
 
+    def _categoryCountText(self, category, count):
+        texts = {
+            # Translators: Status text showing how many users are muted. {} is the count.
+            "muted": _("{} muted user(s).").format(count),
+            # Translators: Status text showing how many users are blocked. {} is the count.
+            "blocked": _("{} blocked user(s).").format(count),
+        }
+        return texts[category]
+
     def _renderActors(self, target_index=None):
         hasActors = bool(self._actors)
         self.listLabel.Show(hasActors)
         self.actorList.Show(hasActors)
         self.removeButton.Show(hasActors)
+        self.removeButton.Enable(hasActors)
 
-        if self._kind == "muted":
-            # Translators: Status text showing how many users are muted. {} is the count.
-            self.statusLabel.SetLabel(_("{} muted user(s).").format(len(self._actors)))
-        else:
-            # Translators: Status text showing how many users are blocked. {} is the count.
-            self.statusLabel.SetLabel(_("{} blocked user(s).").format(len(self._actors)))
+        self.statusLabel.SetLabel(self._categoryCountText(self._currentCategory(), len(self._actors)))
 
         if not hasActors:
             self.actorList.Set([])
@@ -1576,16 +1756,17 @@ class MutedBlockedActorsPanel(wx.Panel):
         self.Layout()
 
     def _load(self):
-        # Translators: Status text while the muted/blocked user list loads.
+        # Translators: Status text while the user list loads.
         self.statusLabel.SetLabel(_("Loading, please wait..."))
         self.removeButton.Disable()
         self.refreshButton.Disable()
         soundpack.start_progress()
+        category = self._currentCategory()
 
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
-                if self._kind == "muted":
+                if category == "muted":
                     actors = client.get_muted_actors(atprotoClient)
                 else:
                     actors = client.get_blocked_actors(atprotoClient)
@@ -1593,40 +1774,30 @@ class MutedBlockedActorsPanel(wx.Panel):
             except Exception as e:
                 actors = None
                 error = str(e)
-            wx.CallAfter(self._onLoaded, actors, error)
+            wx.CallAfter(self._onLoaded, category, actors, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     @uiutil.safe_ui_callback(check_app_closing=False)
-    def _onLoaded(self, actors, error):
+    def _onLoaded(self, category, actors, error):
         soundpack.stop_progress()
+        if category != self._currentCategory():
+            return  # user already switched categories again -- stale result
         if error:
-            if self._kind == "muted":
+            labels = {
                 # Translators: Status text when loading muted users fails. {} is the error message.
-                self.statusLabel.SetLabel(_("Could not load muted users: {}").format(error))
-            else:
+                "muted": _("Could not load muted users: {}").format(error),
                 # Translators: Status text when loading blocked users fails. {} is the error message.
-                self.statusLabel.SetLabel(_("Could not load blocked users: {}").format(error))
+                "blocked": _("Could not load blocked users: {}").format(error),
+            }
+            self.statusLabel.SetLabel(labels[category])
             self.refreshButton.Enable()
             return
-        self._actors = actors or []
+        pending = self._pendingRemovals[category]
+        self._actors = [a for a in (actors or []) if a["did"] not in pending]
         self._renderActors(target_index=0)
-        self.removeButton.Enable()
+        self.removeButton.Enable(bool(self._actors))
         self.refreshButton.Enable()
-        if self._actors:
-            if self._kind == "muted":
-                # Translators: Announced after the muted users list finishes loading. {} is the count.
-                nvdaUi.message(_("{} muted user(s) loaded.").format(len(self._actors)))
-            else:
-                # Translators: Announced after the blocked users list finishes loading. {} is the count.
-                nvdaUi.message(_("{} blocked user(s) loaded.").format(len(self._actors)))
-        else:
-            if self._kind == "muted":
-                # Translators: Announced when the muted users list loads with nothing in it.
-                nvdaUi.message(_("No muted users."))
-            else:
-                # Translators: Announced when the blocked users list loads with nothing in it.
-                nvdaUi.message(_("No blocked users."))
         if self._isActiveTabPage():
             if self._actors:
                 self.actorList.SetFocus()
@@ -1634,88 +1805,139 @@ class MutedBlockedActorsPanel(wx.Panel):
                 self.refreshButton.SetFocus()
 
     def onRemove(self, evt):
-        if not self._actors:
-            # Translators: Spoken when trying to unmute/unblock with nothing in the list.
-            nvdaUi.message(_("No users checked."))
-            return
         indices = list(self.actorList.CheckedItems)
-        if not indices:
-            # Translators: Spoken when trying to unmute/unblock with nothing checked.
+        if not self._actors or not indices:
+            # Translators: Spoken when trying to undo relationships with nothing checked.
             nvdaUi.message(_("No users checked."))
             return
-        toRemove = [self._actors[i] for i in indices if 0 <= i < len(self._actors)]
-        if not toRemove:
+        staged = [self._actors[i] for i in indices if 0 <= i < len(self._actors)]
+        if not staged:
             return
-
-        self.removeButton.Disable()
-        if self._kind == "muted":
-            # Translators: Announced while unmuting checked users. {} is the count.
-            nvdaUi.message(_("Unmuting {} user(s)...").format(len(toRemove)))
-        else:
-            # Translators: Announced while unblocking checked users. {} is the count.
-            nvdaUi.message(_("Unblocking {} user(s)...").format(len(toRemove)))
-
-        def worker():
-            removed = []
-            errors = []
-            atprotoClient = client.get_client_for_active_account()
-            for actor in toRemove:
-                try:
-                    if self._kind == "muted":
-                        client.unmute_actor(atprotoClient, actor["did"])
-                    else:
-                        blockingUri = actor.get("blocking_uri")
-                        if not blockingUri:
-                            raise RuntimeError("no block record uri cached for this user")
-                        client.unblock_actor(atprotoClient, blockingUri)
-                    removed.append(actor)
-                except Exception as e:
-                    errors.append(f'@{actor["handle"]}: {e}')
-            wx.CallAfter(self._onRemoveDone, removed, errors)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback
-    def _onRemoveDone(self, removed, errors):
-        self.removeButton.Enable()
-        removedDids = {a["did"] for a in removed}
-        self._actors = [a for a in self._actors if a["did"] not in removedDids]
+        category = self._currentCategory()
+        for actor in staged:
+            self._pendingRemovals[category][actor["did"]] = actor
+        stagedDids = {a["did"] for a in staged}
+        self._actors = [a for a in self._actors if a["did"] not in stagedDids]
         self._renderActors()
         if self._actors:
             self.actorList.SetFocus()
         else:
             self.refreshButton.SetFocus()
-        if removed:
-            names = ", ".join(f'@{a["handle"]}' for a in removed)
-            if self._kind == "muted":
-                # Translators: Announced after unmuting checked users. {} is a comma-separated list of handles.
-                nvdaUi.message(_("Unmuted: {}.").format(names))
+        doneTexts = {
+            # Translators: Announced after staging users to unmute. {} is the count.
+            "muted": _("{} user(s) will be unmuted when you press OK or Apply.").format(len(staged)),
+            # Translators: Announced after staging users to unblock. {} is the count.
+            "blocked": _("{} user(s) will be unblocked when you press OK or Apply.").format(len(staged)),
+        }
+        nvdaUi.message(doneTexts[category])
+
+    def _actorTask(self, category, actor):
+        def run(atprotoClient):
+            if category == "muted":
+                client.unmute_actor(atprotoClient, actor["did"])
             else:
-                # Translators: Announced after unblocking checked users. {} is a comma-separated list of handles.
-                nvdaUi.message(_("Unblocked: {}.").format(names))
-        if errors:
-            # Translators: Announced when some unmute/unblock actions fail. {} is a semicolon-separated list of "handle: error" entries.
-            nvdaUi.message(_("Some actions failed: {}").format("; ".join(errors)))
+                blockingUri = actor.get("blocking_uri")
+                if not blockingUri:
+                    raise RuntimeError("no block record uri cached for this user")
+                client.unblock_actor(atprotoClient, blockingUri)
+
+        def commit():
+            self._pendingRemovals[category].pop(actor["did"], None)
+            if category == "muted":
+                db.set_author_muted(actor["did"], False)
+            else:
+                db.set_author_blocking(actor["did"], None)
+
+        return _Task(f'@{actor["handle"]}', run, commit)
+
+    def pendingTasks(self):
+        tasks = []
+        for category in ACTOR_LIST_CATEGORY_KEYS:
+            for actor in list(self._pendingRemovals[category].values()):
+                tasks.append(self._actorTask(category, actor))
+        return tasks
+
+
+CONTENT_LABEL_DISPLAY_NAMES = {
+    # Translators: Content label display name.
+    "porn": _("Pornography"),
+    # Translators: Content label display name.
+    "sexual": _("Sexually suggestive"),
+    # Translators: Content label display name.
+    "nudity": _("Nudity"),
+    # Translators: Content label display name.
+    "graphic-media": _("Graphic media"),
+}
+
+OPTIONAL_TAB_CHOICES = [
+    # Translators: Tab name in the Settings > Display tabs checklist.
+    ("notifications", _("Notifications")),
+    # Translators: Tab name in the Settings > Display tabs checklist.
+    ("explore", _("Explore")),
+    # Translators: Tab name in the Settings > Display tabs checklist.
+    ("saved", _("Saved")),
+    # Translators: Tab name in the Settings > Display tabs checklist.
+    ("likes", _("Likes")),
+    # Translators: Tab name in the Settings > Display tabs checklist.
+    ("chat", _("Chat")),
+    # Translators: Tab name in the Settings > Display tabs checklist.
+    ("lists", _("Lists")),
+]
+
+CONTENT_LABEL_VISIBILITY_CHOICES = [
+    # Translators: Content label visibility choice -- shown normally.
+    ("show", _("Show")),
+    # Translators: Content label visibility choice -- text/embed hidden behind a warning until Ctrl+Space.
+    ("warn", _("Warn")),
+    # Translators: Content label visibility choice -- post removed from feeds entirely.
+    ("hide", _("Hide")),
+]
+
+NOTIFICATION_CATEGORY_DISPLAY_NAMES = {
+    # Translators: Notification category display name.
+    "follow": _("New followers"),
+    # Translators: Notification category display name.
+    "like": _("Likes"),
+    # Translators: Notification category display name.
+    "like_via_repost": _("Likes on your reposts"),
+    # Translators: Notification category display name.
+    "mention": _("Mentions"),
+    # Translators: Notification category display name.
+    "quote": _("Quotes"),
+    # Translators: Notification category display name.
+    "reply": _("Replies"),
+    # Translators: Notification category display name.
+    "repost": _("Reposts"),
+    # Translators: Notification category display name.
+    "repost_via_repost": _("Reposts of your reposts"),
+    # Translators: Notification category display name.
+    "starterpack_joined": _("Someone joins your starter pack"),
+    # Translators: Notification category display name -- "subscribe" is a per-account bell icon on a profile, separate from following.
+    "subscribed_post": _("New posts from accounts you've bell-subscribed to"),
+    # Translators: Notification category display name -- Bluesky's identity-verification checkmark being removed from your account.
+    "unverified": _("Your account's verification is removed"),
+    # Translators: Notification category display name -- Bluesky's identity-verification checkmark being granted to your account.
+    "verified": _("Your account gets verified"),
+}
+
+NOTIFICATION_STATE_DISPLAY_NAMES = {
+    # Translators: Notification state -- this category is disabled entirely.
+    "off": _("Off"),
+    # Translators: Notification state -- notified for this category from anyone.
+    "everyone": _("Everyone"),
+    # Translators: Notification state -- notified for this category only from accounts you follow.
+    "following": _("People you follow"),
+    # Translators: Notification state -- this category is enabled (no filtering available).
+    "on": _("On"),
+}
 
 
 class NVSkySettingsDialog(wx.Dialog):
     """
-    Standalone NVSky settings window -- replaces the old NVSkySettingsPanel
-    that was nested inside NVDA's own multi-category Settings dialog.
-
-    Root cause of the double-announcement fix: nesting our own
-    wx.Notebook inside NVDA's Settings dialog (itself a notebook-like
-    category switcher) meant native Tab-key traversal into a page's
-    first control was real OS-driven focus transfer with no hook this
-    codebase could intercept -- this is what caused ListCtrl-backed
-    panels (Accounts, Feed manager, Muted words) to announce their
-    focused row twice. Hosting our own single-level wx.Notebook inside
-    a plain wx.Dialog (same pattern MainWindow already uses for its own
-    tabs) removes the double-nesting, and reuses MainWindow's proven
-    onPageChanging/onPageChanged pattern: move real focus onto the
-    notebook itself right before a page swap, then grant real focus
-    deliberately, exactly once, from onPageChanged via each panel's own
-    onTabActivated() hook.
+    Standalone NVSky settings window with OK / Cancel / Apply. Cancel and
+    Escape discard everything not yet applied. Hosting our own single-level
+    wx.Notebook in a plain wx.Dialog (same pattern as MainWindow) avoids the
+    double-announcement of nesting inside NVDA's own Settings notebook.
     """
 
     def __init__(self, parent, on_account_changed=None):
@@ -1725,12 +1947,10 @@ class NVSkySettingsDialog(wx.Dialog):
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
         )
         self._onAccountChangedExternal = on_account_changed
+        self._applying = False
 
-        # Same purpose as MainWindow._activationSuppressed -- True until
-        # every page has been added (AddPage on an empty notebook
-        # auto-selects the first page and fires a real
-        # EVT_NOTEBOOK_PAGE_CHANGED during construction, before the
-        # dialog is even shown).
+        # True until every page has been added (AddPage on an empty notebook
+        # auto-selects the first page and fires a real PAGE_CHANGED).
         self._activationSuppressed = True
 
         panel = wx.Panel(self)
@@ -1743,9 +1963,18 @@ class NVSkySettingsDialog(wx.Dialog):
         self.notebook = wx.Notebook(panel)
         sizer.Add(self.notebook, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
-        # Translators: Button to close the NVSky Settings dialog.
-        closeBtn = wx.Button(panel, wx.ID_CLOSE, label=_("&Close"))
-        sizer.Add(closeBtn, flag=wx.ALIGN_RIGHT | wx.RIGHT | wx.BOTTOM, border=10)
+        buttonRow = wx.BoxSizer(wx.HORIZONTAL)
+        # Translators: Button to save settings and close the NVSky Settings dialog.
+        self.okBtn = wx.Button(panel, wx.ID_OK, label=_("OK"))
+        # Translators: Button to close the NVSky Settings dialog without saving.
+        self.cancelBtn = wx.Button(panel, wx.ID_CANCEL, label=_("Cancel"))
+        # Translators: Button to save settings without closing the NVSky Settings dialog.
+        self.applyBtn = wx.Button(panel, wx.ID_APPLY, label=_("Appl&y"))
+        self.okBtn.SetDefault()
+        buttonRow.Add(self.okBtn, flag=wx.RIGHT, border=5)
+        buttonRow.Add(self.cancelBtn, flag=wx.RIGHT, border=5)
+        buttonRow.Add(self.applyBtn)
+        sizer.Add(buttonRow, flag=wx.ALIGN_RIGHT | wx.RIGHT | wx.BOTTOM, border=10)
 
         panel.SetSizer(sizer)
 
@@ -1763,11 +1992,11 @@ class NVSkySettingsDialog(wx.Dialog):
         self.notebook.AddPage(self.accountsPanel, _("Accounts"))
         # Translators: Settings dialog tab name (general options).
         self.notebook.AddPage(self.generalPanel, _("General"))
-        # Translators: Settings dialog tab name (display/formatting options).
+        # Translators: Settings dialog tab name (display/formatting options, tabs, content-label visibility, notifications).
         self.notebook.AddPage(self.displayPanel, _("Display"))
         # Translators: Settings dialog tab name (subscribed feeds management).
         self.notebook.AddPage(self.feedManagerPanel, _("Feed manager"))
-        # Translators: Settings dialog tab name (sound options, not yet implemented).
+        # Translators: Settings dialog tab name (sound options).
         self.notebook.AddPage(self.soundPanel, _("Sound"))
         # Translators: Settings dialog tab name (profile editing).
         self.notebook.AddPage(self.profilePanel, _("Profile"))
@@ -1778,7 +2007,9 @@ class NVSkySettingsDialog(wx.Dialog):
         # Translators: Settings dialog tab name (blocked user accounts management).
         self.notebook.AddPage(self.blockedUsersPanel, _("Blocked users"))
 
-        closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        self.okBtn.Bind(wx.EVT_BUTTON, self.onOk)
+        self.cancelBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        self.applyBtn.Bind(wx.EVT_BUTTON, self.onApply)
         self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGING, self.onPageChanging)
         self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.onPageChanged)
         self.Bind(wx.EVT_CLOSE, self.onClose)
@@ -1786,28 +2017,34 @@ class NVSkySettingsDialog(wx.Dialog):
 
         self.CentreOnScreen()
         self._activationSuppressed = False
-        # Page 0 (Accounts) was auto-selected during AddPage above while
-        # still suppressed -- focus it once now the same deliberate way
-        # onPageChanged would, since no real PAGE_CHANGED event fired
-        # for that initial automatic selection.
+        # Page 0 was auto-selected while suppressed; focus it once deliberately.
         wx.CallAfter(self._activatePage, 0)
 
+    def _pages(self):
+        return [self.notebook.GetPage(i) for i in range(self.notebook.GetPageCount())]
+
+    def _hasPendingServerChanges(self):
+        return any(
+            callable(getattr(page, "pendingTasks", None)) and page.pendingTasks() for page in self._pages()
+        )
+
     def _onAccountChanged(self):
-        # Same actions as the old NVSkySettingsPanel.makeSettings'
-        # onAccountChanged closure -- reload every per-account panel,
-        # then tell an already-open MainWindow to rebuild its tabs.
+        # Pending server-side edits belong to the previous account: the panels drop them on reload.
+        if self._hasPendingServerChanges():
+            # Translators: Announced when switching accounts discards unsaved server-side settings changes.
+            nvdaUi.message(_("Unsaved changes for the previous account were discarded."))
         self.profilePanel.reload()
         self.mutedWordsPanel.reload()
         self.feedManagerPanel.reload()
         self.mutedUsersPanel.reload()
         self.blockedUsersPanel.reload()
+        self.displayPanel.reloadContentLabels()
+        self.displayPanel.reloadNotificationPrefs()
         if self._onAccountChangedExternal:
             self._onAccountChangedExternal()
 
     def onPageChanging(self, evt):
-        # Mirrors MainWindow.onPageChanging -- moves real focus to the
-        # notebook itself BEFORE the page actually swaps, so no child
-        # control is still focused right as its page becomes hidden.
+        # Move real focus to the notebook before the page swaps (see MainWindow.onPageChanging).
         self.notebook.SetFocus()
         evt.Skip()
 
@@ -1821,15 +2058,7 @@ class NVSkySettingsDialog(wx.Dialog):
 
     def _activatePage(self, index):
         panel = self.notebook.GetPage(index)
-        # Announce the tab name FIRST, before granting real focus --
-        # same ordering FeedWindow.onTabActivated etc already use in
-        # MainWindow (speak "<tab> tab", then move focus), which is
-        # confirmed to not lose the race against the focus-change
-        # announcement that follows. Centralized here (rather than
-        # repeated in every panel's own onTabActivated) since these
-        # panels don't carry a TAB_NAME attribute the way MainWindow's
-        # tabs do -- the notebook's own page text is the single source
-        # of truth for the label either way.
+        # Announce the tab name first, then grant real focus (the order that avoids losing the race).
         pageText = self.notebook.GetPageText(index)
         # Translators: Announced when switching to a Settings dialog tab. {} is the tab name.
         nvdaUi.message(_("{} tab").format(pageText))
@@ -1849,6 +2078,78 @@ class NVSkySettingsDialog(wx.Dialog):
             return
         evt.Skip()
 
+    # ---------------- OK / Apply ----------------
+
+    def onOk(self, evt):
+        self._startApply(closeAfter=True)
+
+    def onApply(self, evt):
+        self._startApply(closeAfter=False)
+
+    def _startApply(self, closeAfter):
+        if self._applying:
+            return
+        self._applying = True
+        self.okBtn.Disable()
+        self.applyBtn.Disable()
+
+        tasks = []
+        for page in self._pages():
+            applyFn = getattr(page, "apply", None)
+            if callable(applyFn):
+                applyFn()
+            tasksFn = getattr(page, "pendingTasks", None)
+            if callable(tasksFn):
+                tasks.extend(tasksFn())
+
+        if not tasks:
+            self._finishApply(closeAfter, [], [])
+            return
+
+        def worker():
+            done = []
+            failures = []
+            try:
+                atprotoClient = client.get_client_for_active_account()
+            except Exception as e:
+                wx.CallAfter(self._finishApply, closeAfter, [], [(t, str(e)) for t in tasks])
+                return
+            for task in tasks:
+                try:
+                    task.run(atprotoClient)
+                    done.append(task)
+                except Exception as e:
+                    log.error(f"NVSky: saving {task.label} failed: {e}")
+                    failures.append((task, str(e)))
+            wx.CallAfter(self._finishApply, closeAfter, done, failures)
+
+        uiutil.start_worker(worker)
+
+    @uiutil.safe_ui_callback(check_app_closing=False)
+    def _finishApply(self, closeAfter, done, failures):
+        self._applying = False
+        self.okBtn.Enable()
+        self.applyBtn.Enable()
+        for task in done:
+            task.commit()
+        if failures:
+            soundpack.play("error")
+            details = "; ".join(f"{task.label}: {error}" for task, error in failures)
+            # Translators: Announced when saving some settings to the server fails. {} lists what failed and why.
+            nvdaUi.message(_("Could not save: {}").format(details))
+            return
+        if done:
+            soundpack.play("ready")
+        if closeAfter:
+            self.Close()
+        else:
+            # Translators: Announced after the Apply button saves the settings.
+            nvdaUi.message(_("Settings applied."))
+
     def onClose(self, evt):
         gui.mainFrame.postPopup()
+        needsRebuild = self.displayPanel.tabsChanged
         self.Destroy()
+        if needsRebuild:
+            from . import rebuild_main_window_tabs
+            wx.CallAfter(rebuild_main_window_tabs, True)

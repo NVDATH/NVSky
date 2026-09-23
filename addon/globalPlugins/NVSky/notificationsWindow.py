@@ -20,6 +20,8 @@ from .feedWindow import (
     EmbedViewMixin,
     _format_post_time,
     _announce_now,
+    _post_web_url,
+    _compose_copy_text,
 )
 
 
@@ -157,6 +159,18 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
             nvdaUi.message(_("No notification selected."))
             return
         self.showUserActionMenu(notif["author_did"], notif["handle"], notif.get("display_name"))
+
+    def _copyFocusedPostRow(self):
+        notif = self._getFocusedPost()
+        if notif is None:
+            return
+        parts = [
+            self._authorLabel(notif, self._currentAuthorMode()),
+            _describe_notification(notif),
+            _format_post_time(notif.get("indexed_at")),
+        ]
+        url = _post_web_url(notif.get("subject_uri"), notif.get("subject_author_handle"))
+        uiutil.copy_text_to_clipboard(_compose_copy_text(parts, url))
 
     def onClearCache(self, evt=None):
         if self._account is None:

@@ -31,6 +31,8 @@ from .feedWindow import (
     _describe_embed,
     _message_text,
     _format_post_time,
+    _visible_embed_text,
+    _visible_message_text,
 )
 
 
@@ -261,7 +263,7 @@ class SubscribeListDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onUserListsLoaded, entries, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onUserListsLoaded(self, entries, error):
@@ -301,6 +303,8 @@ class SubscribeListDialog(wx.Dialog):
         return _("{} ({})").format(lst["name"], kind)
 
     def onOpenAsTabs(self, evt):
+        if not self.openTabButton.IsShown():
+            return
         checked = [self._userLists[i] for i in self.listsCheckBox.CheckedItems if 0 <= i < len(self._userLists)]
         curateLists = [l for l in checked if l["purpose"] == client.LIST_PURPOSE_CURATE]
         if not curateLists:
@@ -325,6 +329,8 @@ class SubscribeListDialog(wx.Dialog):
             nvdaUi.message(_("Opened {} lists as tabs.").format(len(curateLists)))
 
     def onSubscribe(self, action):
+        if not self.subscribeAsMuteButton.IsShown():
+            return
         checked = [self._userLists[i] for i in self.listsCheckBox.CheckedItems if 0 <= i < len(self._userLists)]
         modLists = [l for l in checked if l["purpose"] == client.LIST_PURPOSE_MOD]
         if not modLists:
@@ -345,7 +351,7 @@ class SubscribeListDialog(wx.Dialog):
                     errors.append(f'{lst["name"]}: {e}')
             wx.CallAfter(self._onSubscribeDone, len(modLists) - len(errors), errors)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onSubscribeDone(self, successCount, errors):
@@ -491,6 +497,8 @@ class ManageMembersDialog(wx.Dialog):
         db.set_user_list_cache(self._account["id"], f"list_members:{self._listInfo['uri']}", self._members)
 
     def onRemove(self, evt):
+        if not self.removeButton.IsShown():
+            return
         indices = list(self.memberList.CheckedItems)
         if not indices:
             # Translators: Announced when removing list members with nothing checked.
@@ -529,7 +537,7 @@ class ManageMembersDialog(wx.Dialog):
                     errors.append(f'@{member["handle"]}: {e}')
             wx.CallAfter(self._onRemoveDone, removed, errors)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onRemoveDone(self, removed, errors):
@@ -593,6 +601,8 @@ class ManageMembersDialog(wx.Dialog):
             self.suggestionList.SetSelection(0)
 
     def onAddSuggestion(self, evt):
+        if not self.addButton.IsShown():
+            return
         indices = list(self.suggestionList.CheckedItems)
         if not indices:
             # Translators: Announced when adding list members with nothing checked in search results.
@@ -618,7 +628,7 @@ class ManageMembersDialog(wx.Dialog):
                     errors.append(f'@{actor["handle"]}: {e}')
             wx.CallAfter(self._onAddDone, added, errors)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onAddDone(self, added, errors):
@@ -748,7 +758,7 @@ class AddToListDialog(wx.Dialog):
                     errors.append(f'{lst["name"]}: {e}')
             wx.CallAfter(self._onAddDone, added, errors)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onAddDone(self, added, errors):
@@ -835,9 +845,13 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
         # Nothing is focused/selectable at construction time yet --
         # _showSelectedList()/_updateActionButtons() re-show these once
-        # a curation list with posts actually gets focused.
+        # a curation list with posts actually gets focused. Disable()
+        # too, not just Hide() -- see _showSelectedList's matching fix
+        # for why (mnemonic dispatch ignores visibility).
         self.postActionButton.Hide()
+        self.postActionButton.Disable()
         self.userActionButton.Hide()
+        self.userActionButton.Disable()
 
         toolbarRow = wx.BoxSizer(wx.HORIZONTAL)
         # Translators: Button to create a new list. (Hidden -- kept as a real widget for onAddList()'s focus-restore calls; the shared toolbar's New-post button becomes "New list..." on this tab instead.)
@@ -852,6 +866,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         self.subscribeButton = wx.Button(self, label=_("&Find lists by user..."))
         for button in (self.addListButton, self.removeListButton, self.showInNewTabButton, self.manageMembersButton, self.subscribeButton):
             button.Hide()
+            button.Disable()
         #self.addListButton.Hide()
         # Remove/Show in new tab/Manage members moved into the list
         # tree's context menu (see onListContextMenu) -- mirrors Chat's
@@ -1060,7 +1075,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 error = str(e)
             wx.CallAfter(self._onSyncListsDone, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onSyncListsDone(self, error):
@@ -1156,8 +1171,15 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         if self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
             self.postList.Hide()
             self.memberList.Show()
+            # Disable() too, not just Hide() -- CONFIRMED bug pattern
+            # elsewhere (ChatWindow's Accept button): a hidden-but-
+            # enabled button still fires its own mnemonic. Alt+U here
+            # collides with _onAltU's own list-purpose branching in
+            # this same class.
             self.postActionButton.Hide()
+            self.postActionButton.Disable()
             self.userActionButton.Hide()
+            self.userActionButton.Disable()
             self.Layout()
             self._loadMembersLive()
         else:
@@ -1178,9 +1200,9 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         return post
 
     def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.InsertItem(index, _visible_embed_text(post))
         self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 2, _visible_message_text(post))
         self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
@@ -1220,7 +1242,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 error = str(e)
             wx.CallAfter(self._onMembersLoaded, info, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onMembersLoaded(self, info, error):
@@ -1306,7 +1328,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 error = str(e)
             wx.CallAfter(self._onCreateListDone, name, description, purpose, result, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onCreateListDone(self, name, description, purpose, result, error):
@@ -1366,7 +1388,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 error = str(e)
             wx.CallAfter(self._onRemoveListDone, listUri, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onRemoveListDone(self, listUri, error):
@@ -1533,7 +1555,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 error = str(e)
             wx.CallAfter(self._onManageMembersInfoReady, info, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     def _refreshListMembersCache(self, listUri):
         # Silent background refresh -- the dialog already showing
@@ -1735,9 +1757,9 @@ class ListTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActio
         return post
 
     def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.InsertItem(index, _visible_embed_text(post))
         self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 2, _visible_message_text(post))
         self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):

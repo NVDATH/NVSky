@@ -23,8 +23,10 @@ open).
 
 import json
 import os
+import re
 import secrets
 import threading
+import time
 from contextlib import contextmanager
 
 from sqlcipher3 import dbapi2 as sqlite3
@@ -54,6 +56,37 @@ def _get_or_create_db_key() -> str:
 
 
 _local = threading.local()
+_reset_lock = threading.Lock()
+
+
+def _is_unreadable_storage_error(e) -> bool:
+    text = str(e)
+    return "CryptUnprotectData" in text or "not a database" in text
+
+
+def _backup_unreadable_storage():
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    for path in (DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm", DB_KEY_PATH):
+        if os.path.exists(path):
+            try:
+                os.replace(path, f"{path}.{stamp}.bak")
+            except OSError as e:
+                log.error(f"NVSky: could not back up {path}: {e}")
+
+
+def _open_connection():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        dbKey = _get_or_create_db_key()
+        conn.execute(f"PRAGMA key = \"x'{dbKey}'\"")
+        conn.execute("SELECT count(*) FROM sqlite_master")
+    except Exception:
+        conn.close()
+        raise
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _get_connection():
@@ -76,12 +109,15 @@ def _get_connection():
     if conn is not None:
         return conn
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    dbKey = _get_or_create_db_key()
-    conn.execute(f"PRAGMA key = \"x'{dbKey}'\"")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.row_factory = sqlite3.Row
+    try:
+        conn = _open_connection()
+    except Exception as e:
+        if not _is_unreadable_storage_error(e):
+            raise
+        with _reset_lock:
+            log.error(f"NVSky: database/key unreadable, starting fresh: {e}")
+            _backup_unreadable_storage()
+            conn = _open_connection()
     _local.conn = conn
     return conn
 
@@ -95,6 +131,18 @@ def _connect():
     # explicitly where needed (see upsert_convo etc.), so nothing here
     # relied on close()-time behavior.
     yield _get_connection()
+
+
+def _addon_version_number() -> int:
+    # "1.2.3" -> 10203; 0 if unreadable (then no stamping, harmless)
+    try:
+        import addonHandler
+        version = addonHandler.getCodeAddon().manifest["version"]
+        parts = [int(p) for p in re.findall(r"\d+", version)[:3]]
+        parts += [0] * (3 - len(parts))
+        return parts[0] * 10000 + parts[1] * 100 + parts[2]
+    except Exception:
+        return 0
 
 
 def init_db():
@@ -116,7 +164,8 @@ def init_db():
                 avatar_url TEXT,
                 viewer_following TEXT,
                 viewer_muted INTEGER DEFAULT 0,
-                viewer_blocking TEXT
+                viewer_blocking TEXT,
+                viewer_activity_subscription INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS posts (
@@ -147,6 +196,7 @@ def init_db():
                 viewer_repost_uri TEXT,
                 viewer_bookmarked INTEGER DEFAULT 0,
                 viewer_thread_muted INTEGER DEFAULT 0,
+                labels_json TEXT,
                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
                 FOREIGN KEY (author_did) REFERENCES authors(did)
             );
@@ -242,6 +292,12 @@ def init_db():
                 value TEXT
             );
         """)
+        # Steps are keyed by the release that introduced them (1.2.0 -> 10200)
+        # and must be idempotent, e.g. "if stored < 10200: ALTER TABLE ...".
+        stored = conn.execute("PRAGMA user_version").fetchone()[0]
+        current = _addon_version_number()
+        if current > stored:
+            conn.execute(f"PRAGMA user_version = {current}")
         conn.commit()
     log.info(f"NVSky: database ready at {DB_PATH}")
 
@@ -292,6 +348,10 @@ def remove_account(account_id: int):
         conn.execute("DELETE FROM convos WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM messages WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM convo_members WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM notifications WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM lists WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"%:{account_id}",))
+        conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"user_list_cache:{account_id}:%",))
         conn.commit()
         conn.execute("VACUUM")
 
@@ -417,6 +477,15 @@ def set_author_blocking(did: str, blocking_uri):
         conn.commit()
 
 
+def set_author_activity_subscription(did: str, subscribed: bool):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE authors SET viewer_activity_subscription = ? WHERE did = ?",
+            (1 if subscribed else 0, did),
+        )
+        conn.commit()
+
+
 # ---------------- posts ----------------
 
 def upsert_post(post: dict):
@@ -428,12 +497,12 @@ def upsert_post(post: dict):
                 like_count, repost_count, reply_count, reply_parent_uri,
                 reply_to_did, reply_to_handle, is_repost, reposted_by_did, reposted_by_handle, reposted_by_display_name,
                 embed_json, facets_json, quoted_text, quoted_author_handle, viewer_like_uri, viewer_repost_uri,
-                viewer_bookmarked, viewer_thread_muted)
+                viewer_bookmarked, viewer_thread_muted, labels_json)
                VALUES (:uri, :cid, :account_id, :author_did, :text, :created_at, :indexed_at,
                        :like_count, :repost_count, :reply_count, :reply_parent_uri,
                        :reply_to_did, :reply_to_handle, :is_repost, :reposted_by_did, :reposted_by_handle, :reposted_by_display_name,
                        :embed_json, :facets_json, :quoted_text, :quoted_author_handle, :viewer_like_uri, :viewer_repost_uri,
-                       :viewer_bookmarked, :viewer_thread_muted)
+                       :viewer_bookmarked, :viewer_thread_muted, :labels_json)
                ON CONFLICT(uri) DO UPDATE SET
                    text=excluded.text,
                    created_at=excluded.created_at,
@@ -455,7 +524,8 @@ def upsert_post(post: dict):
                    viewer_like_uri=excluded.viewer_like_uri,
                    viewer_repost_uri=excluded.viewer_repost_uri,
                    viewer_bookmarked=excluded.viewer_bookmarked,
-                   viewer_thread_muted=excluded.viewer_thread_muted""",
+                   viewer_thread_muted=excluded.viewer_thread_muted,
+                   labels_json=excluded.labels_json""",
             post,
         )
         conn.commit()
@@ -826,6 +896,15 @@ def mark_message_unread(account_id: int, convo_id: str, message_id: str):
         conn.commit()
 
 
+def delete_message(account_id: int, convo_id: str, message_id: str):
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE account_id = ? AND convo_id = ? AND message_id = ?",
+            (account_id, convo_id, message_id),
+        )
+        conn.commit()
+
+
 def set_message_reactions(account_id: int, convo_id: str, message_id: str, reactions_json: str):
     # Local-first write for _ChatMessagePanelMixin._applyReactionsLocally's
     # optimistic UI -- sync_convo_messages's normal upsert_message path
@@ -1060,6 +1139,26 @@ def get_saved_feeds_cache(account_id: int) -> list:
         return []
 
 
+# ---------------- content label prefs cache (Settings > Content labels) ----------------
+# Local cache so FeedListMixin's per-row visibility check never needs a
+# network call -- written whenever Settings > Content labels loads or
+# saves a change. Missing/empty means "no explicit pref cached yet" --
+# callers fall back to client.CONTENT_LABEL_DEFAULT_VISIBILITY.
+
+def get_content_label_prefs_cache(account_id: int) -> dict:
+    raw = get_ui_state(f"content_label_prefs_cache:{account_id}")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
+def set_content_label_prefs_cache(account_id: int, prefs: dict):
+    set_ui_state(f"content_label_prefs_cache:{account_id}", json.dumps(prefs))
+
+
 # ---------------- user list cache (followers/following/people-search tabs) ----------------
 # Same ui_state-backed JSON-blob pattern as saved_feeds_cache above --
 # UserListTabWindow (feedWindow.py) shows this instantly on open, then
@@ -1140,6 +1239,30 @@ def set_bg_sync_last(account_id: int, category: str, iso_timestamp: str):
     set_ui_state(f"bg_sync_last:{category}:{account_id}", iso_timestamp)
 
 
+def get_chat_log_cursor(account_id: int):
+    """chat.bsky.convo.getLog cursor for background delta-sync (see
+    client.sync_chat_delta) -- None means never synced this way yet,
+    triggers a one-time full bootstrap sync."""
+    return get_ui_state(f"chat_log_cursor:{account_id}")
+
+
+def set_chat_log_cursor(account_id: int, cursor: str):
+    set_ui_state(f"chat_log_cursor:{account_id}", cursor)
+
+
+def get_notification_sync_cursor(account_id: int):
+    """listNotifications cursor from the last successful sync -- lets
+    sync_notifications resume from where it left off instead of always
+    re-fetching only the newest 50, which silently dropped anything
+    past that if more than 50 notifications arrived between syncs
+    (e.g. the add-on left closed for a while, or a popular account)."""
+    return get_ui_state(f"notification_sync_cursor:{account_id}")
+
+
+def set_notification_sync_cursor(account_id: int, cursor: str):
+    set_ui_state(f"notification_sync_cursor:{account_id}", cursor)
+
+
 def get_home_active_filter(account_id: int) -> str:
     """The feed_key FeedWindow's filter dropdown was last set to (e.g.
     "home", "discover", or a custom feed uri) -- persisted on every
@@ -1153,12 +1276,46 @@ def set_home_active_filter(account_id: int, feed_key: str):
     set_ui_state(f"home_active_filter:{account_id}", feed_key)
 
 
+DEFAULT_ENABLED_TABS = {"notifications", "explore", "chat", "lists"}
+
+
+def get_enabled_tabs() -> set:
+    """Permanent tabs shown besides Home (Home is always shown)."""
+    raw = get_ui_state("enabled_tabs")
+    if raw is None:
+        return set(DEFAULT_ENABLED_TABS)
+    try:
+        return set(json.loads(raw))
+    except (ValueError, TypeError):
+        return set(DEFAULT_ENABLED_TABS)
+
+
+def set_enabled_tabs(tabs) -> None:
+    set_ui_state("enabled_tabs", json.dumps(sorted(tabs)))
+
+
 # ---------------- sound pack ----------------
 
 def get_soundpack_selected() -> str:
-    """Empty string means "Silent / No sound" -- also the default for
-    an account that's never touched Settings > Sound."""
-    return get_ui_state("soundpack_selected") or ""
+    """
+    Empty string means "Silent / No sound". Falls back to the
+    "default" pack folder (soundpack.DEFAULT_PACK_NAME) for an account
+    that's never touched Settings > Sound -- NOT Silent, which was a
+    real bug: a fresh install/DB had no ui_state row for this key at
+    all, so get_ui_state() returned None and every sound was silent by
+    default until the user opened Settings > Sound once and picked
+    something. Falls back further to whichever pack folder is found
+    first (alphabetically) if "default" doesn't exist, and only
+    actually falls back to Silent if no pack folder exists at all.
+    """
+    raw = get_ui_state("soundpack_selected")
+    if raw is not None:
+        return raw
+    from . import soundpack
+    packs = soundpack.list_packs()
+    if soundpack.DEFAULT_PACK_NAME in packs:
+        return soundpack.DEFAULT_PACK_NAME
+    return packs[0] if packs else ""
 
 
 def set_soundpack_selected(pack_name: str):

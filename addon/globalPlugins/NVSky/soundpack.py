@@ -16,6 +16,7 @@ Two playback modes:
 """
 import os
 import threading
+import time
 
 import tones
 import nvwave
@@ -37,14 +38,19 @@ EVENT_KEYS = [
     "notification",
     "open_tab", "close_tab", "boundary", "error", "ready",
     "embed_image", "embed_video", "embed_link", "embed_quote",
-    "max_length",
+    "max_length", "content_warning",
+    "main_open", "main_close",
 ]
+
+# Safety net: a progress sound nobody stopped ends itself after this long.
+PROGRESS_MAX_SECONDS = 180
 
 # The looped progress-indicator sound -- played on repeat while
 # something loads, distinct from the one-shot EVENT_KEYS above.
 PROGRESS_KEY = "progress"
 
 SILENT_PACK = ""  # sentinel for "Silent / No sound" in the picker
+DEFAULT_PACK_NAME = "default"  # bundled pack folder used as the out-of-the-box default
 
 
 def list_packs() -> list:
@@ -86,8 +92,9 @@ class SoundEngine:
         self._enabledEvents = set()
         self._availablePaths = {}  # event_key -> path, only for files that exist
         self._progressPath = None
+        self._progressLock = threading.Lock()
+        self._progressCount = 0
         self._progressStopEvent = threading.Event()
-        self._progressThread = None
         self._debounceTimer = None
         self.reload()
 
@@ -120,7 +127,7 @@ class SoundEngine:
         except Exception as e:
             log.error(f"NVSky: failed to play sound {path}: {e}")
 
-    def play_debounced(self, event_key: str, delay_ms: int = 150):
+    def play_debounced(self, event_key: str, delay_ms: int = 0):
         """
         Same as play(), but delayed and cancellable -- used for
         focus-driven sounds (embed type on arrow-key navigation) where
@@ -139,39 +146,64 @@ class SoundEngine:
             return
         if self._debounceTimer is not None:
             self._debounceTimer.cancel()
+            self._debounceTimer = None
+        if delay_ms <= 0:
+            # Blocking on purpose: NVDA handles the focus event after this returns,
+            # so the sound always lands before speech.
+            self._play_debounced_fire(path, asynchronous=False)
+            return
         self._debounceTimer = threading.Timer(delay_ms / 1000.0, self._play_debounced_fire, args=(path,))
         self._debounceTimer.daemon = True
         self._debounceTimer.start()
 
-    def _play_debounced_fire(self, path):
+    def _play_debounced_fire(self, path, asynchronous=True):
         try:
-            nvwave.playWaveFile(path)
+            nvwave.playWaveFile(path, asynchronous=asynchronous)
         except Exception as e:
             log.error(f"NVSky: failed to play sound {path}: {e}")
 
     # ---------------- progress indicator (looped) ----------------
 
     def start_progress(self):
-        """Starts the looped 'still working' indicator. No-op if
-        already running -- callers don't need to track state themselves."""
-        if self._progressThread is not None and self._progressThread.is_alive():
-            return
-        self._progressStopEvent.clear()
-        progressPath = self._progressPath
-        self._progressThread = threading.Thread(
-            target=self._progress_worker, args=(progressPath,), daemon=True
-        )
-        self._progressThread.start()
+        """Counted: every start_progress() needs one stop_progress(); the
+        looped sound plays while at least one caller is still waiting."""
+        with self._progressLock:
+            self._progressCount += 1
+            if self._progressCount > 1:
+                return
+            stopEvent = threading.Event()
+            self._progressStopEvent = stopEvent
+            threading.Thread(
+                target=self._progress_worker, args=(self._progressPath, stopEvent), daemon=True
+            ).start()
 
     def stop_progress(self):
-        self._progressStopEvent.set()
+        with self._progressLock:
+            if self._progressCount == 0:
+                return
+            self._progressCount -= 1
+            if self._progressCount == 0:
+                self._progressStopEvent.set()
 
-    def _progress_worker(self, progress_path):
+    def reset_progress(self):
+        with self._progressLock:
+            self._progressCount = 0
+            self._progressStopEvent.set()
+
+    def _progress_worker(self, progress_path, stopEvent):
         useBeepFallback = not progress_path
-        while not self._progressStopEvent.is_set():
+        deadline = time.time() + PROGRESS_MAX_SECONDS
+        while not stopEvent.is_set():
+            if time.time() > deadline:
+                log.info("NVSky: progress sound ended by safety timeout (a start_progress had no stop)")
+                with self._progressLock:
+                    if self._progressStopEvent is stopEvent:
+                        self._progressCount = 0
+                stopEvent.set()
+                return
             if useBeepFallback:
                 tones.beep(500, 50)
-                self._progressStopEvent.wait(1.0)
+                stopEvent.wait(1.0)
             else:
                 try:
                     nvwave.playWaveFile(progress_path)
@@ -179,7 +211,7 @@ class SoundEngine:
                     log.error(f"NVSky: failed to play progress sound {progress_path}: {e}")
                     useBeepFallback = True
                     continue
-                self._progressStopEvent.wait(1.0)
+                stopEvent.wait(1.0)
 
 
 _engine = None
@@ -198,7 +230,7 @@ def play(event_key: str):
     get_engine().play(event_key)
 
 
-def play_debounced(event_key: str, delay_ms: int = 150):
+def play_debounced(event_key: str, delay_ms: int = 0):
     get_engine().play_debounced(event_key, delay_ms)
 
 
@@ -208,6 +240,10 @@ def start_progress():
 
 def stop_progress():
     get_engine().stop_progress()
+
+
+def reset_progress():
+    get_engine().reset_progress()
 
 
 def reload():

@@ -6,6 +6,7 @@ shows everything cached on open, lazy-loads from the network once the
 cache runs out. Other tabs are not implemented yet -- Home only.
 """
 import core
+import datetime
 import json
 import threading
 import webbrowser
@@ -110,8 +111,10 @@ def _embed_sound_event(embed_json: str):
             return "embed_image"
         if embed.get("video_url") or embed.get("video_alt") is not None:
             return "embed_video"
+        if embed.get("link_url"):
+            return "embed_link"
         return "embed_quote"
-    if "images" in embed_type:
+    if "images" in embed_type or "gallery" in embed_type:
         return "embed_image"
     if "video" in embed_type:
         return "embed_video"
@@ -132,7 +135,7 @@ def _describe_embed(embed_json: str) -> str:
 
     embed_type = embed.get("$type", "")
 
-    if "images" in embed_type:
+    if "images" in embed_type or "gallery" in embed_type:
         images = embed.get("images", [])
         alts = [img.get("alt") for img in images if img.get("alt")]
         # Translators: Embed summary for a post with more than one image. {} is the count.
@@ -154,6 +157,9 @@ def _describe_embed(embed_json: str) -> str:
         if embed.get("video_url") or embed.get("video_alt") is not None:
             # Translators: Embed summary for a quote post that also carries an attached video.
             return _("Quote + video")
+        if embed.get("link_url"):
+            # Translators: Embed summary for a quote post that also carries a link-preview card.
+            return _("Quote + link")
         # Translators: Fallback embed summary for a quote post with media whose type couldn't be determined.
         return _("Quote + media")
     if "record" in embed_type:
@@ -163,6 +169,19 @@ def _describe_embed(embed_json: str) -> str:
         # Translators: Embed summary for a post with a link-preview card.
         return _("Link")
     return ""
+
+
+def _post_web_url(uri, handle_or_did) -> str:
+    if not uri or not handle_or_did:
+        return ""
+    return f"https://bsky.app/profile/{handle_or_did}/post/{uri.rsplit('/', 1)[-1]}"
+
+
+def _compose_copy_text(parts, url) -> str:
+    text = ", ".join(p for p in parts if p)
+    if url:
+        return f"{text} ({url})" if text else url
+    return text
 
 
 def _message_text(post: dict) -> str:
@@ -194,6 +213,102 @@ def _message_text(post: dict) -> str:
             text = _("Reposted: {}").format(text)
 
     return uiutil.single_line(text)
+
+
+# Translators: Short placeholder shown in the Embed column for a content-labeled ("warn") post -- kept generic/brief, the actual category names go in the Message column instead.
+CONTENT_WARNING_EMBED_TEXT = _("Warning")
+# Translators: Placeholder shown in the Message column for a content-labeled ("warn") post, in place of the real text. {} is a comma-separated list of the matched category names.
+CONTENT_WARNING_MESSAGE_TEXT = _("(Content warning: {})")
+
+
+def _label_visibility(post: dict) -> str:
+    """
+    Returns "show"/"warn"/"hide" for `post`, based on its cached
+    labels_json and the account's cached content-label preferences
+    (db.get_content_label_prefs_cache -- see Settings > Content
+    labels). Only the standard adult-content labels
+    (client.CONTENT_LABEL_KEYS) are considered; any other label a
+    labeler might attach is ignored. If a post carries more than one
+    matching label, the most restrictive visibility wins.
+    """
+    labelsJson = post.get("labels_json")
+    if not labelsJson:
+        return "show"
+    try:
+        labels = json.loads(labelsJson)
+    except (ValueError, TypeError):
+        return "show"
+    if not labels:
+        return "show"
+
+    account = db.get_active_account()
+    prefsCache = db.get_content_label_prefs_cache(account["id"]) if account else {}
+
+    order = {"show": 0, "warn": 1, "hide": 2}
+    worst = "show"
+    for label in labels:
+        if label not in client.CONTENT_LABEL_KEYS:
+            continue
+        visibility = client.effective_label_visibility(prefsCache, label)
+        if order.get(visibility, 0) > order.get(worst, 0):
+            worst = visibility
+    return worst
+
+
+def _matched_label_names(post: dict) -> str:
+    labelsJson = post.get("labels_json")
+    if not labelsJson:
+        return ""
+    try:
+        labels = json.loads(labelsJson)
+    except (ValueError, TypeError):
+        return ""
+    return ", ".join(l for l in labels if l in client.CONTENT_LABEL_KEYS)
+
+
+def _visible_embed_text(post: dict) -> str:
+    if _label_visibility(post) == "warn":
+        return CONTENT_WARNING_EMBED_TEXT
+    return _describe_embed(post.get("embed_json"))
+
+
+def _visible_message_text(post: dict) -> str:
+    if _label_visibility(post) == "warn":
+        return CONTENT_WARNING_MESSAGE_TEXT.format(_matched_label_names(post))
+    return _message_text(post)
+
+
+def propagate_post_state(post: dict):
+    """Copies viewer state onto every other open tab's in-memory copy of the same post."""
+    from . import get_main_window
+    mainWindow = get_main_window()
+    if mainWindow is None:
+        return
+    fields = ("viewer_like_uri", "viewer_repost_uri", "viewer_bookmarked", "viewer_thread_muted")
+    for panel in mainWindow.getOpenTabs():
+        for other in getattr(panel, "_posts", None) or []:
+            if other is not post and other.get("uri") == post.get("uri"):
+                for field in fields:
+                    if field in post:
+                        other[field] = post[field]
+
+
+def sync_like_state(post: dict, account_id: int):
+    """Persists a like/unlike made outside the feed tabs and mirrors it to every open tab."""
+    db.set_post_like_uri(post["uri"], post.get("viewer_like_uri"))
+    propagate_post_state(post)
+    if post.get("viewer_like_uri"):
+        likedAt = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        db.upsert_feed_item(account_id, "likes", post["uri"], likedAt)
+    else:
+        db.delete_feed_item(account_id, "likes", post["uri"])
+    from . import get_main_window
+    mainWindow = get_main_window()
+    if mainWindow is None:
+        return
+    for panel in mainWindow.getOpenTabs():
+        if getattr(panel, "TAB_KEY", None) == "likes":
+            panel._loadFromCache(reset=True)
 
 
 class RemovableTabMixin:
@@ -256,8 +371,21 @@ class UserActionMixin:
         return item
 
     def _populateUserActionMenu(self, menu, did, handle, display_name=None):
-        # Translators: User action menu item.
-        self._addMenuItem(menu, _("&View profile..."), lambda: self.viewProfile(did))
+        browseMenu = wx.Menu()
+        # Translators: Submenu item under "View...", opens the user's profile.
+        self._addMenuItem(browseMenu, _("&Profile..."), lambda: self.viewProfile(did))
+        # Translators: Submenu item under "View...", opens the user's timeline.
+        self._addMenuItem(browseMenu, _("&Timeline..."), lambda: self.showTimeline(did, handle, display_name))
+        # Translators: Submenu item under "View...", opens the user's followers list.
+        self._addMenuItem(browseMenu, _("&Followers..."), lambda: self.showFollowers(did, handle, display_name))
+        # Translators: Submenu item under "View...", opens who the user follows.
+        self._addMenuItem(browseMenu, _("Follo&wing..."), lambda: self.showFollowing(did, handle, display_name))
+        # Translators: Submenu item under "View...", opens followers you both share.
+        self._addMenuItem(browseMenu, _("Kn&own followers..."), lambda: self.showKnownFollowers(did, handle, display_name))
+        # Translators: Submenu item under "View...", opens lists the user is on.
+        self._addMenuItem(browseMenu, _("&Lists..."), lambda: self.showUserLists(did, handle, display_name))
+        # Translators: User action submenu label.
+        menu.AppendSubMenu(browseMenu, _("&View..."))
         # Translators: User action menu item.
         self._addMenuItem(menu, _("&Start chat..."), lambda: self.startChat(did, handle))
         menu.AppendSeparator()
@@ -294,19 +422,6 @@ class UserActionMixin:
             self._addMenuItem(menu, _("&Block / Unblock"), lambda: self._toggleRelation(did, handle, "block"))
         menu.AppendSeparator()
 
-        browseMenu = wx.Menu()
-        # Translators: Submenu item under "Show...", opens the user's timeline.
-        self._addMenuItem(browseMenu, _("&Timeline..."), lambda: self.showTimeline(did, handle, display_name))
-        # Translators: Submenu item under "Show...", opens the user's followers list.
-        self._addMenuItem(browseMenu, _("&Followers..."), lambda: self.showFollowers(did, handle, display_name))
-        # Translators: Submenu item under "Show...", opens who the user follows.
-        self._addMenuItem(browseMenu, _("Follo&wing..."), lambda: self.showFollowing(did, handle, display_name))
-        # Translators: Submenu item under "Show...", opens followers you both share.
-        self._addMenuItem(browseMenu, _("Kn&own followers..."), lambda: self.showKnownFollowers(did, handle, display_name))
-        # Translators: Submenu item under "Show...", opens lists the user is on.
-        self._addMenuItem(browseMenu, _("&Lists..."), lambda: self.showUserLists(did, handle, display_name))
-        # Translators: User action submenu label.
-        menu.AppendSubMenu(browseMenu, _("Sho&w..."))
         # Translators: User action menu item.
         self._addMenuItem(menu, _("&Add to list..."), lambda: self.addToList(did, handle, display_name))
         menu.AppendSeparator()
@@ -433,7 +548,7 @@ class UserActionMixin:
                 error = str(e)
             wx.CallAfter(self._onProfileFetched, profile, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onProfileFetched(self, profile, error):
@@ -489,6 +604,7 @@ class UserActionMixin:
         label = f"@{handle}" if handle else did
         # Translators: Announced while starting a new chat. {} is the recipient's label.
         _announce_now(_("Starting chat with {}, please wait...").format(label))
+        soundpack.start_progress()
 
         def worker():
             try:
@@ -503,7 +619,11 @@ class UserActionMixin:
                     wx.CallAfter(self._onStartChatDone, None, _("{} isn't accepting messages from you.").format(label))
                     return
                 convo = client.get_or_create_convo_for_member(atprotoClient, did)
-                client.sync_convos(atprotoClient, account["id"], account["did"])
+                convoId = convo.get("id") if convo else None
+                if convoId:
+                    client.sync_convo_messages(atprotoClient, account["id"], convoId)
+                    if db.get_convo(account["id"], convoId) is None:
+                        client.sync_convos(atprotoClient, account["id"], account["did"])
                 error = None
             except Exception as e:
                 convo = None
@@ -514,6 +634,7 @@ class UserActionMixin:
 
     @uiutil.safe_ui_callback
     def _onStartChatDone(self, convo, error):
+        soundpack.stop_progress()
         if error or not convo or not convo.get("id"):
             # Translators: Fallback error when the server doesn't explain why opening a chat failed.
             errorText = error or _("no conversation was returned")
@@ -597,7 +718,7 @@ class UserActionMixin:
                 error = str(e)
             wx.CallAfter(self._onRelationStatusChecked, did, handle, kind, profile, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onRelationStatusChecked(self, did, handle, kind, profile, error):
@@ -666,6 +787,10 @@ class UserActionMixin:
             nvdaUi.message(message)
 
     def _toggleRelationCached(self, did, handle, kind, currentValue):
+        if currentValue == "pending":
+            # Translators: Announced when an action is repeated while the previous one is still in progress.
+            _announce_now(_("Please wait..."))
+            return
         label = f"@{handle}" if handle else did
         if kind == "follow":
             db.set_author_following(did, None if currentValue else "pending")
@@ -721,7 +846,7 @@ class UserActionMixin:
         else:
             db.set_author_blocking(did, finalValue)
         if error:
-            # Translators: Announced when a follow/mute/block action fails after the optimistic UI update. {} is the error message.
+            # Translators: Announced when a follow/mute/block/subscribe action fails after the optimistic UI update. {} is the error message.
             nvdaUi.message(_("Action failed: {}").format(error))
 
     def _reportActor(self, did, handle):
@@ -831,6 +956,12 @@ class UserListMixin:
 
     def onUserListCharHook(self, evt):
         keyCode = evt.GetKeyCode()
+        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.userList:
+            if uiutil.copy_focused_row(self.userList):
+                return
+        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.userList:
+            uiutil.jump_to_row(self, self.userList)
+            return
         if evt.AltDown() and keyCode == ord("U"):
             self.onUserAction()
             return
@@ -919,7 +1050,7 @@ class EmbedViewMixin:
         if linkUrl:
             title = embed.get("link_title") or linkUrl
             # Translators: Context menu item to open a post's link preview in a browser. {} is the link's title or URL.
-            self._addMenuItem(menu, _("Open &link: {}").format(title), lambda: webbrowser.open(linkUrl))
+            self._addMenuItem(menu, _("Open &link: {}").format(title), lambda: self._openWebLink(linkUrl))
             # Translators: Context menu item to copy a post's link-preview URL.
             self._addMenuItem(menu, _("Copy link &URL"), lambda: self._copyEmbedUrl(linkUrl, _("Link URL")))
             added = True
@@ -928,6 +1059,14 @@ class EmbedViewMixin:
             menu.Destroy()
             return None
         return menu
+
+    def _openWebLink(self, url):
+        # Web links only -- never hand an arbitrary URI scheme to the shell.
+        if not str(url).lower().startswith(("http://", "https://")):
+            # Translators: Announced when a post's link uses a scheme other than http/https and is refused.
+            _announce_now(_("Only http and https links can be opened."))
+            return
+        webbrowser.open(url)
 
     def _copyEmbedUrl(self, url, label):
         self._copyToClipboard(url)
@@ -948,7 +1087,7 @@ class EmbedViewMixin:
             # Translators: Announced after an image finishes opening.
             wx.CallAfter(self._onActionDone, _("Image opened.") if not error else None, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     def _sendEmbedImageToBeMyEyes(self, url):
         # Translators: Announced while downloading an image to send it to Be My Eyes.
@@ -965,7 +1104,7 @@ class EmbedViewMixin:
             # Translators: Announced after an image is sent to Be My Eyes.
             wx.CallAfter(self._onActionDone, _("Sent to Be My Eyes.") if not error else None, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     def _copyEmbedImageToClipboard(self, url):
         def announce_start():
@@ -992,7 +1131,7 @@ class EmbedViewMixin:
             except Exception as e:
                 wx.CallAfter(self._onActionDone, None, str(e))
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     def _openEmbedVideo(self, url):
         # Translators: Announced while downloading a video to open it.
@@ -1008,7 +1147,17 @@ class EmbedViewMixin:
             # Translators: Announced after a video finishes opening.
             wx.CallAfter(self._onActionDone, _("Video opened.") if not error else None, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
+
+    @uiutil.safe_ui_callback
+    def _onLikeSynced(self, post, message, error):
+        self._onActionDone(message, error)
+        if error:
+            return
+        soundpack.play("like" if post.get("viewer_like_uri") else "unlike")
+        account = db.get_active_account()
+        if account is not None:
+            sync_like_state(post, account["id"])
 
     @uiutil.safe_ui_callback
     def _onActionDone(self, message, error):
@@ -1193,7 +1342,8 @@ class FeedListMixin:
             self.postList.DeleteAllItems()
             return
         if reset:
-            self._posts = self._applySortOrder(self._dbGetPage())
+            posts = self._applySortOrder(self._dbGetPage())
+            self._posts = [p for p in posts if _label_visibility(p) != "hide"]
         self._render()
 
     def _buildFeedListColumns(self):
@@ -1282,9 +1432,9 @@ class FeedListMixin:
         # into FeedWindow/SavedWindow/ListsWindow/ListTabWindow -- same
         # class of duplication chatWindow.py's ChatWindow/ConvoTabWindow
         # had, fixed the same way.
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.InsertItem(index, _visible_embed_text(post))
         self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 2, _visible_message_text(post))
         self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _render(self):
@@ -1340,11 +1490,21 @@ class FeedListMixin:
         # "No post selected." every time. Same Show()/Layout() pattern
         # MainWindow already uses to hide Remove current tab on
         # permanent tabs.
+        #
+        # Also Disable(), not just Hide() -- CONFIRMED bug elsewhere
+        # (ChatWindow's Accept button): a Hide()-only wx.Button still
+        # fires its own mnemonic (Alt+A/Alt+U here) even while
+        # invisible, since wx dispatches mnemonics to any control that
+        # is merely non-shown but still enabled. Alt+A/Alt+U are
+        # global shortcuts used everywhere in this app, so a stray
+        # hidden-but-enabled instance is a real risk of a silent
+        # duplicate/wrong-target trigger on any empty list.
         hasItems = bool(self._posts)
         for buttonName in ("postActionButton", "userActionButton"):
             button = getattr(self, buttonName, None)
             if button is not None:
                 button.Show(hasItems)
+                button.Enable(hasItems)
         self.Layout()
 
     def _announceNthNewestPost(self, n: int):
@@ -1474,9 +1634,12 @@ class FeedListMixin:
             post = self._posts[index]
             db.set_ui_state(self._focusStateKey(), post["uri"])
 
-            embedEvent = _embed_sound_event(post.get("embed_json"))
-            if embedEvent:
-                soundpack.play_debounced(embedEvent)
+            if _label_visibility(post) == "warn":
+                soundpack.play_debounced("content_warning")
+            else:
+                embedEvent = _embed_sound_event(post.get("embed_json"))
+                if embedEvent:
+                    soundpack.play_debounced(embedEvent)
 
             if not post.get("is_read"):
                 self._markItemRead(post)
@@ -1835,7 +1998,22 @@ class FeedListMixin:
         if evt.AltDown() and keyCode == ord("U"):
             self._onAltU()
             return
-        if keyCode == wx.WXK_SPACE and getattr(self, "SUPPORTS_FOCUS_NEXT_UNREAD", False) and self.FindFocus() is self.postList:
+        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown():
+            focused = self.FindFocus()
+            if focused is self.postList:
+                self._copyFocusedPostRow()
+                return
+            if isinstance(focused, (wx.ListCtrl, wx.TreeCtrl)) and uiutil.copy_focused_row(focused):
+                return
+        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown():
+            focused = self.FindFocus()
+            if isinstance(focused, wx.ListCtrl):
+                uiutil.jump_to_row(self, focused)
+                return
+        if keyCode == wx.WXK_SPACE and evt.ControlDown() and self.FindFocus() is self.postList:
+            self._revealContentWarning()
+            return
+        if keyCode == wx.WXK_SPACE and not evt.ControlDown() and getattr(self, "SUPPORTS_FOCUS_NEXT_UNREAD", False) and self.FindFocus() is self.postList:
             self._focusNextUnread()
             return
         if evt.ControlDown() and keyCode == ord("A") and getattr(self, "SUPPORTS_SELECT_ALL", False) and self.FindFocus() is self.postList:
@@ -1849,6 +2027,44 @@ class FeedListMixin:
             return
 
         evt.Skip()
+
+    def _copyFocusedPostRow(self):
+        post = self._getFocusedPost()
+        if post is None:
+            return
+        parts = [
+            self._authorLabel(post, self._currentAuthorMode()),
+            _message_text(post),
+            _format_post_time(post.get("indexed_at")),
+        ]
+        url = _post_web_url(post.get("uri"), post.get("handle") or post.get("author_did"))
+        uiutil.copy_text_to_clipboard(_compose_copy_text(parts, url))
+
+    def _revealContentWarning(self):
+        # Rewrites the FOCUSED ROW's own displayed embed AND message
+        # columns in place (SetItem only, never touches self._posts or
+        # any cached state) so the real content actually replaces both
+        # placeholders on screen, not just spoken once. Deliberately
+        # transient -- any future _render() call (arrow off and back,
+        # F5, tab switch) recomputes from _visible_embed_text/
+        # _visible_message_text again and goes right back to showing
+        # the warning; nothing here is remembered.
+        index = self.postList.GetFocusedItem()
+        post = self._getFocusedPost()
+        if post is None:
+            return
+        if _label_visibility(post) != "warn":
+            # Translators: Announced when Ctrl+Space is pressed on a post with no content warning to reveal.
+            nvdaUi.message(_("This post has no content warning."))
+            return
+        realEmbedText = _describe_embed(post.get("embed_json"))
+        realMessageText = _message_text(post)
+        matchedNames = _matched_label_names(post)
+        revealedEmbedText = f"{CONTENT_WARNING_EMBED_TEXT}, {realEmbedText}" if realEmbedText else CONTENT_WARNING_EMBED_TEXT
+        revealedMessageText = f"{CONTENT_WARNING_MESSAGE_TEXT.format(matchedNames)} {realMessageText}".strip()
+        self.postList.SetItem(index, 0, revealedEmbedText)
+        self.postList.SetItem(index, 2, revealedMessageText)
+        nvdaUi.message(", ".join(p for p in [revealedEmbedText, revealedMessageText] if p))
 
     def _checkListBoundaryBeforeKey(self, keyCode):
         # Deterministic instead of comparing focus before/after via
@@ -2151,9 +2367,36 @@ class ItemActionMixin:
                 message = None
             if not error:
                 soundpack.play("unlike" if wasLiked else "like")
-            wx.CallAfter(self._onActionDone, message, error)
+            wx.CallAfter(self._onLikeToggleDone, post, message, error)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _reloadOtherLikesTabs(self):
+        from . import get_main_window
+        mainWindow = get_main_window()
+        if mainWindow is None:
+            return
+        for panel in mainWindow.getOpenTabs():
+            if panel is not self and getattr(panel, "TAB_KEY", None) == "likes":
+                panel._loadFromCache(reset=True)
+
+    @uiutil.safe_ui_callback
+    def _onLikeToggleDone(self, post, message, error):
+        self._onActionDone(message, error)
+        if error:
+            return
+        propagate_post_state(post)
+        if post.get("viewer_like_uri"):
+            likedAt = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            db.upsert_feed_item(self._account["id"], "likes", post["uri"], likedAt)
+            self._reloadOtherLikesTabs()
+            return
+        db.delete_feed_item(self._account["id"], "likes", post["uri"])
+        self._refreshOtherSavedTabs(post, "likes")
+        onLikeChanged = getattr(self, "_onLikeChanged", None)
+        if callable(onLikeChanged):
+            onLikeChanged(post)
 
     def _toggleBookmark(self, post):
         wasBookmarked = bool(post.get("viewer_bookmarked"))
@@ -2188,6 +2431,7 @@ class ItemActionMixin:
         self._onActionDone(message, error)
         if error:
             return
+        propagate_post_state(post)
         if not post.get("viewer_bookmarked"):
             # BUG FIX: unsaving always drops the "saved" feed cache
             # entry now, regardless of which tab the toggle happened
@@ -2206,7 +2450,7 @@ class ItemActionMixin:
         if callable(onBookmarkChanged):
             onBookmarkChanged(post)
 
-    def _refreshOtherSavedTabs(self, post):
+    def _refreshOtherSavedTabs(self, post, tabKey="saved"):
         # Live-updates an already-open Saved tab if the unsave happened
         # from somewhere else (e.g. Home) -- without this, Saved would
         # only reflect the removal on its next full reload/F5.
@@ -2215,7 +2459,7 @@ class ItemActionMixin:
         if mainWindow is None:
             return
         for panel in mainWindow.getOpenTabs():
-            if panel is self or getattr(panel, "TAB_KEY", None) != "saved":
+            if panel is self or getattr(panel, "TAB_KEY", None) != tabKey:
                 continue
             for i, p in enumerate(getattr(panel, "_posts", [])):
                 if p["uri"] == post["uri"]:
@@ -2251,6 +2495,7 @@ class ItemActionMixin:
         wasMuted = bool(post.get("viewer_thread_muted"))
         post["viewer_thread_muted"] = not wasMuted
         db.set_post_thread_muted(post["uri"], not wasMuted)
+        propagate_post_state(post)
         # Translators: Announced after unmuting a thread.
         # Translators: Announced after muting a thread.
         self._onActionDone(_("Thread unmuted.") if wasMuted else _("Thread muted."), None)
@@ -2380,7 +2625,7 @@ class ItemActionMixin:
                 error = str(e)
             wx.CallAfter(self._onPinStatusChecked, post, pinnedUri, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onPinStatusChecked(self, post, pinnedUri, error):
@@ -2530,7 +2775,7 @@ class ItemActionMixin:
                 error = str(e)
             wx.CallAfter(self._onReplyPermissionsLoaded, post, threadgate, disablesQuotes, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onReplyPermissionsLoaded(self, post, threadgate, disablesQuotes, error):
@@ -2631,7 +2876,7 @@ class ItemActionMixin:
             # Translators: Announced after successfully updating reply permissions.
             wx.CallAfter(self._onActionDone, _("Reply permissions updated.") if not error else None, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     def _openComposeWithContext(self, reply_to=None, quote_of=None):
         gui.mainFrame.prePopup()
@@ -2731,6 +2976,10 @@ class ItemActionMixin:
             })
 
     def _toggleRepost(self, post):
+        if post.get("viewer_repost_uri") == "pending":
+            # Translators: Announced when an action is repeated while the previous one is still in progress.
+            _announce_now(_("Please wait..."))
+            return
         wasReposted = bool(post.get("viewer_repost_uri"))
         previousUri = post.get("viewer_repost_uri")
         post["viewer_repost_uri"] = None if wasReposted else "pending"
@@ -2766,6 +3015,7 @@ class ItemActionMixin:
         if not wasReposted:
             post["viewer_repost_uri"] = newUri
             db.set_post_repost_uri(post["uri"], newUri)
+        propagate_post_state(post)
         onRepostChanged = getattr(self, "_onRepostChanged", None)
         if callable(onRepostChanged):
             onRepostChanged(post)

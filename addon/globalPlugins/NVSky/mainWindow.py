@@ -260,6 +260,8 @@ class MainWindow(wx.Frame):
 
     @uiutil.safe_ui_callback
     def _focusPanel(self, panel):
+        if getattr(self, "_noFocusGrab", False):
+            return
         restoreFocus = getattr(panel, "_restoreFocusPosition", None)
         if callable(restoreFocus) and getattr(panel, "_account", None) is not None:
             restoreFocus()
@@ -584,7 +586,7 @@ class MainWindow(wx.Frame):
                     log.error(f"NVSky: checkAllOpenTabs sync failed for a tab: {e}")
             wx.CallAfter(self._onCheckAllOpenTabsDone, updatedPanels, None)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onCheckAllOpenTabsDone(self, updatedPanels, error):
@@ -627,6 +629,9 @@ class MainWindow(wx.Frame):
         # current tab from the notebook (browser-style) and no-ops on
         # permanent tabs -- the two concepts are intentionally separate.
         if keyCode == wx.WXK_ESCAPE:
+            focused = self.FindFocus()
+            if isinstance(focused, wx.TextCtrl) and focused.IsMultiLine() and focused.GetValue().strip():
+                return
             self.Close()
             return
         if evt.ControlDown() and keyCode == ord("W"):

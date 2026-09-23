@@ -9,6 +9,7 @@ import threading
 import webbrowser
 import wx
 
+import gui
 import ui as nvdaUi
 
 from . import db
@@ -21,6 +22,7 @@ from .feedWindow import (
     UserListMixin,
     EmbedViewMixin,
     _search_feed_key,
+    _announce_now,
 )
 from .feedTabs import FeedPreviewTabWindow, UserListTabWindow
 
@@ -456,6 +458,7 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         self.starterPacksList.Show(resultType == "starter_packs")
         self.feedsResultList.Show(resultType == "feeds")
         self.advBtn.Show(resultType == "posts")
+        self.advBtn.Enable(resultType == "posts")
         if resultType != "posts":
             self._setAdvExpanded(False, layout=False)
         self._updateActionButtons()
@@ -465,14 +468,28 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         return _("{} people found.").format(len(self._users))
 
     def _updateActionButtons(self):
+        # Also Disable(), not just Hide() -- same fix as
+        # ChatWindow's Accept button/FeedListMixin's generic version:
+        # a Hide()-only wx.Button still fires its own mnemonic even
+        # while invisible. Alt+U here (userActionButton) is the real
+        # risk -- it can dispatch onUserAction() against whatever
+        # postList still has focused from a PREVIOUS resultType (e.g.
+        # a stale post from "Posts" mode while now viewing "People").
         resultType = self._currentType()
         counts = {"posts": len(self._posts), "people": len(self._users),
                   "starter_packs": len(self._starterPacks), "feeds": len(self._feeds)}
         hasResults = counts.get(resultType, 0) > 0
-        self.postActionButton.Show(resultType == "posts" and hasResults)
-        self.userActionButton.Show(resultType == "posts" and hasResults)
-        self.resultActionButton.Show(resultType != "posts" and hasResults)
-        self.openInTabButton.Show(resultType in ("posts", "people") and hasResults)
+        showPostAction = resultType == "posts" and hasResults
+        showResultAction = resultType != "posts" and hasResults
+        showOpenInTab = resultType in ("posts", "people") and hasResults
+        self.postActionButton.Show(showPostAction)
+        self.postActionButton.Enable(showPostAction)
+        self.userActionButton.Show(showPostAction)
+        self.userActionButton.Enable(showPostAction)
+        self.resultActionButton.Show(showResultAction)
+        self.resultActionButton.Enable(showResultAction)
+        self.openInTabButton.Show(showOpenInTab)
+        self.openInTabButton.Enable(showOpenInTab)
         labels = {
             # Translators: Button label when result type is People. Shows the Alt+U shortcut.
             "people": _("User action... (Alt+U)"),
@@ -535,7 +552,7 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
                 error = str(e)
             wx.CallAfter(self._onSearchDone, resultType, query, results, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onSearchDone(self, resultType, query, results, error):
@@ -618,7 +635,7 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
                 error = str(e)
             wx.CallAfter(self._onFollowStarterPackDone, count, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onFollowStarterPackDone(self, count, error):
@@ -647,7 +664,7 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
                 error = str(e)
             wx.CallAfter(self._onStarterPackDetailsDone, pack, full, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onStarterPackDetailsDone(self, pack, full, error):
@@ -657,6 +674,7 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
             # Translators: Announced when loading a starter pack's details fails. {} is the error message.
             nvdaUi.message(_("Could not load pack details: {}").format(errorText))
             return
+        gui.mainFrame.prePopup()
         StarterPackDetailsDialog(self, pack, full).Show()
 
     def _openStarterPackInBrowser(self, pack):
@@ -795,7 +813,7 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
                 error = str(e)
             wx.CallAfter(self._onAddFeedDone, added, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onAddFeedDone(self, added, error):

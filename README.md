@@ -83,6 +83,10 @@ Home, Saved, Likes, Lists (curation lists), Notifications, and any pop-out post 
 - **Ctrl+Space** — reveal the real text/embed of a content-warned post, once, without changing your content label settings.
 - **Delete** — quick-delete the focused post, if it's your own (or undo your own repost of someone else's post).
 
+### Checking unread counts
+
+Every list tab keeps its own unread count, shown in that tab's status bar as "X unread, Y total" — this is separate from what's spoken as you arrow through items. To hear it at any time without moving focus off the list, press **NVDA+End** (NVDA's standard "report status bar" command, not something specific to NVSky). This works the same way on the Chat tab (unread messages and conversation count) and everywhere else in the add-on that has a status bar.
+
 ### Post action menu (Alt+A)
 
 Opens a menu of everything you can do with the focused post:

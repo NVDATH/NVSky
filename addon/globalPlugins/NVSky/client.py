@@ -120,8 +120,53 @@ def check_chat_supported(client) -> bool:
         get_chat_client(client).chat.bsky.convo.list_convos(params={"limit": 1})
         return True
     except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status is None or status >= 500:
+            log.info(f"NVSky: chat capability check inconclusive, assuming supported: {e}")
+            return True
         log.info(f"NVSky: chat capability check failed (treating as unsupported): {e}")
         return False
+
+
+_session_lock = threading.Lock()
+_session_cache = {}  # did -> session string, in memory only
+
+
+def _remember_session(client, account):
+    def _on_change(event, session):
+        try:
+            with _session_lock:
+                _session_cache[account["did"]] = session.encode()
+        except Exception as e:
+            log.error(f"NVSky: caching refreshed session failed: {e}")
+
+    try:
+        client.on_session_change(_on_change)
+        with _session_lock:
+            _session_cache[account["did"]] = client.export_session_string()
+    except Exception as e:
+        log.error(f"NVSky: could not cache session: {e}")
+
+
+def _client_from_cached_session(account):
+    from atproto import Client as ATProtoClient
+
+    with _session_lock:
+        sessionString = _session_cache.get(account["did"])
+    if not sessionString:
+        return None
+    try:
+        client = ATProtoClient()
+        client.login(session_string=sessionString)
+        if getattr(client.me, "did", None) != account["did"]:
+            raise RuntimeError("cached session belongs to another account")
+        _remember_session(client, account)
+        return client
+    except Exception as e:
+        with _session_lock:
+            _session_cache.pop(account["did"], None)
+        log.info(f"NVSky: cached session rejected, logging in fresh: {e}")
+        return None
 
 
 def get_client_for_active_account():
@@ -130,6 +175,10 @@ def get_client_for_active_account():
     account = db.get_active_account()
     if account is None:
         raise LoginError("No active account is stored.")
+
+    cachedClient = _client_from_cached_session(account)
+    if cachedClient is not None:
+        return cachedClient
 
     app_password = crypto.decrypt(account["encrypted_password"])
 
@@ -144,6 +193,7 @@ def get_client_for_active_account():
         client = ATProtoClient()
         try:
             client.login(account["handle"], app_password)
+            _remember_session(client, account)
             return client
         except Exception as e:
             lastError = e
@@ -174,7 +224,8 @@ def debug_dump(obj, label: str = "debug"):
     import datetime
 
     folder = os.path.join(os.path.dirname(__file__), "debug_dumps")
-    os.makedirs(folder, exist_ok=True)
+    if not os.path.isdir(folder):
+        return
     path = os.path.join(folder, f"{label}_{datetime.datetime.now():%Y%m%d_%H%M%S}.json")
 
     def _serialize(o, depth=0):
@@ -321,6 +372,40 @@ def _extract_message_embed_info(message: dict):
     }
 
 
+def _upsert_message_from_raw(account_id: int, convo_id: str, message: dict) -> bool:
+    """
+    Shared per-message cache upsert -- used by both the full
+    getMessages sync (_sync_convo_messages) and the getLog delta path
+    (sync_chat_delta below); same raw-JSON message dict shape either
+    way (MessageView), confirmed via a real debug_dump of getLog's
+    logCreateMessage/logAddReaction entries. Returns False (does
+    nothing) for a #deletedMessageView/#systemMessageView placeholder
+    with no "text" field -- same skip condition _sync_convo_messages
+    always used.
+    """
+    if "text" not in message:
+        return False
+    sender = message.get("sender") or {}
+    # Unlike the REQUEST side (MessageInput.replyTo, just {messageId}),
+    # the RESPONSE embeds the entire original message under replyTo --
+    # id/text directly, not a bare reference.
+    replyTo = message.get("replyTo") or {}
+    embedInfo = _extract_message_embed_info(message)
+    db.upsert_message({
+        "account_id": account_id,
+        "convo_id": convo_id,
+        "message_id": message.get("id"),
+        "sender_did": sender.get("did"),
+        "text": message.get("text", ""),
+        "sent_at": message.get("sentAt"),
+        "reply_to_message_id": replyTo.get("id"),
+        "reply_to_text": replyTo.get("text"),
+        "reactions_json": json.dumps(message.get("reactions") or []),
+        "embed_json": json.dumps(embedInfo) if embedInfo else None,
+    })
+    return True
+
+
 def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int = 0, limit: int = 100):
     # Same SDK bug _fetch_thread_json above works around for View
     # Thread -- pydantic can't resolve chat.bsky.convo.defs#messageView's
@@ -360,38 +445,15 @@ def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int =
     hasNewIncoming = False
 
     for message in rawMessages:
-        if "text" not in message:
-            # A #deletedMessageView / #systemMessageView placeholder,
-            # not a real message -- nothing to cache.
-            continue
         sender = message.get("sender") or {}
-        if not isFirstSyncForConvo and message.get("id") not in existingIds and sender.get("did") != myDid:
+        if (
+            not isFirstSyncForConvo
+            and "text" in message
+            and message.get("id") not in existingIds
+            and sender.get("did") != myDid
+        ):
             hasNewIncoming = True
-        # Unlike the REQUEST side (MessageInput.replyTo, just {messageId}),
-        # the RESPONSE embeds the entire original message under replyTo --
-        # id/text directly, not a bare reference. Store both so the reply
-        # preview always has text to show (even if the original isn't in
-        # the currently loaded page) AND the id, for Left/Right jump.
-        replyTo = message.get("replyTo") or {}
-        # LOW CONFIDENCE: field name/shape ("reactions": [{"value":
-        # "<emoji>", "sender": {"did": "..."}, "createdAt": "..."}, ...])
-        # inferred from chat.bsky.convo.defs#messageView/#reactionView
-        # in the lexicon docs, never confirmed against a real server
-        # response in this project -- paste back the raw dict (or a
-        # traceback) if reactions don't show up right.
-        embedInfo = _extract_message_embed_info(message)
-        db.upsert_message({
-            "account_id": account_id,
-            "convo_id": convo_id,
-            "message_id": message.get("id"),
-            "sender_did": sender.get("did"),
-            "text": message.get("text", ""),
-            "sent_at": message.get("sentAt"),
-            "reply_to_message_id": replyTo.get("id"),
-            "reply_to_text": replyTo.get("text"),
-            "reactions_json": json.dumps(message.get("reactions") or []),
-            "embed_json": json.dumps(embedInfo) if embedInfo else None,
-        })
+        _upsert_message_from_raw(account_id, convo_id, message)
 
     if hasNewIncoming:
         soundpack.play("new_message")
@@ -483,6 +545,178 @@ def sync_convo_messages(client, account_id: int, convo_id: str, limit: int = 100
                 log.error(f"NVSky: failed to store fresh convo {convo_id}: {e}")
 
     _sync_convo_messages(dm, convo_id, account_id, unreadCount, limit=limit)
+
+
+def get_convo_log(client, cursor: str = None, limit: int = 100):
+    """
+    Raw-JSON bypass for chat.bsky.convo.getLog. CONFIRMED via a real
+    debug_dump that the typed dm.get_log() call fails to parse real
+    log entries ("Unable to extract tag using discriminator 'py_type'
+    | 'pyType'"), same class of bug as _sync_convo_messages/
+    _fetch_thread_json. Returns (logs: list of raw dicts, new_cursor:
+    str or None). cursor=None returns the server's own current
+    position with an EMPTY logs list -- CONFIRMED via testing this is
+    not historical backlog, just "now". Callers must persist and
+    resend the returned cursor to see what changed since the previous
+    call.
+    """
+    dm = get_chat_client(client).chat.bsky.convo
+    # CONFIRMED bug: invoke_query calls .model_dump() on whatever
+    # `params` is given -- a plain dict has no such method and raises
+    # "'dict' object has no attribute 'model_dump'". Every other
+    # invoke_query call in this file (e.g. getMessages) passes an
+    # explicit typed Params model instead, never a raw dict -- this
+    # was the one place that didn't follow that established pattern.
+    params = models.ChatBskyConvoGetLog.Params(cursor=cursor, limit=limit)
+    response = dm._client.invoke_query(
+        "chat.bsky.convo.getLog", params=params, output_encoding="application/json"
+    )
+    content = response.content if isinstance(response.content, dict) else {}
+    return content.get("logs", []), content.get("cursor")
+
+
+# Log $type values confirmed via chat.bsky.convo.defs (atproto.blue SDK
+# docs) that only affect ConvoView-level metadata (membership, lock
+# state, group name, join links/requests) rather than a single message/
+# reaction. Rather than hand-parsing every SystemMessageView variant,
+# any of these appearing in a getLog batch triggers one full
+# sync_convos() fallback -- correctness over bandwidth for the rare case.
+_STRUCTURAL_LOG_TYPES = {
+    "chat.bsky.convo.defs#logBeginConvo",
+    "chat.bsky.convo.defs#logAcceptConvo",
+    "chat.bsky.convo.defs#logLeaveConvo",
+    "chat.bsky.convo.defs#logMuteConvo",
+    "chat.bsky.convo.defs#logUnmuteConvo",
+    "chat.bsky.convo.defs#logAddMember",
+    "chat.bsky.convo.defs#logRemoveMember",
+    "chat.bsky.convo.defs#logMemberJoin",
+    "chat.bsky.convo.defs#logMemberLeave",
+    "chat.bsky.convo.defs#logLockConvo",
+    "chat.bsky.convo.defs#logUnlockConvo",
+    "chat.bsky.convo.defs#logLockConvoPermanently",
+    "chat.bsky.convo.defs#logEditGroup",
+    "chat.bsky.convo.defs#logCreateJoinLink",
+    "chat.bsky.convo.defs#logEditJoinLink",
+    "chat.bsky.convo.defs#logEnableJoinLink",
+    "chat.bsky.convo.defs#logDisableJoinLink",
+    "chat.bsky.convo.defs#logIncomingJoinRequest",
+    "chat.bsky.convo.defs#logApproveJoinRequest",
+    "chat.bsky.convo.defs#logRejectJoinRequest",
+    "chat.bsky.convo.defs#logOutgoingJoinRequest",
+}
+
+
+def sync_chat_delta(client, account_id: int, my_did: str) -> set:
+    """
+    Background-sync-only delta path (Phase 1) -- replaces bgsync's
+    previous full sync_convos() call on every tick. Manual F5 and
+    ConvoTabWindow's own Check for updates are UNCHANGED, still call
+    the full sync_convos()/sync_convo_messages() path -- scoped to
+    periodic background sync only, per the plan to prove this out on
+    the lowest-risk caller first.
+
+    First call ever for this account (no stored cursor): bootstraps
+    via a full sync_convos(), then makes one getLog call just to
+    obtain and store a starting cursor (its logs are discarded -- the
+    full sync above already has everything). Returns an empty set.
+
+    Subsequent calls: fetches only what changed since the stored
+    cursor via getLog, processing logCreateMessage/logAddReaction/
+    logRemoveReaction/logDeleteMessage directly into the local cache
+    (same per-message upsert path the full getMessages sync uses).
+    Any OTHER log type (see _STRUCTURAL_LOG_TYPES) triggers one full
+    sync_convos() fallback, since those affect convo-level state this
+    function doesn't attempt to hand-reconstruct.
+
+    Read-state (logReadConvo/logReadMessage) is deliberately NOT
+    reconciled here -- background sync's job is "is there new content
+    to announce", not exact read/unread bookkeeping; F5 still does
+    that properly via reconcile_message_read_state.
+
+    Returns the set of convo_ids that received a new, non-own message
+    or reaction since the last check.
+    """
+    storedCursor = db.get_chat_log_cursor(account_id)
+
+    if storedCursor is None:
+        sync_convos(client, account_id, my_did)
+        _logs, newCursor = get_convo_log(client, cursor=None)
+        if newCursor:
+            db.set_chat_log_cursor(account_id, newCursor)
+        return set()
+
+    try:
+        logs, newCursor = get_convo_log(client, cursor=storedCursor)
+    except Exception as e:
+        if getattr(getattr(e, "response", None), "status_code", None) == 400:
+            log.info(f"NVSky: chat log cursor rejected, will re-bootstrap: {e}")
+            db.delete_ui_state(f"chat_log_cursor:{account_id}")
+        raise
+    if not logs:
+        if newCursor:
+            db.set_chat_log_cursor(account_id, newCursor)
+        return set()
+
+    touchedConvoIds = set()
+    needsFullResync = False
+
+    for entry in logs:
+        logType = entry.get("$type", "")
+        convoId = entry.get("convoId")
+
+        if logType in (
+            "chat.bsky.convo.defs#logCreateMessage",
+            "chat.bsky.convo.defs#logAddReaction",
+            "chat.bsky.convo.defs#logRemoveReaction",
+        ):
+            message = entry.get("message") or {}
+            senderDid = (message.get("sender") or {}).get("did")
+            if convoId and _upsert_message_from_raw(account_id, convoId, message):
+                if logType == "chat.bsky.convo.defs#logAddReaction":
+                    actorDid = ((entry.get("reaction") or {}).get("sender") or {}).get("did") or senderDid
+                elif logType == "chat.bsky.convo.defs#logRemoveReaction":
+                    actorDid = my_did
+                else:
+                    actorDid = senderDid
+                if actorDid != my_did:
+                    touchedConvoIds.add(convoId)
+        elif logType == "chat.bsky.convo.defs#logDeleteMessage":
+            message = entry.get("message") or {}
+            messageId = message.get("id")
+            if convoId and messageId:
+                db.delete_message(account_id, convoId, messageId)
+        elif logType in _STRUCTURAL_LOG_TYPES:
+            needsFullResync = True
+        # Unrecognized/future log $type: ignored here -- the next
+        # full F5/manual sync still picks up whatever it was.
+
+    if needsFullResync:
+        try:
+            sync_convos(client, account_id, my_did)
+        except Exception as e:
+            log.error(f"NVSky: structural-log fallback full sync failed: {e}")
+
+    if touchedConvoIds:
+        soundpack.play("new_message")
+        # Refresh unread_count/last-message for every touched convo
+        # via the cheap single-convo call, rather than a full
+        # list_convos -- keeps ChatWindow's tree labels accurate.
+        for convoId in touchedConvoIds:
+            try:
+                freshConvo = get_convo(client, convoId)
+                if freshConvo is not None:
+                    localConvo = db.get_convo(account_id, convoId)
+                    status = (localConvo.get("status") if localConvo else None) or "accepted"
+                    _store_convo(freshConvo, account_id, my_did, status)
+            except Exception as e:
+                log.error(f"NVSky: per-convo refresh after delta sync failed for {convoId}: {e}")
+
+    if newCursor:
+        db.set_chat_log_cursor(account_id, newCursor)
+
+    return touchedConvoIds
+
+
 def get_chat_client(client):
     """
     EXPERIMENTAL -- first use of the chat.bsky.* namespace in NVSky.
@@ -565,7 +799,6 @@ def get_convo_availability(client, member_dids: list):
     response = get_chat_client(client).chat.bsky.convo.get_convo_availability(
         params={"members": member_dids}
     )
-    debug_dump(response, "convo_availability")
     return response
 
 
@@ -605,8 +838,10 @@ def create_join_link(client, convo_id: str, join_rule: str, require_approval: bo
         data=DotDict({"convoId": convo_id, "joinRule": join_rule, "requireApproval": require_approval}),
         input_encoding="application/json", output_encoding="application/json",
     )
-    debug_dump(response.content, "create_join_link_result")
-    return response.content.get("joinLink") if isinstance(response.content, dict) else None
+    joinLink = response.content.get("joinLink") if isinstance(response.content, dict) else None
+    if not joinLink:
+        debug_dump(response.content, "create_join_link_result")
+    return joinLink
 
 
 def edit_join_link(client, convo_id: str, join_rule: str, require_approval: bool):
@@ -618,8 +853,10 @@ def edit_join_link(client, convo_id: str, join_rule: str, require_approval: bool
         data=DotDict({"convoId": convo_id, "joinRule": join_rule, "requireApproval": require_approval}),
         input_encoding="application/json", output_encoding="application/json",
     )
-    debug_dump(response.content, "edit_join_link_result")
-    return response.content.get("joinLink") if isinstance(response.content, dict) else None
+    joinLink = response.content.get("joinLink") if isinstance(response.content, dict) else None
+    if not joinLink:
+        debug_dump(response.content, "edit_join_link_result")
+    return joinLink
 
 
 def enable_join_link(client, convo_id: str):
@@ -630,8 +867,10 @@ def enable_join_link(client, convo_id: str):
         "chat.bsky.group.enableJoinLink", data=DotDict({"convoId": convo_id}),
         input_encoding="application/json", output_encoding="application/json",
     )
-    debug_dump(response.content, "enable_join_link_result")
-    return response.content.get("joinLink") if isinstance(response.content, dict) else None
+    joinLink = response.content.get("joinLink") if isinstance(response.content, dict) else None
+    if not joinLink:
+        debug_dump(response.content, "enable_join_link_result")
+    return joinLink
 
 
 def disable_join_link(client, convo_id: str):
@@ -655,8 +894,10 @@ def edit_group(client, convo_id: str, name: str):
         "chat.bsky.group.editGroup", data=DotDict({"convoId": convo_id, "name": name}),
         input_encoding="application/json", output_encoding="application/json",
     )
-    debug_dump(response.content, "edit_group_result")
-    return response.content.get("convo") if isinstance(response.content, dict) else None
+    convo = response.content.get("convo") if isinstance(response.content, dict) else None
+    if not convo:
+        debug_dump(response.content, "edit_group_result")
+    return convo
 
 
 def create_group(client, member_dids: list, name: str = None):
@@ -727,7 +968,6 @@ def get_join_link_previews(client, codes: list):
         "chat.bsky.group.getJoinLinkPreviews", params=DotDict({"codes": codes}),
         output_encoding="application/json",
     )
-    debug_dump(response.content, "join_link_previews_raw")
     previews = response.content.get("joinLinkPreviews", []) if isinstance(response.content, dict) else []
     return previews
 
@@ -742,7 +982,6 @@ def request_join_group(client, code: str):
         "chat.bsky.group.requestJoin", data=DotDict({"code": code}),
         input_encoding="application/json", output_encoding="application/json",
     )
-    debug_dump(response.content, "request_join_result")
     return response.content if isinstance(response.content, dict) else {}
 
 
@@ -756,7 +995,6 @@ def list_join_requests(client, convo_id: str):
         "chat.bsky.group.listJoinRequests", params=DotDict({"convoId": convo_id}),
         output_encoding="application/json",
     )
-    debug_dump(response.content, "join_requests_raw")
     requests_ = response.content.get("requests", []) if isinstance(response.content, dict) else []
     return requests_
 
@@ -905,6 +1143,25 @@ def sync_saved(client, account_id: int, cursor: str = None, limit: int = 50) -> 
     return resp.cursor
 
 
+def sync_likes(client, account_id: int, cursor: str = None, limit: int = 50) -> str:
+    """Own likes via listRecords (getActorLikes has no like time, so no usable ordering)."""
+    resp = client.com.atproto.repo.list_records(
+        params={"repo": client.me.did, "collection": "app.bsky.feed.like", "limit": limit, "cursor": cursor}
+    )
+    entries = []
+    for record in resp.records:
+        value = record.value
+        subjectUri = _view_field(_view_field(value, "subject"), "uri")
+        createdAt = _view_field(value, "createdAt") or _view_field(value, "created_at")
+        if subjectUri and createdAt:
+            entries.append((subjectUri, createdAt))
+    resolved = resolve_posts(client, account_id, [uri for uri, _time in entries]) if entries else {}
+    for uri, createdAt in entries:
+        if uri in resolved:
+            db.upsert_feed_item(account_id, "likes", uri, createdAt)
+    return resp.cursor
+
+
 def sync_timeline(client, account_id: int, cursor: str = None, limit: int = 50, feed_key: str = "home") -> str:
     resp = client.get_timeline(cursor=cursor, limit=limit)
 
@@ -916,6 +1173,43 @@ def sync_timeline(client, account_id: int, cursor: str = None, limit: int = 50, 
             log.info(f"NVSky: raw item that failed = {item!r}")
 
     return resp.cursor
+
+
+CONTENT_LABEL_KEYS = ["porn", "sexual", "nudity", "graphic-media"]
+# Official app defaults for a label the account never set (graphic-media not verified).
+CONTENT_LABEL_DEFAULT_VISIBILITIES = {
+    "porn": "hide", "sexual": "warn", "nudity": "show", "graphic-media": "warn",
+}
+# Only these follow the master adult-content switch; nudity does not.
+CONTENT_LABEL_ADULT_ONLY = {"porn", "sexual", "graphic-media"}
+
+
+def label_setting(prefs: dict, label: str) -> str:
+    return prefs.get(label) or CONTENT_LABEL_DEFAULT_VISIBILITIES.get(label, "warn")
+
+
+def effective_label_visibility(prefs: dict, label: str) -> str:
+    if label in CONTENT_LABEL_ADULT_ONLY and not prefs.get(ADULT_CONTENT_PREF_KEY, True):
+        return "hide"
+    return label_setting(prefs, label)
+CONTENT_LABEL_PREF_TYPE = "app.bsky.actor.defs#contentLabelPref"
+ADULT_CONTENT_PREF_TYPE = "app.bsky.actor.defs#adultContentPref"
+# Stored inside the same label-prefs dict/cache; missing in an old cache = treat as enabled.
+ADULT_CONTENT_PREF_KEY = "__adult_content_enabled"
+
+
+def _extract_post_labels(post) -> list:
+    """
+    Returns the list of label value strings (e.g. "porn",
+    "graphic-media") a labeler has attached to `post`, or [] if none.
+    LOW CONFIDENCE: assumes post.labels is a list of objects each
+    carrying a plain .val string (com.atproto.label.defs#label) --
+    never independently confirmed against a real labeled post in this
+    project. Paste back a debug_dump of a labeled post if labels don't
+    show up as expected.
+    """
+    labels = getattr(post, "labels", None) or []
+    return [getattr(l, "val", None) for l in labels if getattr(l, "val", None)]
 
 
 def _extract_embed_info(post):
@@ -984,6 +1278,24 @@ def _fill_media_info(info: dict, mediaView, mediaType: str):
         external = getattr(mediaView, "external", None)
         info["link_url"] = getattr(external, "uri", None)
         info["link_title"] = getattr(external, "title", None) or ""
+    elif mediaType.startswith("app.bsky.embed.gallery"):
+        info["images"] = [
+            {
+                "alt": _view_field(item, "alt") or "",
+                "thumb_url": _view_field(item, "thumbnail"),
+                "fullsize_url": _view_field(item, "fullsize"),
+            }
+            for item in (_view_field(mediaView, "items") or [])
+        ]
+
+
+def _view_field(obj, name):
+    value = getattr(obj, name, None)
+    if value is None:
+        getter = _dict_get(obj)
+        value = getter(name) if getter is not None else None
+    return value
+
 
 def _store_feed_item(item, account_id: int, feed_key: str = "home"):
     post = item.post
@@ -1064,6 +1376,7 @@ def _store_feed_item(item, account_id: int, feed_key: str = "home"):
         "viewer_repost_uri": viewer_repost_uri,
         "viewer_bookmarked": viewer_bookmarked,
         "viewer_thread_muted": viewer_thread_muted,
+        "labels_json": json.dumps(_extract_post_labels(post)) or None,
     })
     db.upsert_feed_item(account_id, feed_key, post.uri, feedIndexedAt)
 
@@ -1135,6 +1448,7 @@ def _store_resolved_post(post, account_id: int):
         "viewer_repost_uri": viewer_repost_uri,
         "viewer_bookmarked": viewer_bookmarked,
         "viewer_thread_muted": viewer_thread_muted,
+        "labels_json": json.dumps(_extract_post_labels(post)) or None,
     })
 
 
@@ -1566,46 +1880,91 @@ def resolve_posts(client, account_id: int, uris: list) -> dict:
     return resolved
 
 
+NOTIFICATION_SYNC_MAX_PAGES = 20  # safety cap -- see sync_notifications' docstring
+
+
 def sync_notifications(client, account_id: int, cursor: str = None, limit: int = 50) -> str:
-    """EXPERIMENTAL -- first use of app.bsky.notification.listNotifications
-    in NVSky, paste back the traceback if this errors."""
-    resp = client.app.bsky.notification.list_notifications(params={"cursor": cursor, "limit": limit})
+    """
+    Walks pages of listNotifications starting from the newest, until
+    it reaches a notification already seen in a PREVIOUS resume sync
+    (tracked via db.get/set_notification_sync_cursor -- the uri of the
+    newest notification as of that sync), or until
+    NOTIFICATION_SYNC_MAX_PAGES pages have been walked (safety cap --
+    an account with genuinely thousands of unread notifications, e.g.
+    after the add-on was left closed a long time, syncs what it can
+    per call and picks up the rest on the next bgsync tick instead of
+    blocking on one huge fetch).
+
+    CONFIRMED BUG this replaces: the old version always fetched just
+    the newest `limit` (default 50) notifications with no persisted
+    resume point -- any account receiving more than 50 notifications
+    between two syncs (a popular account, or the add-on left closed a
+    while) silently lost whatever fell past position 50, with no error
+    or indication anything was missed.
+
+    The `cursor` param is preserved for the existing lazy-load
+    "fetch older" caller -- passing it explicitly walks exactly ONE
+    page from that point (old behavior, unchanged) and does NOT touch
+    the persisted resume cursor at all, only a fresh sync
+    (cursor=None) consults/updates it.
+    """
+    isResumeSync = cursor is None
+    resumeUri = db.get_notification_sync_cursor(account_id) if isResumeSync else None
+
+    newestUriThisSync = None
+    lastPageCursor = None
+    pageCursor = cursor
+    pagesWalked = 0
+    reachedKnownNotification = False
+
+    while True:
+        resp = client.app.bsky.notification.list_notifications(params={"cursor": pageCursor, "limit": limit})
+        lastPageCursor = resp.cursor
+        if newestUriThisSync is None and resp.notifications:
+            newestUriThisSync = resp.notifications[0].uri
+
+        urisToResolve = []
+        for notif in resp.notifications:
+            if notif.reason in ("reply", "mention", "quote"):
+                urisToResolve.append(notif.uri)
+            elif notif.reason in ("like", "repost") and notif.reason_subject:
+                urisToResolve.append(notif.reason_subject)
+
+        resolvedSubjects = resolve_posts(client, account_id, urisToResolve) if urisToResolve else {}
+
+        for notif in resp.notifications:
+            if isResumeSync and resumeUri and notif.uri == resumeUri:
+                reachedKnownNotification = True
+                break
+            try:
+                _store_notification(notif, account_id, resolvedSubjects)
+            except Exception as e:
+                log.error(f"NVSky: failed to store a notification: {e}")
+                log.info(f"NVSky: raw notification that failed = {notif!r}")
+
+        pagesWalked += 1
+        if not isResumeSync:
+            # Caller-driven lazy-load pagination -- one page only,
+            # exactly like before this change.
+            break
+        if reachedKnownNotification or not resp.cursor or pagesWalked >= NOTIFICATION_SYNC_MAX_PAGES:
+            break
+        pageCursor = resp.cursor
+
+    if isResumeSync and newestUriThisSync:
+        db.set_notification_sync_cursor(account_id, newestUriThisSync)
 
     # Bluesky's server only supports one "seen up to this point in time"
     # watermark (no per-notification read state) -- this is what clears
     # the unread badge in the official app and any other client reading
     # the same account, separate from NVSky's own local is_read state.
-    # EXPERIMENTAL -- first use of app.bsky.notification.updateSeen in
-    # NVSky, paste back the traceback if this errors. Best-effort: don't
-    # let a failure here break the sync that already succeeded above.
     try:
         seenAt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         client.app.bsky.notification.update_seen({"seen_at": seenAt})
     except Exception as e:
         log.info(f"NVSky: updateSeen failed (non-fatal): {e}")
 
-    # Resolve every notification's actionable post -- not just like/
-    # repost's reasonSubject -- so Post action (Alt+A) has full cached
-    # data for reply/mention/quote notifications too (their own uri IS
-    # the actionable post there). Mirrored in _store_notification's own
-    # subjectUri logic below.
-    urisToResolve = []
-    for notif in resp.notifications:
-        if notif.reason in ("reply", "mention", "quote"):
-            urisToResolve.append(notif.uri)
-        elif notif.reason in ("like", "repost") and notif.reason_subject:
-            urisToResolve.append(notif.reason_subject)
-
-    resolvedSubjects = resolve_posts(client, account_id, urisToResolve) if urisToResolve else {}
-
-    for notif in resp.notifications:
-        try:
-            _store_notification(notif, account_id, resolvedSubjects)
-        except Exception as e:
-            log.error(f"NVSky: failed to store a notification: {e}")
-            log.info(f"NVSky: raw notification that failed = {notif!r}")
-
-    return resp.cursor
+    return lastPageCursor
 
 
 def _store_notification(notif, account_id: int, resolvedSubjects: dict):
@@ -1724,9 +2083,15 @@ def _compress_image_for_blob(image_path: str, max_bytes: int = MAX_BLOB_BYTES) -
 
 
 def _upload_blob_dict(client, image_path: str) -> dict:
+    originalPath = image_path
     image_path = _compress_image_for_blob(image_path)
     with open(image_path, "rb") as f:
         image_bytes = f.read()
+    if image_path != originalPath:
+        try:
+            os.remove(image_path)
+        except OSError:
+            pass
     upload = client.com.atproto.repo.upload_blob(image_bytes)
     blob = upload.blob
     try:
@@ -2208,7 +2573,7 @@ def fetch_link_card(url: str) -> dict:
 
 def create_post(client, text: str, attachments: list = None, reply_ref: dict = None,
                  quote_ref: dict = None, link_card: dict = None, facets: list = None,
-                 video: dict = None):
+                 video: dict = None, self_labels: list = None):
     """
     Creates a post. Covers every combo: plain text, images, reply,
     quote, quote-with-images, and a link-card preview (external embed).
@@ -2224,6 +2589,13 @@ def create_post(client, text: str, attachments: list = None, reply_ref: dict = N
     card isn't something the official app does either, so quote/images
     take priority the same way they already did before this existed.
     facets: pre-built via build_facets() -- passed straight through.
+    self_labels: list of label value strings (subset of
+    CONTENT_LABEL_KEYS) the author is voluntarily attaching to their
+    OWN post via com.atproto.label.defs#selfLabels -- distinct from
+    moderation labels a labeler service attaches server-side, but
+    lands in the same post.labels array once synced back, so the
+    existing _extract_post_labels/warn-hide rendering picks these up
+    automatically with no separate handling needed.
     """
     record = {
         "$type": "app.bsky.feed.post",
@@ -2233,6 +2605,12 @@ def create_post(client, text: str, attachments: list = None, reply_ref: dict = N
 
     if facets:
         record["facets"] = facets
+
+    if self_labels:
+        record["labels"] = {
+            "$type": "com.atproto.label.defs#selfLabels",
+            "values": [{"val": label} for label in self_labels],
+        }
 
     if reply_ref:
         record["reply"] = {
@@ -2292,7 +2670,7 @@ def get_reply_refs(client, post_uri: str, post_cid: str, is_already_reply: bool)
     if not is_already_reply:
         return {"parent": parent_ref, "root": parent_ref}
 
-    raw = _fetch_thread_json(post_uri, depth=0, parent_height=100)
+    raw = _fetch_thread_json(post_uri, depth=0, parent_height=100, client=client)
     node = _dict_to_ns(raw.get("thread", raw))
     root_ref = parent_ref
     walker = node
@@ -2599,7 +2977,7 @@ def sync_author_feed_page(client, account_id: int, did: str, cursor: str = None,
     return resp.cursor
 
 
-def _fetch_thread_json(post_uri: str, depth: int = 25, parent_height: int = 100) -> dict:
+def _fetch_thread_json(post_uri: str, depth: int = 25, parent_height: int = 100, client=None) -> dict:
     """
     Fetches getPostThread as raw JSON from Bluesky's public AppView
     (no auth needed -- a public read endpoint, the same one many
@@ -2610,6 +2988,19 @@ def _fetch_thread_json(post_uri: str, depth: int = 25, parent_height: int = 100)
     extract tag using discriminator 'py_type' | 'pyType'"), even though
     flatter responses parse fine through the SDK elsewhere in this file.
     """
+    if client is not None:
+        # Authenticated first (sees logged-out-hidden accounts, real viewer state).
+        try:
+            authParams = models.AppBskyFeedGetPostThread.Params(
+                uri=post_uri, depth=depth, parent_height=parent_height
+            )
+            authResponse = client.app.bsky.feed._client.invoke_query(
+                "app.bsky.feed.getPostThread", params=authParams, output_encoding="application/json"
+            )
+            if isinstance(authResponse.content, dict) and authResponse.content.get("thread"):
+                return authResponse.content
+        except Exception as e:
+            log.info(f"NVSky: authenticated getPostThread failed, using public AppView: {e}")
     params = urllib.parse.urlencode({"uri": post_uri, "depth": depth, "parentHeight": parent_height})
     url = f"https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?{params}"
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
@@ -2810,7 +3201,7 @@ def get_thread(client, post_uri: str, depth: int = 25, parent_height: int = 100)
     dicts in display order (each tagged "_thread_depth" for
     indentation), plus the index of the target post within that list.
     """
-    raw = _fetch_thread_json(post_uri, depth, parent_height)
+    raw = _fetch_thread_json(post_uri, depth, parent_height, client=client)
     node = _dict_to_ns(raw.get("thread", raw))
 
     ancestors = []
@@ -3032,6 +3423,76 @@ def block_actor(client, did: str) -> str:
 def unblock_actor(client, block_uri: str):
     client.com.atproto.repo.delete_record(data=_parse_at_uri(block_uri))
 
+
+def set_activity_subscription(client, did: str, subscribed: bool):
+    """
+    Subscribes (or unsubscribes) to per-account "new post" bell
+    notifications -- separate from follow. CONFIRMED via a real 422
+    validation error that the target-account field is named "subject",
+    not "actor". Also CONFIRMED the typed put_activity_subscription()
+    call hits the same PydanticSerializationError ("Unable to serialize
+    unknown type: FieldInfo") documented elsewhere in this file for
+    send_message/create_group -- some field on this request model stays
+    an unresolved FieldInfo default and model_dump_json() chokes on it.
+    Raw-JSON bypass via DotDict, same fix as those two.
+
+    TEMPORARY: dumps the raw write response every call while this
+    endpoint is still being confirmed (list_activity_subscriptions
+    comes back empty after a write with no error, cause not yet
+    identified) -- check debug_dumps/activity_subscription_write_*.json
+    after triggering this from the UI. Safe to remove once confirmed.
+    """
+    from atproto_client.models.dot_dict import DotDict
+
+    resp = client.app.bsky.notification._client.invoke_procedure(
+        "app.bsky.notification.putActivitySubscription",
+        data=DotDict({
+            "subject": did,
+            "activitySubscription": {"post": subscribed, "reply": subscribed},
+        }),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+
+
+def get_activity_subscriptions(client, page_limit: int = 100, max_pages: int = 100) -> list:
+    """
+    app.bsky.notification.listActivitySubscriptions -- accounts the
+    active user has bell-subscribed to for new-post notifications
+    (separate from follow/mute/block). Raw-JSON bypass, NOT the typed
+    list_activity_subscriptions() call -- CONFIRMED via testing that a
+    write (putActivitySubscription, which itself echoes back
+    subject/activitySubscription successfully, proving the write
+    landed) was consistently invisible through the typed read call
+    afterward (empty subscriptions/cursor every time), pointing at the
+    same class of pydantic discriminated-union parsing bug documented
+    throughout this file for other chat.bsky.convo.*/notification
+    endpoints, not an actual empty result.
+    """
+    from atproto_client.models.dot_dict import DotDict
+
+    results = []
+    cursor = None
+    for _ in range(max_pages):
+        params = {"limit": page_limit}
+        if cursor:
+            params["cursor"] = cursor
+        resp = client.app.bsky.notification._client.invoke_query(
+            "app.bsky.notification.listActivitySubscriptions",
+            params=DotDict(params), output_encoding="application/json",
+        )
+        content = resp.content if isinstance(resp.content, dict) else {}
+        for actor in content.get("subscriptions", []):
+            results.append({
+                "did": actor.get("did"), "handle": actor.get("handle"),
+                "display_name": actor.get("displayName"),
+                "description": actor.get("description"),
+            })
+        cursor = content.get("cursor")
+        if not cursor:
+            break
+    return results
+
+
 MUTED_WORDS_PREF_TYPE = "app.bsky.actor.defs#mutedWordsPref"
 
 def get_muted_words(client) -> list:
@@ -3076,12 +3537,12 @@ def _save_muted_words(client, words: list):
         "$type": MUTED_WORDS_PREF_TYPE,
         "items": [
             {
-                "id": w["id"] or str(int(time.time() * 1000)),
+                "id": w["id"] or f"{int(time.time() * 1000)}{i}",
                 "value": w["value"],
                 "targets": w["targets"] or ["content", "tag"],
                 "actorTarget": "all",
             }
-            for w in words
+            for i, w in enumerate(words)
         ],
     })
     _put_preferences(client, prefs)
@@ -3096,6 +3557,185 @@ def add_muted_word(client, value: str, targets: list = None):
 def remove_muted_word(client, value: str):
     words = [w for w in get_muted_words(client) if w["value"] != value]
     _save_muted_words(client, words)
+
+
+def get_content_label_prefs(client) -> dict:
+    """
+    Returns {label_val: "show"/"warn"/"hide"} for every
+    app.bsky.actor.defs#contentLabelPref the account has explicitly
+    set. Missing keys mean "not set yet" -- callers should fall back
+    to CONTENT_LABEL_DEFAULT_VISIBILITY. Same raw-JSON preferences
+    round trip as get_muted_words (see _get_cleaned_preferences).
+    """
+    prefs = _get_cleaned_preferences(client)
+    result = {ADULT_CONTENT_PREF_KEY: False}
+    for pref in prefs:
+        if pref.get("$type") == ADULT_CONTENT_PREF_TYPE:
+            result[ADULT_CONTENT_PREF_KEY] = bool(pref.get("enabled"))
+        elif pref.get("$type") == CONTENT_LABEL_PREF_TYPE:
+            label = pref.get("label")
+            visibility = pref.get("visibility")
+            if label and visibility:
+                result[label] = "show" if visibility == "ignore" else visibility
+    return result
+
+
+def set_adult_content_enabled(client, enabled: bool):
+    prefs = _get_cleaned_preferences(client)
+    prefs = [p for p in prefs if p.get("$type") != ADULT_CONTENT_PREF_TYPE]
+    prefs.append({"$type": ADULT_CONTENT_PREF_TYPE, "enabled": bool(enabled)})
+    _put_preferences(client, prefs)
+
+
+def set_content_label_pref(client, label: str, visibility: str):
+    """Sets one label's visibility, preserving every other
+    contentLabelPref and every other preference type untouched --
+    same raw-JSON round trip as _save_muted_words."""
+    prefs = _get_cleaned_preferences(client)
+    prefs = [
+        p for p in prefs
+        if not (p.get("$type") == CONTENT_LABEL_PREF_TYPE and p.get("label") == label)
+    ]
+    prefs.append({
+        "$type": CONTENT_LABEL_PREF_TYPE,
+        "label": label,
+        "visibility": visibility,
+    })
+    _put_preferences(client, prefs)
+
+
+# Categories confirmed via a real debug_dump of
+# app.bsky.notification.getPreferences. "chat" is included here (with
+# its own type/wire-key entries) purely so writes can round-trip it
+# back unchanged -- putPreferencesV2 is a PUT (full replace, confirmed
+# by a real test: sending only the changed category had NO effect at
+# all, no error, matching how app.bsky.actor.putPreferences also
+# requires the whole array back), so every category must be resent
+# every time or the ones left out risk being reset/dropped.
+# NOT offered in the UI as an editable row -- no "list" field at all
+# for chat (only include/push), so it doesn't fit the combined
+# off/everyone/following model used for the other 12.
+NOTIFICATION_FILTERABLE_CATEGORIES = [
+    "follow", "like", "like_via_repost", "mention", "quote", "reply", "repost", "repost_via_repost",
+]
+NOTIFICATION_SIMPLE_CATEGORIES = [
+    "starterpack_joined", "subscribed_post", "unverified", "verified",
+]
+NOTIFICATION_ALL_CATEGORIES = NOTIFICATION_FILTERABLE_CATEGORIES + NOTIFICATION_SIMPLE_CATEGORIES
+
+# $type discriminator per category -- CONFIRMED via a real debug_dump
+# (each preference sub-object's own unresolved py_type FieldInfo
+# default carries this exact string). Required on write: this is a
+# discriminated union field, and every other discriminated union in
+# this file needs $type explicitly set for the server to parse it --
+# omitting it here is the leading suspect for why a first attempt at
+# this write had no effect despite no error.
+NOTIFICATION_CATEGORY_TYPES = {
+    "chat": "app.bsky.notification.defs#chatPreference",
+    "follow": "app.bsky.notification.defs#filterablePreference",
+    "like": "app.bsky.notification.defs#filterablePreference",
+    "like_via_repost": "app.bsky.notification.defs#filterablePreference",
+    "mention": "app.bsky.notification.defs#filterablePreference",
+    "quote": "app.bsky.notification.defs#filterablePreference",
+    "reply": "app.bsky.notification.defs#filterablePreference",
+    "repost": "app.bsky.notification.defs#filterablePreference",
+    "repost_via_repost": "app.bsky.notification.defs#filterablePreference",
+    "starterpack_joined": "app.bsky.notification.defs#preference",
+    "subscribed_post": "app.bsky.notification.defs#preference",
+    "unverified": "app.bsky.notification.defs#preference",
+    "verified": "app.bsky.notification.defs#preference",
+}
+
+# python (snake_case, matches the SDK's own attribute names) -> real
+# wire-format camelCase key. CONFIRMED bug: the SDK auto-converts
+# camelCase JSON keys to snake_case attributes on READ (getPreferences),
+# but a plain dict handed to invoke_procedure for a WRITE is sent
+# byte-for-byte as given -- a first attempt sent "like_via_repost" as
+# a literal top-level key, which the server silently doesn't recognize
+# (no error, field just never took effect). Every category with an
+# underscore needs its real camelCase name here.
+NOTIFICATION_CATEGORY_WIRE_KEYS = {
+    "chat": "chat",
+    "follow": "follow",
+    "like": "like",
+    "like_via_repost": "likeViaRepost",
+    "mention": "mention",
+    "quote": "quote",
+    "reply": "reply",
+    "repost": "repost",
+    "repost_via_repost": "repostViaRepost",
+    "starterpack_joined": "starterpackJoined",
+    "subscribed_post": "subscribedPost",
+    "unverified": "unverified",
+    "verified": "verified",
+}
+
+
+def get_notification_prefs(client) -> dict:
+    """
+    Returns {category: {"list": bool, "include": "all"/"follows"/None,
+    "push": bool}} for every category in NOTIFICATION_CATEGORY_TYPES
+    (including "chat", read-only-in-this-app but needed so writes can
+    round-trip it back unchanged -- see set_notification_category).
+    Field names/shape confirmed via a real debug_dump of
+    getPreferences -- "list"/"include"/"push" resolve as plain values
+    even though the object's own $type discriminator hits the usual
+    FieldInfo bug (only the discriminator, not the content fields).
+    """
+    resp = client.app.bsky.notification.get_preferences()
+    prefs = resp.preferences
+    result = {}
+    for category in NOTIFICATION_CATEGORY_TYPES:
+        pref = getattr(prefs, category, None)
+        if pref is None:
+            continue
+        result[category] = {
+            "list": bool(getattr(pref, "list", False)),
+            "include": getattr(pref, "include", None),
+            "push": bool(getattr(pref, "push", False)),
+        }
+    return result
+
+
+def set_notification_category(client, current_prefs: dict, category: str, list_enabled: bool, push: bool, include: str = None):
+    """
+    LOW CONFIDENCE -- app.bsky.notification.putPreferencesV2 has never
+    been CONFIRMED working against a real server (a first attempt had
+    no effect -- see NOTIFICATION_CATEGORY_WIRE_KEYS/_TYPES above for
+    the two suspected causes now fixed: missing $type, wrong wire
+    key). Sends the FULL preferences object (every category in
+    current_prefs, each tagged with its own $type and real wire key)
+    -- putPreferencesV2 is a PUT, confirmed to have no effect when only
+    the changed category was sent, so every category must round-trip
+    through every write. `current_prefs` should be whatever
+    get_notification_prefs last returned (chat included), with the one
+    `category` being changed already reflecting its new values.
+    `push` is always sent back as the caller's last-known value for
+    every category (never something the UI lets the user change) so
+    this call can't silently reset anyone's push settings. Paste back
+    a traceback -- or confirm on bsky.app's own Settings > Notifications
+    page -- if a saved change still doesn't stick.
+    """
+    from atproto_client.models.dot_dict import DotDict
+
+    body = {}
+    for cat, catType in NOTIFICATION_CATEGORY_TYPES.items():
+        pref = current_prefs.get(cat) or {}
+        entry = {"$type": catType, "push": bool(pref.get("push", False))}
+        if catType == "app.bsky.notification.defs#filterablePreference":
+            entry["list"] = bool(pref.get("list", False))
+            entry["include"] = pref.get("include") or "all"
+        elif catType == "app.bsky.notification.defs#chatPreference":
+            entry["include"] = pref.get("include") or "all"
+        else:  # plain "preference" -- list/push only, no include
+            entry["list"] = bool(pref.get("list", False))
+        body[NOTIFICATION_CATEGORY_WIRE_KEYS[cat]] = entry
+
+    client.app.bsky.notification._client.invoke_procedure(
+        "app.bsky.notification.putPreferencesV2",
+        data=DotDict(body),
+        input_encoding="application/json", output_encoding="application/json",
+    )
 
 
 # ---------------- lists ----------------

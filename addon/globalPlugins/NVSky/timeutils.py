@@ -66,6 +66,9 @@ def format_timestamp(iso_timestamp: str, mode: str = "relative_24h", custom_patt
     except ValueError:
         return iso_timestamp
 
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+
     now = datetime.datetime.now(datetime.timezone.utc)
     seconds = max((now - dt).total_seconds(), 0)
 

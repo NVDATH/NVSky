@@ -16,6 +16,7 @@ back the traceback if it doesn't behave as expected on your machine.
 import ctypes
 import os
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 
@@ -23,6 +24,28 @@ import wx
 from logHandler import log
 
 BEMYEYES_AUMID = "BeMyEyes.BeMyEyes_7yeb8xxw19svt!App"
+
+
+def _temp_dir() -> str:
+    path = os.path.join(tempfile.gettempdir(), "NVSky")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def cleanup_old_temp_files(max_age_seconds: int = 86400):
+    # Best effort; files still open in another app just fail to delete.
+    try:
+        folder = _temp_dir()
+        cutoff = time.time() - max_age_seconds
+        for name in os.listdir(folder):
+            full = os.path.join(folder, name)
+            try:
+                if os.path.isfile(full) and os.path.getmtime(full) < cutoff:
+                    os.remove(full)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 def download_to_temp(url: str, suffix: str = "") -> str:
     """
@@ -51,12 +74,6 @@ def download_to_temp(url: str, suffix: str = "") -> str:
         content_type = response.headers.get("Content-Type", "")
         data = response.read()
 
-    log.info(
-        f"NVSky: download_to_temp {url} -> status={status} "
-        f"content-type={content_type!r} bytes={len(data)} "
-        f"first-bytes={data[:16].hex()}"
-    )
-
     if status >= 400:
         raise OSError(f"Download failed: HTTP {status} ({len(data)} bytes)")
 
@@ -69,7 +86,7 @@ def download_to_temp(url: str, suffix: str = "") -> str:
     if content_type.startswith("image/webp"):
         suffix = ".webp"
 
-    fd, path = tempfile.mkstemp(suffix=suffix)
+    fd, path = tempfile.mkstemp(suffix=suffix, dir=_temp_dir())
     os.close(fd)
     
     with open(path, "wb") as f:
@@ -129,7 +146,7 @@ def download_video_playlist_to_temp(url: str) -> str:
             line = urllib.parse.urljoin(url, stripped)
         rewritten_lines.append(line)
 
-    fd, path = tempfile.mkstemp(suffix=".m3u8")
+    fd, path = tempfile.mkstemp(suffix=".m3u8", dir=_temp_dir())
     os.close(fd)
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(rewritten_lines))

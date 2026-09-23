@@ -29,6 +29,10 @@ from .feedWindow import (
     _search_feed_key,
     _announce_now,
     _embed_sound_event,
+    _visible_embed_text,
+    _visible_message_text,
+    _post_web_url,
+    _compose_copy_text,
 )
 
 
@@ -203,7 +207,7 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
         # Translators: Announced while loading a user list. {} is already-translated (e.g. "followers").
         nvdaUi.message(_("Loading {}, please wait...").format(self._KIND_LABELS[self._kind]))
         self._pendingIsInitial = False
-        self._fetch()
+        self._fetch(progress=True)
 
     def onClearCache(self, evt=None):
         # Clears the cached list only -- no auto-refetch, F5/bgsync
@@ -228,7 +232,7 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
         if checkButton is not None:
             checkButton.SetFocus()
 
-    def _fetch(self):
+    def _fetch(self, progress=False):
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
@@ -258,7 +262,7 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
                 error = str(e)
             wx.CallAfter(self._onFetchDone, users, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=progress)
 
     @uiutil.safe_ui_callback
     def _onFetchDone(self, users, error):
@@ -425,7 +429,25 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         if evt.ControlDown() and keyCode == wx.WXK_DELETE:
             self.onClearCache()
             return
+        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.postList:
+            self._copyFocusedPostRow()
+            return
+        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.postList:
+            uiutil.jump_to_row(self, self.postList)
+            return
         evt.Skip()
+
+    def _copyFocusedPostRow(self):
+        post = self._getFocusedPost()
+        if post is None:
+            return
+        parts = [
+            self._displayLabel(post.get("handle"), post.get("display_name")),
+            _message_text(post),
+            _format_post_time(post.get("indexed_at")),
+        ]
+        url = _post_web_url(post.get("uri"), post.get("handle") or post.get("author_did"))
+        uiutil.copy_text_to_clipboard(_compose_copy_text(parts, url))
 
     def _renderThread(self, target_index=None):
         # Keeps whichever post is currently focused (by uri) unless
@@ -497,7 +519,7 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
                 error = str(e)
             wx.CallAfter(self._onRefreshDone, posts, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onRefreshDone(self, posts, error):
@@ -598,14 +620,13 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
             except Exception as e:
                 error = str(e)
                 message = None
-            wx.CallAfter(self._onActionDone, message, error)
+            wx.CallAfter(self._onLikeSynced, post, message, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _copyPostText(self, post):
         self._copyToClipboard(post.get("text", ""))
         # Translators: Announced after copying a post's text to the clipboard.
-        _announce_now = getattr(client, "_announce_now", None)  # placeholder removed below
         _announce_now(_("Post text copied to clipboard."))
 
     def _copyPostLink(self, post):
@@ -719,7 +740,25 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         if evt.AltDown() and keyCode == ord("U"):
             self.onUserAction()
             return
+        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.postList:
+            self._copyFocusedPostRow()
+            return
+        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.postList:
+            uiutil.jump_to_row(self, self.postList)
+            return
         evt.Skip()
+
+    def _copyFocusedPostRow(self):
+        post = self._getFocusedPost()
+        if post is None:
+            return
+        parts = [
+            self._displayLabel(post.get("handle"), post.get("display_name")),
+            _message_text(post),
+            _format_post_time(post.get("indexed_at")),
+        ]
+        url = _post_web_url(post.get("uri"), post.get("handle") or post.get("author_did"))
+        uiutil.copy_text_to_clipboard(_compose_copy_text(parts, url))
 
     def _render(self):
         previousUri = None
@@ -771,7 +810,7 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
                 error = str(e)
             wx.CallAfter(self._onRefreshDone, quotes, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onRefreshDone(self, quotes, error):
@@ -876,7 +915,7 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
             except Exception as e:
                 error = str(e)
                 message = None
-            wx.CallAfter(self._onActionDone, message, error)
+            wx.CallAfter(self._onLikeSynced, post, message, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -982,9 +1021,9 @@ class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, U
         return post
 
     def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.InsertItem(index, _visible_embed_text(post))
         self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 2, _visible_message_text(post))
         self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
@@ -1127,7 +1166,7 @@ class FeedPreviewTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, Us
                 error = str(e)
             wx.CallAfter(self._onAddFeedFromPreviewDone, added, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onAddFeedFromPreviewDone(self, added, error):
@@ -1202,9 +1241,9 @@ class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 break
 
     def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _describe_embed(post.get("embed_json")))
+        self.postList.InsertItem(index, _visible_embed_text(post))
         self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _message_text(post))
+        self.postList.SetItem(index, 2, _visible_message_text(post))
         self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
@@ -1229,3 +1268,70 @@ class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
 
     # onCharHook is inherited from FeedListMixin -- no SUPPORTS_* flags
     # needed here, this class never had Space/Ctrl+A/Left-Right/Ctrl+N.
+
+
+class LikesWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
+    """Posts the active account liked, newest like first. Optional permanent tab."""
+
+    TAB_KEY = "likes"
+
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        self._account = db.get_active_account()
+        # Translators: Optional permanent tab label for liked posts.
+        self.TAB_NAME = _("Likes")
+        self._feedKey = "likes"
+        self._tracksUnread = False
+        self._initFeedListState()
+
+        self._buildStandardFeedSizer()
+        self._bindStandardFeedEvents()
+        self._finishStandardFeedInit()
+
+    def onTabActivated(self):
+        self._render()
+        if self._account is not None:
+            # Translators: Announced when switching to this tab. {} is the tab name.
+            nvdaUi.message(_("{} tab").format(self.TAB_NAME))
+            self._restoreFocusPosition()
+
+    def _getActionablePost(self):
+        post = self._getFocusedPost()
+        if post is None:
+            # Translators: Announced when the post-action menu is invoked with no post focused.
+            nvdaUi.message(_("No post selected."))
+        return post
+
+    def _onLikeChanged(self, post):
+        if post.get("viewer_like_uri"):
+            return
+        for i, p in enumerate(self._posts):
+            if p["uri"] == post["uri"]:
+                del self._posts[i]
+                self._render()
+                if self._posts:
+                    newIndex = min(i, len(self._posts) - 1)
+                    self.postList.Focus(newIndex)
+                    self.postList.Select(newIndex)
+                break
+
+    def _dbGetPage(self, before_indexed_at=None, limit=None):
+        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
+
+    def _dbGetUnreadCount(self):
+        return db.get_unread_count(self._account["id"], self._feedKey)
+
+    def _syncPage(self, atprotoClient, cursor, limit):
+        return client.sync_likes(atprotoClient, self._account["id"], cursor=cursor, limit=limit)
+
+    def _markItemRead(self, post):
+        db.mark_post_read(post["uri"])
+
+    def onUserAction(self, evt=None):
+        post = self._getFocusedPost()
+        if post is None:
+            # Translators: Announced when the user-action menu is invoked with no post focused.
+            nvdaUi.message(_("No post selected."))
+            return
+        self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))

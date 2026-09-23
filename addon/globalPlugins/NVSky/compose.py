@@ -23,6 +23,7 @@ import os
 import threading
 import wx
 
+import gui.nvdaControls
 import tones
 import ui as nvdaUi
 from logHandler import log
@@ -31,6 +32,17 @@ from . import client
 from . import attachments as attachmentModule
 from . import uiutil
 from . import soundpack
+
+CONTENT_LABEL_DISPLAY_NAMES = {
+    # Translators: Content label display name (used when self-labeling a post).
+    "porn": _("Pornography"),
+    # Translators: Content label display name (used when self-labeling a post).
+    "sexual": _("Sexually suggestive"),
+    # Translators: Content label display name (used when self-labeling a post).
+    "nudity": _("Nudity"),
+    # Translators: Content label display name (used when self-labeling a post).
+    "graphic-media": _("Graphic media"),
+}
 
 POST_MAX_LENGTH = 300
 MAX_IMAGES = 4
@@ -331,11 +343,23 @@ class ComposeDialog(wx.Dialog):
         # Attach must come before Post in tab order.
         # Translators: Button to attach an image or video to a post.
         self.attachButton = wx.Button(self, label=_("Attach &media..."))
+        sizer.Add(self.attachButton, flag=wx.LEFT | wx.TOP, border=10)
+
+        # Created (and added to the sizer) BEFORE postButton/cancelButton
+        # below -- tab order follows creation/sizer-add order, and this
+        # needs to land right after Attach, not after Post/Cancel.
+        # Translators: Label above the self-label checklist in the compose window.
+        labelListLabel = wx.StaticText(self, label=_("Content &labels for this post (check any that apply):"))
+        sizer.Add(labelListLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        self.labelCheckList = gui.nvdaControls.CustomCheckListBox(
+            self, choices=[CONTENT_LABEL_DISPLAY_NAMES.get(k, k) for k in client.CONTENT_LABEL_KEYS]
+        )
+        sizer.Add(self.labelCheckList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP | wx.BOTTOM, border=10)
+
         # Translators: Button to submit the post. Shows the Ctrl+Enter shortcut.
         self.postButton = wx.Button(self, label=_("&Post (Ctrl+Enter)"))
         self.cancelButton = wx.Button(self, label=_("&Cancel"))
         buttonRow = wx.BoxSizer(wx.HORIZONTAL)
-        buttonRow.Add(self.attachButton, flag=wx.RIGHT, border=5)
         buttonRow.Add(self.postButton, flag=wx.RIGHT, border=5)
         buttonRow.Add(self.cancelButton)
         sizer.Add(buttonRow, flag=wx.ALL | wx.ALIGN_CENTER, border=10)
@@ -351,6 +375,9 @@ class ComposeDialog(wx.Dialog):
 
         self._updateTitle()
         self.textCtrl.SetFocus()
+
+    def _selectedSelfLabels(self):
+        return [client.CONTENT_LABEL_KEYS[i] for i in self.labelCheckList.CheckedItems]
 
     def onCloseEvent(self, evt):
         if self._onClosed:
@@ -413,6 +440,7 @@ class ComposeDialog(wx.Dialog):
             if self.linkPreviewCheck.IsShown() or self.chooseLinkButton.IsShown():
                 self.linkPreviewCheck.Hide()
                 self.chooseLinkButton.Hide()
+                self.chooseLinkButton.Disable()
                 self.Layout()
             self._detectedLinkUrl = None
             self._detectedUrls = []
@@ -437,7 +465,9 @@ class ComposeDialog(wx.Dialog):
         self.linkPreviewCheck.SetLabel(_("Attach link preview for {}").format(self._detectedLinkUrl))
         self.linkPreviewCheck.SetValue(True)
         self.linkPreviewCheck.Show()
-        self.chooseLinkButton.Show(len(urls) > 1)
+        hasMultipleUrls = len(urls) > 1
+        self.chooseLinkButton.Show(hasMultipleUrls)
+        self.chooseLinkButton.Enable(hasMultipleUrls)
         self.Layout()
 
     def onChooseLink(self, evt):
@@ -561,8 +591,6 @@ class ComposeDialog(wx.Dialog):
         dlg.Destroy()
         self.attachButton.Enable()
 
-        log.info(f"NVSky DEBUG video upload dialog result: result={result!r} wx.ID_OK={wx.ID_OK!r} blob_is_none={blob is None!r} uploadError={uploadError!r}")
-
         if result == wx.ID_OK and blob:
             altDlg = wx.TextEntryDialog(
                 self,
@@ -646,6 +674,7 @@ class ComposeDialog(wx.Dialog):
         video = self._video
         replyTo = self._replyTo
         quoteOf = self._quoteOf
+        selfLabels = self._selectedSelfLabels()
         linkUrl = self._detectedLinkUrl if (self.linkPreviewCheck.IsShown() and self.linkPreviewCheck.GetValue()) else None
 
         def worker():
@@ -674,6 +703,7 @@ class ComposeDialog(wx.Dialog):
                 createdPost = client.create_post(
                     atprotoClient, text, attachments=attachments, reply_ref=reply_ref,
                     quote_ref=quote_ref, link_card=link_card, facets=facets, video=video,
+                    self_labels=selfLabels,
                 )
                 error = None
             except Exception as e:
@@ -681,15 +711,14 @@ class ComposeDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onPostDone, error, createdPost)
 
-        threading.Thread(target=worker, daemon=True).start()
-
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback(check_app_closing=False)
     def _onPostDone(self, error, createdPost=None):
         if error:
             self.postButton.Enable()
             self.cancelButton.Enable()
-            self.attachButton.Enable()
+            self.attachButton.Enable(self._video is None)
             # Translators: Shown when posting fails. {} is the error message.
             failedText = _("Failed to post: {}").format(error)
             self.statusLabel.SetLabel(failedText)
@@ -706,8 +735,8 @@ class ComposeDialog(wx.Dialog):
         # after -- Close() is what jumps focus back to the parent window
         # and triggers NVDA to announce it, cutting off the message above.
         # Buttons are already disabled, so staying open silently for a
-        # moment longer doesn't let anything unwanted happen.
         wx.CallLater(1000, self.Close)
+        # moment longer doesn't let anything unwanted happen.
 
     def _insertOptimisticPost(self, createdPost, video=None):
         """
@@ -726,6 +755,10 @@ class ComposeDialog(wx.Dialog):
         by testing that omitting embed_json entirely for a video post
         left the row showing as empty text with no embed at all until
         the next real sync/F5 corrected it.
+
+        self._selectedSelfLabels() is read directly here (not passed
+        in) since this is only ever called right after a successful
+        post, from the same checklist state onPost already read.
         """
         try:
             account = db.get_active_account()
@@ -778,6 +811,7 @@ class ComposeDialog(wx.Dialog):
                 "viewer_repost_uri": None,
                 "viewer_bookmarked": False,
                 "viewer_thread_muted": False,
+                "labels_json": json.dumps(self._selectedSelfLabels()) or None,
             })
             db.upsert_feed_item(account["id"], "home", createdPost["uri"], createdPost.get("created_at"))
 

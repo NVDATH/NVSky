@@ -428,6 +428,35 @@ class _ChatMessagePanelMixin:
             self._afterMessageRead(convoId)
             self._pushMessageReadToServer(convoId, messageId)
 
+    def _messageRowText(self, index):
+        messages = getattr(self, "_currentMessages", [])
+        if not (0 <= index < len(messages)):
+            return ""
+        message = messages[index]
+        parts = [
+            _describe_reactions(message.get("reactions_json")),
+            self._messageFromLabel(message),
+            self._messageDisplayText(message),
+            # Translators: Placeholder shown for a message still being sent.
+            _format_time(message["sent_at"]) if message.get("sent_at") else _("Sending..."),
+        ]
+        return ", ".join(p for p in parts if p)
+
+    def _copyFocusedMessageRow(self):
+        index = _focused_list_index(self.messageList)
+        messages = getattr(self, "_currentMessages", [])
+        if not (0 <= index < len(messages)):
+            return
+        message = messages[index]
+        parts = [
+            _describe_reactions(message.get("reactions_json")),
+            self._messageFromLabel(message),
+            self._messageDisplayText(message),
+            # Translators: Placeholder shown for a message still being sent.
+            _format_time(message["sent_at"]) if message.get("sent_at") else _("Sending..."),
+        ]
+        uiutil.copy_text_to_clipboard(", ".join(p for p in parts if p))
+
     # ---------------- reply navigation ----------------
 
     def _jumpToRepliedMessage(self):
@@ -499,6 +528,8 @@ class _ChatMessagePanelMixin:
         nvdaUi.message(replyingLabel)
 
     def onCancelReply(self, evt):
+        if self._replyToMessageId is None:
+            return
         self._replyToMessageId = None
         self.replyingToLabel.Hide()
         self.cancelReplyButton.Hide()
@@ -893,6 +924,12 @@ class _ChatMessagePanelMixin:
         if keyCode == wx.WXK_RETURN and evt.ControlDown():
             self.onSend(None)
             return
+        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown() and self.FindFocus() is self.messageList:
+            self._copyFocusedMessageRow()
+            return
+        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown() and self.FindFocus() is self.messageList:
+            uiutil.jump_to_row(self, self.messageList, row_text=self._messageRowText)
+            return
         if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
             self._announceNthNewestMessage(keyCode - ord("0"))
             return
@@ -1024,7 +1061,7 @@ class JoinGroupDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onPreviewDone, code, previews, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onPreviewDone(self, code, previews, error):
@@ -1086,7 +1123,7 @@ class JoinGroupDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onJoinDone, result, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onJoinDone(self, result, error):
@@ -1132,7 +1169,7 @@ class JoinGroupDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onWithdrawDone, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onWithdrawDone(self, error):
@@ -1308,6 +1345,8 @@ class NewChatDialog(wx.Dialog):
             self.searchResultsList.SetSelection(0)
 
     def onAddRecipient(self, evt):
+        if not self.addRecipientButton.IsShown():
+            return
         indices = list(self.searchResultsList.CheckedItems)
         if not indices:
             # Translators: Announced when adding recipients with nothing checked in the search results.
@@ -1339,6 +1378,8 @@ class NewChatDialog(wx.Dialog):
         nvdaUi.message(_("Added {}. {} recipient(s) total.").format(len(toAdd), len(self._recipients)))
 
     def onRemoveRecipient(self, evt):
+        if not self.removeRecipientButton.IsShown():
+            return
         indices = list(self.recipientsList.CheckedItems)
         if not indices:
             # Translators: Announced when removing recipients with nothing checked.
@@ -1388,6 +1429,7 @@ class NewChatDialog(wx.Dialog):
             # Translators: Announced while starting a new 1:1 chat. {} is the recipient's handle.
             else _("Starting chat with @{}, please wait...").format(recipients[0]["handle"])
         )
+        soundpack.start_progress()
 
         def worker():
             try:
@@ -1412,6 +1454,7 @@ class NewChatDialog(wx.Dialog):
 
     @uiutil.safe_ui_callback
     def _onStartChatDone(self, convo, error):
+        soundpack.stop_progress()
         if error:
             log.error(f"NVSky: start new chat failed: {error}")
             # Translators: Announced when starting a new chat fails. {} is the error message.
@@ -1502,7 +1545,7 @@ class JoinRequestsDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onLoadDone, requests_, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onLoadDone(self, requests_, error):
@@ -1549,7 +1592,7 @@ class JoinRequestsDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onResolveDone, index, approve, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onResolveDone(self, index, approve, error):
@@ -1783,7 +1826,7 @@ class InviteLinkDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onGenerateDone, joinLink, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onGenerateDone(self, joinLink, error):
@@ -1821,7 +1864,7 @@ class InviteLinkDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onToggleDone, joinLink, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onToggleDone(self, joinLink, error):
@@ -1932,6 +1975,8 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
             self.memberList.SetSelection(0)
 
     def onRemove(self, evt):
+        if not self.removeButton.IsShown():
+            return
         indices = list(self.memberList.CheckedItems)
         if not indices:
             # Translators: Announced when removing group members with nothing checked.
@@ -1974,7 +2019,7 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onRemoveDone, toRemove, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onRemoveDone(self, removed, error):
@@ -2030,6 +2075,8 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
             self.suggestionList.SetSelection(0)
 
     def onAddSuggestion(self, evt):
+        if not self.addButton.IsShown():
+            return
         indices = list(self.suggestionList.CheckedItems)
         if not indices:
             # Translators: Announced when adding group members with nothing checked in search results.
@@ -2062,7 +2109,7 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onAddDone, toAdd, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onAddDone(self, added, error):
@@ -2189,7 +2236,7 @@ class ShareToChatDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onSendDone, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onSendDone(self, error):
@@ -2642,7 +2689,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.sendButton.Show(canCompose)
         self.lockNotice.Show(isLocked)
         self.acceptButton.Show(isRequest)
+        self.acceptButton.Enable(isRequest)
         self.declineButton.Show(isRequest)
+        self.declineButton.Enable(isRequest)
         self.Layout()
 
     def onConvoTreeCharHook(self, evt):
@@ -2654,11 +2703,20 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         keyCode = evt.GetKeyCode()
         if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers():
             self._checkConvoTreeBoundaryBeforeKey(keyCode)
+        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown():
+            if uiutil.copy_focused_row(self.convoTree):
+                return
         evt.Skip()
 
     def onAcceptButton(self, evt):
         convo = self._currentConvo()
-        if convo is not None:
+        # Guards against the Accept button's own &A mnemonic firing
+        # via Alt+A even while hidden (CONFIRMED: wx still dispatches a
+        # hidden button's mnemonic if it's merely Hide()'d, not also
+        # Disable()'d -- see _updateActionArea's matching fix) landing
+        # on a non-request conversation and silently accept_convo()-ing
+        # something that was never a pending request.
+        if convo is not None and convo.get("status") == "request":
             self._acceptConvo(convo)
 
     def onDeclineButton(self, evt):
@@ -3009,7 +3067,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onLeaveConvoDone, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback
     def _onLeaveConvoDone(self, error):
@@ -3081,6 +3139,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             wx.CallAfter(self._onRefreshSelectedConvoDone, convoId, error, previousMessageCount)
 
         threading.Thread(target=worker, daemon=True).start()
+        # (unchanged from before -- cursor persistence now lives inside
+        # client.debug_get_convo_log itself, see its docstring)
 
     @uiutil.safe_ui_callback
     def _onRefreshSelectedConvoDone(self, convoId, error, previousMessageCount):

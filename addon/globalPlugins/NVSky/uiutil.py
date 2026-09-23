@@ -7,7 +7,14 @@ import risk.
 """
 import functools
 
+import threading
+import time
+
+import controlTypes
+import queueHandler
+import speech
 import wx
+import ui as nvdaUi
 from logHandler import log
 
 # Set True by MainWindow.onClose (feedWindow.py) right before it calls
@@ -23,6 +30,182 @@ from logHandler import log
 # shutdown avoids that window regardless of which failure mode a given
 # race would have hit.
 app_closing = False
+
+
+def start_worker(worker, progress=True):
+    """Runs worker in a daemon thread; the progress sound plays until it finishes."""
+    from . import soundpack
+
+    def run():
+        try:
+            worker()
+        finally:
+            if progress:
+                soundpack.stop_progress()
+
+    if progress:
+        soundpack.start_progress()
+    threading.Thread(target=run, daemon=True).start()
+
+
+def copy_text_to_clipboard(text: str) -> bool:
+    if not text:
+        return False
+    if not wx.TheClipboard.Open():
+        return False
+    try:
+        wx.TheClipboard.SetData(wx.TextDataObject(text))
+    finally:
+        wx.TheClipboard.Close()
+    # Translators: Announced after Ctrl+C copies the focused row's text to the clipboard.
+    nvdaUi.message(_("Copied."))
+    return True
+
+
+_jump_title = ""
+_jump_suppress_until = 0.0
+
+
+def _suppress_jump_title(title):
+    # The main window's title is re-announced when the dialog closes; skip that one announcement.
+    global _jump_title, _jump_suppress_until
+    _jump_title = title
+    _jump_suppress_until = time.time() + 1.5
+
+
+def jump_title_suppressed(name):
+    return time.time() < _jump_suppress_until and name == _jump_title
+
+
+_jump_row_text = ""
+_jump_row_until = 0.0
+
+
+def _set_jump_row(text, active=True):
+    global _jump_row_text, _jump_row_until
+    _jump_row_text = text
+    _jump_row_until = time.time() + 0.6 if active else 0.0
+
+
+def jump_row_text_for(obj):
+    """Row text to speak instead of NVDA's own announcement right after Ctrl+J."""
+    if time.time() < _jump_row_until and obj.role == controlTypes.Role.LISTITEM:
+        return _jump_row_text
+    return None
+
+
+class _RowNumberDialog(wx.Dialog):
+    def __init__(self, parent, current, total):
+        # Translators: Title of the jump-to-row dialog.
+        super().__init__(parent, title=_("Jump to row"))
+        self._total = total
+        self.number = None
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        # Translators: Label of the jump-to-row field. {} is the highest row number.
+        label = wx.StaticText(self, label=_("&Row number (1 to {}):").format(total))
+        sizer.Add(label, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+        startValue = str(current + 1) if current >= 0 else "1"
+        self.rowText = wx.TextCtrl(self, value=startValue, style=wx.TE_PROCESS_ENTER)
+        sizer.Add(self.rowText, flag=wx.EXPAND | wx.ALL, border=10)
+
+        buttons = wx.StdDialogButtonSizer()
+        okBtn = wx.Button(self, wx.ID_OK)
+        cancelBtn = wx.Button(self, wx.ID_CANCEL)
+        okBtn.SetDefault()
+        buttons.AddButton(okBtn)
+        buttons.AddButton(cancelBtn)
+        buttons.Realize()
+        sizer.Add(buttons, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
+
+        self.SetSizerAndFit(sizer)
+        self.CentreOnScreen()
+
+        self.rowText.Bind(wx.EVT_TEXT, self.onText)
+        self.rowText.Bind(wx.EVT_TEXT_ENTER, self.onOk)
+        okBtn.Bind(wx.EVT_BUTTON, self.onOk)
+
+        self.rowText.SetFocus()
+        self.rowText.SelectAll()
+
+    def onText(self, evt):
+        raw = self.rowText.GetValue()
+        digits = "".join(c for c in raw if c in "0123456789").lstrip("0")
+        if digits and int(digits) > self._total:
+            digits = str(self._total)
+            from . import soundpack
+            soundpack.play("max_length")
+        if digits != raw:
+            self.rowText.ChangeValue(digits)
+            self.rowText.SetInsertionPointEnd()
+        evt.Skip()
+
+    def onOk(self, evt):
+        value = self.rowText.GetValue()
+        if not value:
+            # Translators: Announced when confirming the jump-to-row dialog with an empty field.
+            nvdaUi.message(_("Enter a row number."))
+            return
+        self.number = int(value)
+        _suppress_jump_title(self.GetParent().GetTopLevelParent().GetTitle())
+        self.EndModal(wx.ID_OK)
+
+
+def jump_to_row(parent, list_ctrl, row_text=None) -> bool:
+    """Ctrl+J: asks for a row number (capped to the row count) and moves there.
+    row_text(index) optionally supplies the spoken text (chat uses the full message)."""
+    total = list_ctrl.GetItemCount()
+    if total == 0:
+        # Translators: Announced when Ctrl+J is pressed on an empty list.
+        nvdaUi.message(_("Nothing to jump to."))
+        return False
+    dlg = _RowNumberDialog(parent, list_ctrl.GetFocusedItem(), total)
+    result = dlg.ShowModal()
+    number = dlg.number
+    dlg.Destroy()
+    if result != wx.ID_OK or number is None:
+        return False
+    index = max(0, min(number - 1, total - 1))
+
+    def apply():
+        try:
+            if index >= list_ctrl.GetItemCount():
+                return
+            if row_text is not None:
+                text = row_text(index)
+            else:
+                parts = [list_ctrl.GetItemText(index, col) for col in range(list_ctrl.GetColumnCount())]
+                text = ", ".join(p for p in parts if p)
+            speech.cancelSpeech()
+            _set_jump_row(text)
+            if move_focus_and_check_announce(list_ctrl, index):
+                # No focus event will follow, so announce here.
+                _set_jump_row("", active=False)
+                if text:
+                    nvdaUi.message(text)
+        except RuntimeError:
+            pass
+
+    list_ctrl.SetFocus()
+    # Runs after events NVDA already queued (focus change from the closed dialog).
+    wx.CallAfter(queueHandler.queueFunction, queueHandler.eventQueue, apply)
+    return True
+
+
+def copy_focused_row(ctrl) -> bool:
+    """Copies the focused row (all columns) of a ListCtrl, or the selected TreeCtrl item."""
+    if isinstance(ctrl, wx.TreeCtrl):
+        item = ctrl.GetSelection()
+        if not item.IsOk():
+            return False
+        return copy_text_to_clipboard(ctrl.GetItemText(item))
+    if isinstance(ctrl, wx.ListCtrl):
+        index = ctrl.GetFocusedItem()
+        if index == -1:
+            return False
+        parts = [ctrl.GetItemText(index, col) for col in range(ctrl.GetColumnCount())]
+        return copy_text_to_clipboard(", ".join(p for p in parts if p))
+    return False
 
 
 def single_line(text: str) -> str:

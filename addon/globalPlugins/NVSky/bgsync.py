@@ -48,6 +48,11 @@ def _thread_display_name(posts: list) -> str:
 
 
 def sync_home(atprotoClient, account_id: int):
+    if client.ADULT_CONTENT_PREF_KEY not in db.get_content_label_prefs_cache(account_id):
+        try:
+            db.set_content_label_prefs_cache(account_id, client.get_content_label_prefs(atprotoClient))
+        except Exception as e:
+            log.error(f"NVSky: content label prefs bootstrap failed: {e}")
     feedKey = db.get_home_active_filter(account_id)
     before = db.get_feed_page(account_id, feedKey, limit=1)
     oldTopUri = before[0]["uri"] if before else None
@@ -66,6 +71,8 @@ def sync_home(atprotoClient, account_id: int):
 
 
 def sync_notifications(atprotoClient, account_id: int):
+    if "notifications" not in db.get_enabled_tabs():
+        return False, []
     beforeCount = db.get_unread_notification_count(account_id)
     client.sync_notifications(atprotoClient, account_id, limit=PAGE_SIZE)
     afterCount = db.get_unread_notification_count(account_id)
@@ -76,36 +83,56 @@ def sync_notifications(atprotoClient, account_id: int):
 
 
 def sync_saved(atprotoClient, account_id: int):
-    before = db.get_feed_page(account_id, "saved", limit=1)
-    oldTopUri = before[0]["uri"] if before else None
-    client.sync_saved(atprotoClient, account_id, limit=PAGE_SIZE)
-    after = db.get_feed_page(account_id, "saved", limit=1)
-    newTopUri = after[0]["uri"] if after else None
-    if newTopUri and newTopUri != oldTopUri:
+    # Covers both optional tabs, same interval; only the enabled ones sync.
+    enabled = db.get_enabled_tabs()
+    names = []
+    targets = [
         # Translators: Display name for the Saved tab in sync-change announcements.
-        return True, [_("Saved")]
-    return False, []
+        ("saved", client.sync_saved, _("Saved")),
+        # Translators: Display name for the Likes tab in sync-change announcements.
+        ("likes", client.sync_likes, _("Likes")),
+    ]
+    for feedKey, syncFn, label in targets:
+        if feedKey not in enabled:
+            continue
+        before = db.get_feed_page(account_id, feedKey, limit=1)
+        oldTopUri = before[0]["uri"] if before else None
+        try:
+            syncFn(atprotoClient, account_id, limit=PAGE_SIZE)
+        except Exception as e:
+            log.error(f"NVSky: background {feedKey} sync failed: {e}")
+            continue
+        after = db.get_feed_page(account_id, feedKey, limit=1)
+        newTopUri = after[0]["uri"] if after else None
+        if newTopUri and newTopUri != oldTopUri:
+            names.append(label)
+    return bool(names), names
 
 
 def sync_chat(atprotoClient, account_id: int, my_did: str):
-    beforeConvos = db.get_convos(account_id)
-    beforeSnapshot = {
-        c["convo_id"]: (c.get("unread_count") or 0, c.get("last_message_sent_at")) for c in beforeConvos
-    }
-    client.sync_convos(atprotoClient, account_id, my_did)
-    afterConvos = db.get_convos(account_id)
-    afterSnapshot = {
-        c["convo_id"]: (c.get("unread_count") or 0, c.get("last_message_sent_at")) for c in afterConvos
-    }
-    changedIds = {cid for cid, val in afterSnapshot.items() if beforeSnapshot.get(cid) != val}
-    if not changedIds:
+    account = db.get_active_account()
+    if account is not None and not account.get("chat_supported", 1):
+        return False, []
+    # Chat tab hidden: still sync while a popped-out conversation tab is open.
+    if "chat" not in db.get_enabled_tabs() and not any(
+        e.get("type") == "conversation" for e in db.get_open_temp_tabs(account_id)
+    ):
+        return False, []
+    # Phase 1 delta-sync (see client.sync_chat_delta) -- replaces the
+    # previous full sync_convos()-every-tick + before/after snapshot
+    # diff. Only background sync uses this; F5/manual refresh still go
+    # through the full path unchanged.
+    touchedConvoIds = client.sync_chat_delta(atprotoClient, account_id, my_did)
+    if not touchedConvoIds:
         return False, []
     names = []
-    for convo in afterConvos:
-        if convo["convo_id"] in changedIds:
-            members = db.get_convo_members(account_id, convo["convo_id"])
-            names.append(db.describe_convo_from_members(convo, members))
-    return True, names
+    for convoId in touchedConvoIds:
+        convo = db.get_convo(account_id, convoId)
+        if convo is None:
+            continue
+        members = db.get_convo_members(account_id, convoId)
+        names.append(db.describe_convo_from_members(convo, members))
+    return bool(names), names
 
 
 def sync_lists(atprotoClient, account_id: int, my_did: str):
@@ -116,6 +143,11 @@ def sync_lists(atprotoClient, account_id: int, my_did: str):
     # anyway). Also covers any list open as its own ListTabWindow temp
     # tab, which may belong to someone else entirely (e.g. opened via
     # Find lists by user).
+    # Lists tab hidden: still sync while a list opened in its own tab exists.
+    if "lists" not in db.get_enabled_tabs() and not any(
+        e.get("type") == "list" for e in db.get_open_temp_tabs(account_id)
+    ):
+        return False, []
     changed = False
     names = []
 
