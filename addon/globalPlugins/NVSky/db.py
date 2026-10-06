@@ -3,16 +3,10 @@ SQLite persistence layer for NVSky. See init_db() for schema.
 The database file lives under NVDA's user config directory, NOT inside the
 add-on folder (the add-on folder gets overwritten on every update).
 
-Uses sqlcipher3 (not plain sqlite3) for full database encryption -- its
-compiled extension bundles SQLCipher+OpenSSL statically, so unlike the old
-plain-sqlite3 setup, this needs NO os.add_dll_directory() vendoring trick
-at all. That trick was process-wide (Windows AddDllDirectory is global to
-the whole NVDA process, not scoped per add-on), which is how it was
-possible for another add-on's vendored sqlite3.dll to get picked up here
-and vice versa -- confirmed by testing, not just theory. sqlcipher3 having
-no external DLL to resolve removes that risk entirely, but still worth
-re-confirming empirically (e.g. temporarily disable other add-ons that
-vendor sqlite3 and check NVSky still opens its db fine).
+Uses sqlcipher3 (not plain sqlite3) for full database encryption. Its
+compiled extension bundles SQLCipher+OpenSSL statically, so no
+os.add_dll_directory() trick is needed (that trick is process-wide and
+let other add-ons' sqlite3.dll collide with ours).
 
 The DB encryption master key is a random 32-byte value, generated once and
 stored -- encrypted via the same DPAPI helpers as the App Password
@@ -90,21 +84,10 @@ def _open_connection():
 
 
 def _get_connection():
-    # One connection per OS thread, created once and reused for that
-    # thread's lifetime, instead of opening+closing (and paying the
-    # SQLCipher PRAGMA-key unlock cost) on every single query. Confirmed
-    # via timing that opening a fresh connection per call was the
-    # dominant cost behind the MainWindow-open freeze (~200+ connects
-    # in a single UI build, ~0.8s total) -- see also the time-format
-    # N+1 fix in feedWindow.py/chatWindow.py, which was the other half
-    # of that same freeze.
-    #
-    # Safe across threads without a lock: sqlite3/sqlcipher3 connections
-    # default to check_same_thread=True (each connection only usable
-    # from the thread that created it), which is exactly what
-    # threading.local() already gives us for free -- one isolated
-    # connection object per thread, never shared.
-
+    # One connection per OS thread, reused for that thread's lifetime:
+    # reopening per query (SQLCipher key unlock) caused the MainWindow-open
+    # freeze. No lock needed: connections are check_same_thread=True and
+    # threading.local() never shares them.
     conn = getattr(_local, "conn", None)
     if conn is not None:
         return conn
@@ -124,12 +107,8 @@ def _get_connection():
 
 @contextmanager
 def _connect():
-    # Kept as a context manager so every existing `with _connect() as
-    # conn:` call site keeps working unchanged -- it just no longer
-    # closes the connection on exit, since the connection is now meant
-    # to outlive this one call. Write paths already call conn.commit()
-    # explicitly where needed (see upsert_convo etc.), so nothing here
-    # relied on close()-time behavior.
+    # Context manager kept for `with _connect() as conn:` call sites; it
+    # doesn't close the connection (see _get_connection). Writers commit explicitly.
     yield _get_connection()
 
 
@@ -341,10 +320,7 @@ def get_all_accounts():
 def remove_account(account_id: int):
     with _connect() as conn:
         conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        # convos/messages/convo_members were never given an actual
-        # FOREIGN KEY ... ON DELETE CASCADE to accounts (only posts
-        # was), so they'd otherwise be left as orphaned rows forever --
-        # cleaned up explicitly here instead.
+        # Only posts has a cascading FK to accounts; delete the rest explicitly.
         conn.execute("DELETE FROM convos WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM messages WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM convo_members WHERE account_id = ?", (account_id,))
@@ -367,23 +343,12 @@ def set_chat_supported(account_id: int, supported: bool):
 
 def close_all_connections():
     """
-    Best-effort cleanup for GlobalPlugin.terminate(). Runs a WAL
-    checkpoint and closes whichever connection belongs to the CURRENT
-    thread -- terminate() runs on NVDA's main thread, so that's
-    _local.conn for that thread specifically.
-
-    NOT a full fix for the Gemini-raised concern: sqlite3 connections
-    here default to check_same_thread=True (see _get_connection's
-    comment -- deliberate, avoids needing a lock across threads), so a
-    connection opened by a background sync thread genuinely can't be
-    safely closed from here if a sync happens to be mid-flight at the
-    exact moment NVDA shuts down. In practice that's a narrow race
-    (most shutdowns happen with no sync in progress), and the OS
-    releases the file handle regardless once the process actually
-    exits -- this only matters for something that needs the file
-    unlocked WHILE the add-on is still loaded, e.g. "Copy user config
-    to portable NVDA" (the case reported). Disabling the add-on first
-    remains the safe manual fallback for that specific case.
+    Checkpoints the WAL and closes the CURRENT thread's connection. Called
+    from terminate() (main thread) and at the end of background workers.
+    Other threads' connections can't be closed from here
+    (check_same_thread), so a sync mid-flight at shutdown keeps its file
+    handle until the process exits; disable the add-on before copying the
+    NVDA profile.
     """
     conn = getattr(_local, "conn", None)
     if conn is None:
@@ -402,31 +367,20 @@ def close_all_connections():
 
 def clear_all_cache(account_id: int):
     """
-    Wipes every cached/local-state table for this account -- like
-    remove_account but keeps the accounts row itself (still logged in,
-    no re-entering the App Password). This is the Settings > General
-    "Clear all cache" action; Ctrl+Delete in each tab only clears that
-    one tab's own cache, this clears everything at once.
+    Settings > General "Clear all cache": like remove_account but keeps
+    the accounts row (stays logged in).
     """
     with _connect() as conn:
-        # posts cascades into feed_items via the FK on posts.uri --
-        # no separate feed_items delete needed (foreign_keys pragma is
-        # ON, see _get_connection).
+        # posts cascades into feed_items via its FK.
         conn.execute("DELETE FROM posts WHERE account_id = ?", (account_id,))
-        # notifications/convos/messages/convo_members/lists have no
-        # real FK to accounts (same gap remove_account's own comment
-        # documents) -- deleted explicitly here too.
+        # These have no FK to accounts; delete explicitly.
         conn.execute("DELETE FROM notifications WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM convos WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM messages WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM convo_members WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM lists WHERE account_id = ?", (account_id,))
-        # ui_state has no account_id column -- every per-account entry
-        # embeds the id in its key string instead (see
-        # get_open_temp_tabs/get_user_list_cache/get_tab_order/etc).
-        # Two LIKE patterns cover every such key: ends with ":<id>", or
-        # starts with "user_list_cache:<id>:" (the one key shape with
-        # the id in the middle, not at the end).
+        # ui_state has no account_id column; per-account keys end with
+        # ":<id>", except "user_list_cache:<id>:<key>".
         conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"%:{account_id}",))
         conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"user_list_cache:{account_id}:%",))
         conn.commit()
@@ -436,19 +390,22 @@ def clear_all_cache(account_id: int):
 # ---------------- authors ----------------
 
 def upsert_author(did: str, handle: str, display_name: str, avatar_url: str,
-                   viewer_following=None, viewer_muted=False, viewer_blocking=None):
+                   viewer_following=None, viewer_muted=False, viewer_blocking=None,
+                   viewer_activity_subscription=False):
     with _connect() as conn:
         conn.execute(
-            """INSERT INTO authors (did, handle, display_name, avatar_url, viewer_following, viewer_muted, viewer_blocking)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO authors (did, handle, display_name, avatar_url, viewer_following, viewer_muted, viewer_blocking, viewer_activity_subscription)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(did) DO UPDATE SET
                    handle=excluded.handle,
                    display_name=excluded.display_name,
                    avatar_url=excluded.avatar_url,
                    viewer_following=excluded.viewer_following,
                    viewer_muted=excluded.viewer_muted,
-                   viewer_blocking=excluded.viewer_blocking""",
-            (did, handle, display_name, avatar_url, viewer_following, int(bool(viewer_muted)), viewer_blocking),
+                   viewer_blocking=excluded.viewer_blocking,
+                   viewer_activity_subscription=excluded.viewer_activity_subscription""",
+            (did, handle, display_name, avatar_url, viewer_following, int(bool(viewer_muted)), viewer_blocking,
+             int(bool(viewer_activity_subscription))),
         )
         conn.commit()
 
@@ -484,6 +441,25 @@ def set_author_activity_subscription(did: str, subscribed: bool):
             (1 if subscribed else 0, did),
         )
         conn.commit()
+
+
+RELATIONSHIP_LIST_KINDS = ("following", "followers", "known_followers", "muted", "blocked", "subscriptions")
+
+
+def cache_relationship_authors(users: list, kind: str):
+    """Stores each user's relationship state (from client._actor_dict) so
+    Alt+U shows truthful labels. Skips lists whose entries carry no state."""
+    if kind not in RELATIONSHIP_LIST_KINDS:
+        return
+    for u in users:
+        old = get_author(u["did"]) or {}
+        subscribed = True if kind == "subscriptions" else bool(old.get("viewer_activity_subscription"))
+        upsert_author(
+            did=u["did"], handle=u["handle"], display_name=u.get("display_name"),
+            avatar_url=old.get("avatar_url"), viewer_following=u.get("following_uri"),
+            viewer_muted=u.get("muted", False), viewer_blocking=u.get("blocking_uri"),
+            viewer_activity_subscription=subscribed,
+        )
 
 
 # ---------------- posts ----------------
@@ -549,13 +525,8 @@ def upsert_feed_item(account_id: int, feed_key: str, uri: str, indexed_at: str):
 
 def clear_feed_key_cache(account_id: int, feed_key: str):
     """
-    Removes every feed_items row for one feed_key (does NOT touch the
-    shared posts table itself -- other feeds/tabs may still reference
-    the same post rows). Used when a temp tab backed by FeedListMixin
-    (e.g. UserTimelineTabWindow) is closed via Ctrl+W -- unlike list/
-    conversation tabs, these feed_keys are synthetic and per-tab
-    (f"user_timeline:{did}"), so nothing else should keep them around
-    once the tab itself is gone.
+    Removes every feed_items row for one feed_key (Ctrl+Delete in a tab).
+    Leaves the shared posts table alone; other feeds may reference those rows.
     """
     with _connect() as conn:
         conn.execute(
@@ -566,12 +537,8 @@ def clear_feed_key_cache(account_id: int, feed_key: str):
 
 
 def delete_feed_item(account_id: int, feed_key: str, uri: str):
-    """Removes `uri` from `feed_key` for this account -- the reverse of
-    upsert_feed_item. Needed for feeds where an item can legitimately
-    disappear (e.g. Saved, when a post gets unbookmarked) -- without
-    this, get_feed_page() keeps returning the stale membership row
-    forever, since a sync only ever adds/updates rows, it never detects
-    and removes ones no longer present remotely."""
+    """Reverse of upsert_feed_item. Needed where items can disappear
+    (e.g. Saved after unbookmarking): a sync only adds/updates rows."""
     with _connect() as conn:
         conn.execute(
             "DELETE FROM feed_items WHERE account_id = ? AND feed_key = ? AND uri = ?",
@@ -614,11 +581,7 @@ def get_post(uri: str):
 
 
 def upsert_convo(convo: dict):
-    # Plain overwrite on every field -- convo.kind (see
-    # client._store_convo) turned out to carry is_group/group_name/
-    # lock_status directly and reliably every sync, so there's no
-    # longer a need to protect any of these from being clobbered by a
-    # stale/missing value the way an earlier, wrong theory needed.
+    # Plain overwrite of every field: client._store_convo derives them reliably each sync.
     with _connect() as conn:
         conn.execute(
             """INSERT INTO convos
@@ -676,12 +639,8 @@ def get_convo_members(account_id: int, convo_id: str):
 
 def describe_convo_from_members(convo: dict, members: list) -> str:
     """
-    Pure display-name helper, no DB access -- deliberately takes an
-    already-fetched member list instead of querying itself, so callers
-    that already have (or are caching) the member list for a batch of
-    convos don't reintroduce the N+1 query pattern that caused the
-    MainWindow-open freeze fixed in plan-07.md. Shared by ChatWindow,
-    ConvoTabWindow, and __init__.py's temp-tab restore.
+    Display name for a convo from an already-fetched member list. No DB
+    access on purpose: querying per convo caused an N+1 freeze.
     """
     if convo.get("is_group"):
         if convo.get("group_name"):
@@ -698,12 +657,8 @@ def describe_convo_from_members(convo: dict, members: list) -> str:
 
 
 def get_convos(account_id: int):
-    # Convos with no last_message_sent_at yet (e.g. a group created
-    # with no first message) sort as NULL, which SQLite always treats
-    # as the lowest value -- DESC pushed them to the very bottom, even
-    # though a brand-new empty convo should read as "newest", not
-    # oldest. The CASE puts NULL-timestamp convos first as a group,
-    # then everything else sorts by actual time as before.
+    # NULL last_message_sent_at (e.g. a new group with no messages) sorts
+    # lowest under DESC; the CASE puts those convos first instead.
     with _connect() as conn:
         rows = conn.execute(
             """SELECT * FROM convos WHERE account_id = ?
@@ -780,6 +735,26 @@ def set_convo_locked(account_id: int, convo_id: str, locked: bool):
         conn.commit()
 
 
+def set_convo_muted(account_id: int, convo_id: str, muted: bool):
+    # Local-first write for ChatWindow._toggleMuteConvo's optimistic UI.
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE convos SET muted = ? WHERE account_id = ? AND convo_id = ?",
+            (int(muted), account_id, convo_id),
+        )
+        conn.commit()
+
+
+def set_convo_status(account_id: int, convo_id: str, status: str):
+    # Local-first write for ChatWindow._acceptConvo's optimistic UI.
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE convos SET status = ? WHERE account_id = ? AND convo_id = ?",
+            (status, account_id, convo_id),
+        )
+        conn.commit()
+
+
 def upsert_list(list_row: dict):
     with _connect() as conn:
         conn.execute(
@@ -837,18 +812,9 @@ def delete_list(account_id: int, list_uri: str):
 
 
 def upsert_message(message: dict):
-    """is_read is deliberately NOT set here -- a new row just gets the
-    column's DEFAULT 0, and db.reconcile_message_read_state() (called
-    right after a batch of these upserts, from
-    client._sync_convo_messages) is what actually establishes the
-    correct read/unread boundary, from the server's authoritative
-    per-conversation unread_count. Never touched by ON CONFLICT either
-    way -- some other local-state path (reconcile / mark_message_read /
-    mark_all_messages_read) always owns it after this point.
-    reactions_json IS refreshed on every resync though (in both INSERT
-    and ON CONFLICT) -- unlike is_read, reactions are someone else's
-    server-side data, not local state we own, so a stale cached copy
-    would just be wrong rather than "the user's own read progress"."""
+    """is_read is never set here (new rows get DEFAULT 0; see
+    reconcile_message_read_state/mark_message_read). reactions_json IS
+    refreshed on every resync, since it's server-side data."""
     with _connect() as conn:
         conn.execute(
             """INSERT INTO messages
@@ -887,15 +853,6 @@ def mark_message_read(account_id: int, convo_id: str, message_id: str):
         conn.commit()
 
 
-def mark_message_unread(account_id: int, convo_id: str, message_id: str):
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE messages SET is_read = 0 WHERE account_id = ? AND convo_id = ? AND message_id = ?",
-            (account_id, convo_id, message_id),
-        )
-        conn.commit()
-
-
 def delete_message(account_id: int, convo_id: str, message_id: str):
     with _connect() as conn:
         conn.execute(
@@ -906,11 +863,7 @@ def delete_message(account_id: int, convo_id: str, message_id: str):
 
 
 def set_message_reactions(account_id: int, convo_id: str, message_id: str, reactions_json: str):
-    # Local-first write for _ChatMessagePanelMixin._applyReactionsLocally's
-    # optimistic UI -- sync_convo_messages's normal upsert_message path
-    # still overwrites this with the server's authoritative value right
-    # after, this just lets the UI (and other open tabs, via
-    # notifyConvoChanged) reflect the requested state immediately.
+    # Optimistic local write; the next sync overwrites it with the server's value.
     with _connect() as conn:
         conn.execute(
             "UPDATE messages SET reactions_json = ? WHERE account_id = ? AND convo_id = ? AND message_id = ?",
@@ -1092,6 +1045,8 @@ def mark_notification_unread(uri: str):
 def clear_notifications_cache(account_id: int):
     with _connect() as conn:
         conn.execute("DELETE FROM notifications WHERE account_id = ?", (account_id,))
+        # Without this, the next sync stops at the old resume point and stores nothing.
+        conn.execute("DELETE FROM ui_state WHERE key = ?", (f"notification_sync_cursor:{account_id}",))
         conn.commit()
         conn.execute("VACUUM")
 
@@ -1250,6 +1205,94 @@ def set_chat_log_cursor(account_id: int, cursor: str):
     set_ui_state(f"chat_log_cursor:{account_id}", cursor)
 
 
+def get_jetstream_cursor(account_id: int):
+    """Jetstream time_us cursor (see jetstream.JetstreamClient) --
+    None means never connected before, starts from "now" (no cursor
+    param sent)."""
+    raw = get_ui_state(f"jetstream_cursor:{account_id}")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def set_jetstream_cursor(account_id: int, time_us: int):
+    set_ui_state(f"jetstream_cursor:{account_id}", str(time_us))
+
+
+def get_jetstream_enabled() -> bool:
+    return get_ui_state("jetstream_enabled") == "1"
+
+
+def set_jetstream_enabled(enabled: bool):
+    set_ui_state("jetstream_enabled", "1" if enabled else "0")
+
+
+def get_tray_enabled() -> bool:
+    # On unless the user turned it off.
+    return get_ui_state("tray_enabled") != "0"
+
+
+def set_tray_enabled(enabled: bool):
+    set_ui_state("tray_enabled", "1" if enabled else "0")
+
+
+TRAY_CATEGORIES = ("home", "notifications", "chat")
+
+
+def get_tray_categories() -> set:
+    """Tabs whose unread counts the notification area icon shows (all by default)."""
+    raw = get_ui_state("tray_categories")
+    if raw is None:
+        return set(TRAY_CATEGORIES)
+    try:
+        return set(json.loads(raw)) & set(TRAY_CATEGORIES)
+    except (ValueError, TypeError):
+        return set(TRAY_CATEGORIES)
+
+
+def set_tray_categories(categories) -> None:
+    set_ui_state("tray_categories", json.dumps(sorted(categories)))
+
+
+def get_tray_per_tab() -> bool:
+    return get_ui_state("tray_per_tab") == "1"
+
+
+def set_tray_per_tab(per_tab: bool) -> None:
+    set_ui_state("tray_per_tab", "1" if per_tab else "0")
+
+
+def get_feed_item_indexed_at(account_id: int, feed_key: str, uri: str):
+    """Existing sort-position timestamp for one feed_items row, or
+    None if not cached yet -- used by client._store_feed_item to keep
+    a self-repost's position from sinking when a subsequent sync
+    doesn't frame it as a repost (see that function's own comment)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT indexed_at FROM feed_items WHERE account_id = ? AND feed_key = ? AND uri = ?",
+            (account_id, feed_key, uri),
+        ).fetchone()
+        return row["indexed_at"] if row else None
+
+
+def mark_post_reposted(uri: str, reposted_by_did, reposted_by_handle, reposted_by_display_name):
+    """Local-only write for jetstream.py's real-time repost path --
+    sets is_repost + reposted_by_* on an already-cached post row.
+    Deliberately outside upsert_post's own ON CONFLICT SET clause since
+    a normal sync legitimately overwrites these back to the server's
+    real state on its own next pass."""
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE posts SET is_repost = 1, reposted_by_did = ?,
+               reposted_by_handle = ?, reposted_by_display_name = ? WHERE uri = ?""",
+            (reposted_by_did, reposted_by_handle, reposted_by_display_name, uri),
+        )
+        conn.commit()
+
+
 def get_notification_sync_cursor(account_id: int):
     """listNotifications cursor from the last successful sync -- lets
     sync_notifications resume from where it left off instead of always
@@ -1276,7 +1319,7 @@ def set_home_active_filter(account_id: int, feed_key: str):
     set_ui_state(f"home_active_filter:{account_id}", feed_key)
 
 
-DEFAULT_ENABLED_TABS = {"notifications", "explore", "chat", "lists"}
+DEFAULT_ENABLED_TABS = {"notifications", "explore", "chat", "lists", "people"}
 
 
 def get_enabled_tabs() -> set:
@@ -1298,15 +1341,8 @@ def set_enabled_tabs(tabs) -> None:
 
 def get_soundpack_selected() -> str:
     """
-    Empty string means "Silent / No sound". Falls back to the
-    "default" pack folder (soundpack.DEFAULT_PACK_NAME) for an account
-    that's never touched Settings > Sound -- NOT Silent, which was a
-    real bug: a fresh install/DB had no ui_state row for this key at
-    all, so get_ui_state() returned None and every sound was silent by
-    default until the user opened Settings > Sound once and picked
-    something. Falls back further to whichever pack folder is found
-    first (alphabetically) if "default" doesn't exist, and only
-    actually falls back to Silent if no pack folder exists at all.
+    Empty string means "Silent / No sound". Never set: the "default" pack,
+    else the first pack found, else Silent if no pack folder exists.
     """
     raw = get_ui_state("soundpack_selected")
     if raw is not None:
@@ -1324,18 +1360,8 @@ def set_soundpack_selected(pack_name: str):
 
 def get_soundpack_disabled_events() -> set:
     """
-    Returns the set of event keys the user has explicitly UNCHECKED --
-    the inverse of what used to be stored (a list of enabled events).
-    Storing disabled events instead means any event key added to
-    soundpack.EVENT_KEYS in a future update (like embed_image/
-    embed_video/etc were) is enabled by default automatically, since
-    it simply won't be in this set yet -- the old enabled-list scheme
-    had the opposite (and wrong) behavior: a newly added event key was
-    never in the old saved list either, so it read as "not enabled"
-    until the user re-checked it manually. Confirmed as a real bug
-    when embed_image/embed_video/embed_link/embed_quote were added and
-    came up unchecked for accounts that had already saved Settings >
-    Sound before that.
+    Event keys the user has UNCHECKED. Storing the disabled set means
+    event keys added to soundpack.EVENT_KEYS later are enabled by default.
     """
     raw = get_ui_state("soundpack_disabled_events")
     if raw is None:
@@ -1352,12 +1378,9 @@ def set_soundpack_disabled_events(events) -> None:
 
 def get_open_temp_tabs(account_id: int) -> list:
     """
-    "Temp tabs" -- dynamic tabs opened on demand (Lists' Show in new
-    tab today; future per-user timeline/search tabs could reuse the
-    same mechanism) that get remembered and reopened automatically
-    next time MainWindow is built. Stored as one JSON blob per account
-    since it's small, order-sensitive, and only ever read/written as a
-    whole list.
+    "Temp tabs": removable tabs opened on demand (list, thread, user
+    timeline, conversation, ...), restored on the next MainWindow build.
+    One JSON list per account.
     """
     raw = get_ui_state(f"open_temp_tabs:{account_id}")
     if not raw:
@@ -1381,34 +1404,6 @@ def remove_open_temp_tab(account_id: int, tab_type: str, key: str):
     set_ui_state(f"open_temp_tabs:{account_id}", json.dumps(tabs))
 
 
-def reorder_open_temp_tabs(account_id: int, ordered_type_key_pairs: list):
-    """
-    Rewrites the stored temp-tab list to match `ordered_type_key_pairs`
-    (list of (type, key) tuples), reflecting the user's actual on-screen
-    tab order after Ctrl+Shift+PageUp/PageDown -- without this, temp
-    tabs (list/conversation/search_preview/user_list) always restored
-    in their original add-order on next NVSky open, ignoring any
-    reordering done during the session. Entries not found in
-    ordered_type_key_pairs (shouldn't normally happen -- every open temp
-    tab's identity should be in there) are appended unchanged at the end
-    rather than dropped.
-    """
-    tabs = get_open_temp_tabs(account_id)
-    byKey = {(t.get("type"), t.get("key")): t for t in tabs}
-    newList = []
-    used = set()
-    for pair in ordered_type_key_pairs:
-        entry = byKey.get(pair)
-        if entry is not None:
-            newList.append(entry)
-            used.add(pair)
-    for t in tabs:
-        pair = (t.get("type"), t.get("key"))
-        if pair not in used:
-            newList.append(t)
-    set_ui_state(f"open_temp_tabs:{account_id}", json.dumps(newList))
-
-
 def set_temp_tab_custom_name(account_id: int, tab_type: str, key: str, name: str):
     """
     Persists a user-chosen rename for a temp tab (see MainWindow.
@@ -1428,13 +1423,8 @@ def set_temp_tab_custom_name(account_id: int, tab_type: str, key: str, name: str
 
 def get_tab_order(account_id: int) -> list:
     """
-    Combined, interleaved order of EVERY tab (permanent and temp
-    together) for this account -- list of [kind, key] pairs. Replaces
-    the old split permanent_tab_order/open_temp_tabs-list-order scheme,
-    which couldn't represent a temp tab moved to sit before/between
-    permanent tabs (permanent tabs were always rebuilt as a block
-    first, so any such interleaving was lost on restart -- confirmed
-    bug, see plan-13.md). Empty list if never saved.
+    One interleaved order for EVERY tab (permanent and temp) as
+    [kind, key] pairs; empty list if never saved.
     """
     raw = get_ui_state(f"tab_order:{account_id}")
     if not raw:

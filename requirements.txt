@@ -19,3 +19,4 @@ sqlcipher3
 typing_extensions
 typing_inspection
 websockets
+zstandard

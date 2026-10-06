@@ -4,16 +4,10 @@ plus a persistent toolbar (Check for updates / New post / Settings /
 Remove current tab / Close) that's shared across all tabs instead of
 being duplicated in each panel.
 
-Uses plain wx.Notebook, NOT wx.aui.AuiNotebook -- the AUI notebook
-doesn't expose per-tab accessibility properly (NVDA read both tab
-names concatenated together, "HomeNotifications", instead of one tab
-at a time), while wx.Notebook is a standard, well-supported control
-("Home tab selected" reads cleanly, matching YoutubePlus's own tab
-UI). No drag-to-reorder tabs as a result -- not needed; reordering
-will be a command instead (same approach YoutubePlus already uses),
-not implemented yet. No built-in per-tab close button either (core
-wx.aui.AuiNotebook didn't properly support that anyway) -- Ctrl+W /
-removeCurrentTab() is the only way to take a tab out.
+Uses plain wx.Notebook, NOT wx.aui.AuiNotebook: the AUI notebook doesn't
+expose per-tab accessibility properly (NVDA read all tab names
+concatenated). Tabs are reordered with Ctrl+Shift+PageUp/PageDown and
+removed with Ctrl+W (no per-tab close button).
 
 Two kinds of tabs:
   - Permanent tabs (Home, Notifications, and future primary sections
@@ -36,10 +30,7 @@ Each tab panel is expected to expose:
     restore this tab's own real keyboard focus/list position (see
     _restoreFocusPosition(moveFocus=...) in feedWindow.py).
 
-NOTE: Ctrl+Delete ("clear current tab's cache") is intentionally NOT
-implemented yet -- it needs a new db.clear_feed_cache(account_id,
-feed_key) plus a notifications equivalent that don't exist yet. Add it
-here once those land.
+Ctrl+Delete (clear the tab's cache) is handled by each tab itself.
 """
 import json
 import threading
@@ -58,39 +49,20 @@ from . import client
 
 class MainWindow(wx.Frame):
     def __init__(self, parent):
-        # Title starts plain -- the first tab added via addTab() calls
-        # panel._updateTitle(), which immediately sets the real
-        # "<tab name> - NVSky - <handle>" title since it's the
-        # initially-selected tab. See _updateTitle() in feedWindow.py's
-        # FeedListMixin and onPageChanged() below, which keeps the title
-        # in sync as the user switches tabs.
+        # Title starts plain; the first addTab() sets the real
+        # "<tab name> - NVSky - <handle>" title and onPageChanged keeps it in sync.
         super().__init__(parent, title="NVSky", size=(900, 550))
 
-        # Reset here (not just set True in onClose below) so a second
-        # NVSky open within the same NVDA session isn't permanently
-        # blocked by the previous session's shutdown flag.
+        # Reset here so a second open in the same NVDA session isn't blocked.
         uiutil.app_closing = False
 
-        # True until activateInitialTab() flips it off once startup has
-        # picked and focused the remembered tab -- while True, onPageChanged
-        # below still updates the tab-strip/window title but skips calling
-        # onTabActivated() (which is what speaks "<tab> tab" and re-runs
-        # each panel's own activation logic). Without this, every
-        # permanent tab's addTab()/AddPage() -- and wx.Notebook
-        # auto-selecting the very first page added to an empty notebook,
-        # regardless of the select argument -- fires a real
-        # EVT_NOTEBOOK_PAGE_CHANGED during construction, so "Home tab" got
-        # spoken every single time NVSky opened, before the window was
-        # even shown.
+        # True until activateInitialTab(): skips onTabActivated() (which
+        # speaks "<tab> tab") for the page-changed events fired while the
+        # notebook is built, so "Home tab" isn't spoken on every open.
         self._activationSuppressed = True
 
-        # Everything lives inside one wx.Panel rather than being parented
-        # directly to the Frame -- wx.Frame does NOT apply dialog-style
-        # Tab traversal across its direct children the way wx.Panel (and
-        # wx.Dialog, which FeedWindow/NotificationsWindow used to be)
-        # does. Without this wrapper, Tab only cycled within the
-        # notebook's own internal group (tab strip/list/action buttons)
-        # and could never reach the toolbar at all.
+        # Everything lives in one wx.Panel: a wx.Frame doesn't do dialog-style
+        # Tab traversal, so Tab couldn't reach the toolbar.
         panel = wx.Panel(self)
         frameSizer = wx.BoxSizer(wx.VERTICAL)
         frameSizer.Add(panel, proportion=1, flag=wx.EXPAND)
@@ -98,9 +70,7 @@ class MainWindow(wx.Frame):
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Persistent toolbar -- shared across every tab instead of each
-        # panel duplicating its own Check for updates/New post buttons
-        # (which is what FeedWindow/NotificationsWindow used to do).
+        # Persistent toolbar shared by every tab.
         toolbarSizer = wx.BoxSizer(wx.HORIZONTAL)
         # Translators: Toolbar button to sync the current tab. Shows the F5 shortcut.
         self.checkUpdatesButton = wx.Button(panel, label=_("Check for &updates (F5)"))
@@ -178,22 +148,9 @@ class MainWindow(wx.Frame):
         dlg.Show()
 
     def _openChatConvo(self, convoId):
-        # Switch to the permanent Chat tab and select this conversation
-        # -- called once NewChatDialog resolves/creates it.
-        #
-        # CRASH FIX: SetSelection() below fires a real
-        # EVT_NOTEBOOK_PAGE_CHANGED, which (unless suppressed) calls
-        # ChatWindow.onTabActivated() -- which ALSO does its own
-        # _loadFromCache() + reselect. Previously this method then
-        # immediately did a SECOND, separate _loadFromCache/select pass
-        # right after -- two overlapping rebuild-and-reselect sequences
-        # on the same TreeCtrl, seemingly racing each other, which
-        # produced "wrapped C/C++ object of type TreeCtrl has been
-        # deleted" and crashed NVDA. Suppressing onTabActivated for just
-        # this one programmatic switch and doing a single controlled
-        # reload+select here instead should eliminate that race -- not
-        # fully certain this is wx's exact internal mechanism, so watch
-        # for a repeat.
+        # Switch to the Chat tab and select this conversation. onTabActivated
+        # is suppressed: it also reloads and reselects, and two overlapping
+        # TreeCtrl rebuilds crashed NVDA. One reload+select below instead.
         for i in range(self.notebook.GetPageCount()):
             candidatePanel = self.notebook.GetPage(i)
             if getattr(candidatePanel, "TAB_KEY", None) == "chat":
@@ -219,18 +176,10 @@ class MainWindow(wx.Frame):
 
     def addTab(self, panel, label, select=True, removable=True, play_sound=True):
         """
-        Adds `panel` (already constructed with self.notebook as its
-        parent) as a new tab. `removable=False` marks a permanent tab
-        (Home, Notifications, and future primary sections) -- Ctrl+W
-        becomes a no-op for it. NOTE: "removable" here only ever means
-        "can Ctrl+W take this tab out of the notebook" -- it has
-        nothing to do with closing the MainWindow itself (Escape/
-        Alt+F4/the toolbar's Close button), see onCharHook below.
-
-        play_sound=False is used when restoring previously-open temp
-        tabs on startup (see GlobalPlugin._buildTabs) -- those aren't
-        the user opening something new right now, so the "open_tab"
-        sound shouldn't fire for each one on every NVSky launch.
+        Adds `panel` (constructed with self.notebook as parent) as a tab.
+        removable=False marks a permanent tab (Ctrl+W is a no-op); it has
+        nothing to do with closing the window. play_sound=False is for
+        restoring temp tabs at startup.
         """
         panel.TAB_REMOVABLE = removable
         if removable and play_sound:
@@ -238,24 +187,14 @@ class MainWindow(wx.Frame):
         self.notebook.AddPage(panel, label, select)
         self._updateRemoveTabButton()
 
-        # The panel's own __init__ runs (and may call self._updateTitle())
-        # BEFORE it's added as a page here, so notebook.FindPage(self)
-        # inside _updateTitle returns nothing yet and both the tab label
-        # and (if this is the selected tab) the MainWindow title update
-        # are silently skipped. Re-run it now that the page index is valid.
+        # The panel's own _updateTitle ran before it was a page; re-run it now.
         refreshTitle = getattr(panel, "_updateTitle", None)
         if callable(refreshTitle):
             refreshTitle()
 
         if select:
-            # AddPage(select=True) updates which page is visually shown,
-            # but doesn't move REAL keyboard/screen-reader focus there by
-            # itself -- and a panel's own __init__ (see
-            # _restoreFocusPosition in feedWindow.py) only restores its
-            # internal list position/selection at construction time, NOT
-            # real focus (moveFocus=False there), specifically so this
-            # is the ONLY place real focus gets grabbed for the
-            # initially-selected tab, once notebook layout has settled.
+            # AddPage(select=True) doesn't move real focus; this is the only
+            # place it's grabbed for the initial tab, once layout settles.
             wx.CallAfter(self._focusPanel, panel)
 
     @uiutil.safe_ui_callback
@@ -282,11 +221,8 @@ class MainWindow(wx.Frame):
             return
         panel = self.notebook.GetPage(index)
         label = self.notebook.GetPageText(index)
-        # RemovePage() auto-selects a neighboring tab and fires
-        # EVT_NOTEBOOK_PAGE_CHANGED for IT first, then InsertPage(select=True)
-        # fires again for the real target -- two real announcements back
-        # to back. Suppress both via the existing flag onPageChanged
-        # already checks, then trigger onTabActivated manually once.
+        # RemovePage and InsertPage each fire page-changed (two announcements):
+        # suppress both, then activate once.
         self._activationSuppressed = True
         try:
             self.notebook.RemovePage(index)
@@ -313,14 +249,8 @@ class MainWindow(wx.Frame):
         db.set_tab_order(account["id"], order)
 
     def notifyConvoChanged(self, convoId, sourcePanel=None):
-        # Cross-tab live sync -- called by chatWindow.py's
-        # _ChatMessagePanelMixin._notifyConvoChanged after any local
-        # state change (send/react/delete/mark-read/lock) to a
-        # conversation. Every OTHER open panel (skips sourcePanel, which
-        # already updated its own UI) gets a chance to re-render from
-        # the now-fresh local DB -- cheap, no network call. Covers
-        # ChatWindow (has both hooks) and any ConvoTabWindow(s) for the
-        # same convoId (only has _reloadMessagesIfCurrent).
+        # Cross-tab live sync after a local chat change: every OTHER open panel
+        # re-reads the fresh local DB (no network).
         for panel in self.getOpenTabs():
             if panel is sourcePanel:
                 continue
@@ -329,12 +259,7 @@ class MainWindow(wx.Frame):
                 try:
                     reload(convoId, moveFocus=False)
                 except TypeError:
-                    # ChatWindow's version has no moveFocus param -- it
-                    # never grabs real OS focus in _showMessages anyway
-                    # (Focus()/Select() on a ListCtrl that doesn't
-                    # already have focus don't steal it), unlike
-                    # ConvoTabWindow's _loadMessages, which does via an
-                    # explicit SetFocus().
+                    # ChatWindow's version has no moveFocus param (it never grabs focus).
                     reload(convoId)
             refreshLabel = getattr(panel, "_refreshConvoLabel", None)
             if refreshLabel:
@@ -351,15 +276,10 @@ class MainWindow(wx.Frame):
 
     def _getTabIdentity(self, panel):
         """
-        Generalized identity used for MainWindow's remember-last-tab
-        feature (see onPageChanged/activateInitialTab below) and for
-        tab rename persistence (see renameCurrentTab). Permanent tabs
-        are identified by their TAB_KEY string (see feedWindow.py/
-        chatWindow.py). Temp tabs (ListTabWindow, ConvoTabWindow) carry
-        no TAB_KEY, but each now sets TAB_TEMP_TYPE/TAB_TEMP_KEY,
-        matching the "type"/"key" fields already used by
-        db.get_open_temp_tabs() -- letting the same identity double as
-        a lookup into that list. Returns None if neither is present.
+        Tab identity {"kind", "key"}: a permanent tab's TAB_KEY, or a temp
+        tab's TAB_TEMP_TYPE/TAB_TEMP_KEY (matching db.get_open_temp_tabs
+        entries). Used to remember the last tab and persist order/renames.
+        None if neither is set.
         """
         tabKey = getattr(panel, "TAB_KEY", None)
         if tabKey:
@@ -371,17 +291,9 @@ class MainWindow(wx.Frame):
         return None
 
     def onPageChanging(self, evt):
-        # Fired BEFORE the page actually swaps (unlike onPageChanged),
-        # for every cause including native Ctrl+Tab. Moving focus to
-        # the notebook itself here means no child control is still
-        # focused right as it becomes hidden -- that "focused control
-        # about to be hidden" moment is what seemed to trigger Windows'
-        # own native focus-reassignment into the new page, landing an
-        # extra, uncontrolled focus (and NVDA announcement) alongside
-        # onTabActivated()'s own explicit one right after. Confirmed by
-        # testing: doubled specifically for Ctrl+Tab/Ctrl+number
-        # (focus starts deep in the OLD page's content) but not
-        # tab-strip navigation (focus already on the strip itself).
+        # Focus the notebook before the swap: a focused control being hidden
+        # made Windows move focus into the new page too, doubling NVDA's
+        # announcement (Ctrl+Tab/Ctrl+number only).
         self.notebook.SetFocus()
         evt.Skip()
 
@@ -412,15 +324,7 @@ class MainWindow(wx.Frame):
                 onActivated = getattr(panel, "onTabActivated", None)
                 if callable(onActivated):
                     onActivated()
-                # Remember which tab this was (permanent OR temp -- see
-                # _getTabIdentity above), per account, so the next NVSky
-                # session can reopen on it instead of always defaulting
-                # to Home. Previously only permanent tabs (TAB_KEY) were
-                # remembered here, so leaving NVSky focused on a temp
-                # tab (e.g. a conversation popped into its own tab)
-                # silently fell back to whichever permanent tab was
-                # active before that -- fixed by widening this to any
-                # tab with a resolvable identity.
+                # Remember the last-active tab (permanent or temp) per account.
                 identity = self._getTabIdentity(panel)
                 if identity:
                     account = db.get_active_account()
@@ -428,13 +332,11 @@ class MainWindow(wx.Frame):
                         db.set_ui_state(f"last_active_tab:{account['id']}", json.dumps(identity))
         self._updateRemoveTabButton()
         evt.Skip()
+
     def activateInitialTab(self, index):
         """
-        Called once by GlobalPlugin.script_openFeed() after every startup
-        tab (permanent + restored temp tabs) has been added, to select
-        whichever tab was remembered as last-active (Home by
-        default/fallback) WITHOUT speaking its name -- silent counterpart
-        to a real mid-session tab switch.
+        Called once after every startup tab has been added: selects the
+        remembered tab silently (no spoken tab name).
         """
         if index != self.notebook.GetSelection():
             self.notebook.SetSelection(index)  # still suppressed here -- silent
@@ -499,11 +401,7 @@ class MainWindow(wx.Frame):
         self.notebook.DeletePage(index)
 
     def renameCurrentTab(self):
-        # Only ever changes panel.TAB_NAME (the short label in the tab
-        # strip and the first part of the window title) -- the
-        # " - NVSky - <handle>" suffix always comes from _updateTitle()
-        # and is never touched here. Permanent tabs (TAB_REMOVABLE False)
-        # are never renameable, same restriction as Ctrl+W.
+        # Changes only TAB_NAME; permanent tabs can't be renamed (same as Ctrl+W).
         index = self.notebook.GetSelection()
         if index == wx.NOT_FOUND:
             return
@@ -525,10 +423,7 @@ class MainWindow(wx.Frame):
                 refreshTitle = getattr(panel, "_updateTitle", None)
                 if callable(refreshTitle):
                     refreshTitle()
-                # Persist the rename past this session -- each temp tab
-                # class owns the actual db write (it already knows its
-                # own identity/db.get_open_temp_tabs() entry), same
-                # delegation pattern as onTabRemoved.
+                # Each temp tab class persists its own rename.
                 onRenamed = getattr(panel, "onTabRenamed", None)
                 if callable(onRenamed):
                     onRenamed(newName)
@@ -544,27 +439,10 @@ class MainWindow(wx.Frame):
             onFindLists()
 
     def checkAllOpenTabs(self):
-        # ONE shared background thread syncing every tab sequentially
-        # (not N concurrent ones -- that raced on
-        # client.get_client_for_active_account()'s session/token
-        # refresh and caused sporadic "re-login failed" errors), and
-        # ONE spoken summary at the end (not N "no new X" announcements
-        # firing back to back).
-        #
-        # NOTE: this used to only re-render whichever tab was currently
-        # visible, on the assumption every other tab would re-render
-        # itself next time it was activated (see each panel's
-        # onTabActivated). That assumption was wrong -- onTabActivated
-        # only calls _restoreFocusPosition(), which re-shows whatever
-        # was already rendered, it never re-reads the DB. Confirmed
-        # bug: after a fresh login, Home/Saved/etc all render once
-        # against an empty cache; running Ctrl+F5 from Chat correctly
-        # refreshed Chat (the active tab) but Home stayed empty even
-        # after switching to it, despite its own status bar (which
-        # queries the DB fresh) already showing the right unread count.
-        # Fixed below by reloading every tab that actually got new
-        # data, not just the active one -- moveFocus=False keeps a
-        # background reload from stealing real keyboard focus.
+        # One shared thread syncs tabs sequentially (concurrent logins raced
+        # on session refresh) and one summary is spoken at the end. Every tab
+        # with new data is reloaded, not just the visible one (moveFocus=False
+        # so a background reload can't steal focus).
         panels = [p for p in self.getOpenTabs() if callable(getattr(p, "_syncForBulkCheck", None))]
         if not panels:
             return
@@ -601,10 +479,8 @@ class MainWindow(wx.Frame):
             reload = getattr(panel, "_reloadAfterBulkCheck", None)
             if callable(reload):
                 reload(moveFocus=(panel is activePanel))
-        # The active tab reloads even if it personally had nothing new
-        # (e.g. right after a fresh login, its very first render
-        # happened against an empty local cache) -- matches the old
-        # always-reload-the-active-tab behavior.
+        # The active tab reloads even with nothing new (e.g. its first render
+        # after login was against an empty cache).
         if activePanel is not None and activePanel not in updatedPanels:
             reload = getattr(activePanel, "_reloadAfterBulkCheck", None)
             if callable(reload):
@@ -624,10 +500,7 @@ class MainWindow(wx.Frame):
     def onCharHook(self, evt):
         keyCode = evt.GetKeyCode()
 
-        # "Close" always means closing this whole app window (Escape/
-        # Alt+F4/toolbar Close button); Ctrl+W only ever REMOVES the
-        # current tab from the notebook (browser-style) and no-ops on
-        # permanent tabs -- the two concepts are intentionally separate.
+        # Escape/Alt+F4/Close close the whole window; Ctrl+W only removes the current (removable) tab.
         if keyCode == wx.WXK_ESCAPE:
             focused = self.FindFocus()
             if isinstance(focused, wx.TextCtrl) and focused.IsMultiLine() and focused.GetValue().strip():
@@ -651,12 +524,8 @@ class MainWindow(wx.Frame):
         if evt.ControlDown() and keyCode == wx.WXK_F5:
             self.checkAllOpenTabs()
             return
-        # Plain F5/Ctrl+N fallbacks -- each tab panel already handles
-        # these itself (via its own EVT_CHAR_HOOK) whenever it actually
-        # has focus, so this only fires when focus is somewhere else in
-        # the window (e.g. on the toolbar itself). Shift+F5 ("fetch
-        # previous posts") is deliberately NOT handled here -- that's
-        # tab-specific "load more" behavior, panels only.
+        # F5/Ctrl+N fallbacks for when focus is outside a panel (panels handle
+        # them themselves). Shift+F5 is panel-only ("load older").
         if keyCode == wx.WXK_F5 and not evt.ShiftDown():
             self.onCheckForUpdates()
             return
@@ -673,28 +542,12 @@ class MainWindow(wx.Frame):
         evt.Skip()
 
     def onClose(self, evt):
-        # Set FIRST, before anything else -- any wx.CallAfter-queued
-        # background completion (safe_ui_callback-guarded) that lands
-        # from this point on will see this and skip touching wx
-        # entirely, rather than trying and hoping RuntimeError catches
-        # it cleanly. See uiutil.app_closing for the full reasoning.
+        # Set FIRST: queued safe_ui_callback completions skip touching wx once closing.
         uiutil.app_closing = True
 
-        # wx.Timer isn't part of the parent-child window destroy
-        # cascade -- Destroy() below tears down every child panel's
-        # C++ object, but any still-running timer keeps firing into
-        # those now-destroyed panels regardless. Confirmed by checking
-        # source (see plan-09.md): scanning for every wx.Timer INSTANCE
-        # stored on each panel (rather than checking specific known
-        # attribute names) on purpose -- an earlier version of this
-        # fix only checked for _timeRefreshTimer by name and missed
-        # _loadingTimer (the ~1s F5-in-progress beep, only ever
-        # stopped from inside _onCheckForUpdatesDone), which is a much
-        # more likely crash trigger than the 60s one since it fires so
-        # much more often during exactly the "refresh then immediately
-        # close" window. Scanning by type instead of by name means any
-        # future timer added anywhere doesn't need this method updated
-        # again to stay covered.
+        # wx.Timer isn't part of the destroy cascade and would keep firing into
+        # destroyed panels; stop every timer instance on each panel (found by
+        # type, so new timers need no update here).
         for i in range(self.notebook.GetPageCount()):
             panel = self.notebook.GetPage(i)
             for value in vars(panel).values():

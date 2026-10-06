@@ -16,13 +16,13 @@ Every part of Bluesky is presented through accessible, shortcut-driven lists and
 
 Features:
 • Log in with a Bluesky App Password (your regular password never leaves Bluesky's own site), and run several accounts side by side.
-• Home, Notifications, Explore, Saved, Likes, Chat, and Lists — turn any of the optional tabs on or off to suit how you use Bluesky.
+• Home, Notifications, Explore, Saved, Likes, Chat, Lists, and People (who you follow, your followers, and the accounts you've muted, blocked, or subscribed to) — turn any of the optional tabs on or off to suit how you use Bluesky.
 • Posts, notifications, chat messages, and lists are cached locally in an encrypted database, so your feeds open instantly.
 • Full post actions: reply, repost, quote, like, save, mute a thread, edit who can reply, and more, all from one Post action menu.
-• Full user actions: follow, mute, block, view someone's profile/timeline/followers/following, add them to a list, or start a chat.
+• Full user actions: follow, subscribe to someone's new posts, mute, block, view their profile/timeline/followers/following, add them to a list, or start a chat.
 • Direct messages, including group chats: message requests, reactions, replies, invite links, join requests, and member management.
 • Content label visibility (Show/Warn/Hide) and muted words/users/lists, matching the same settings as Bluesky's own official app.
-• A configurable background sync scheduler keeps every tab up to date on its own, with optional sounds and spoken announcements."""),
+• A configurable background sync scheduler keeps every tab up to date on its own, with optional real-time updates for Home and Lists, sounds, and spoken announcements."""),
     "addon_author": "NVDA_TH <nvdainth@gmail.com>, assisted by A.I.",
     "addon_url": "https://github.com/NVDATH/NVSky",
     "addon_docFileName": "readme.html",

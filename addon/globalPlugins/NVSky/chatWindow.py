@@ -1,59 +1,28 @@
 """
 Chat (DM) tab for NVSky.
 
-Structurally different from Home/Notifications/Saved -- those are all
-flat post lists sharing FeedListMixin/ItemActionMixin. Chat has two
-levels (conversations -> messages) and its own send/mark-read/mute
-actions that don't map onto a post at all, so it's its own thing here
-rather than shoehorned into the existing mixins.
+Chat has two levels (conversations -> messages) and its own send/
+mark-read/mute actions, so it doesn't use FeedListMixin/ItemActionMixin.
 
-REFACTOR NOTE: ChatWindow (the permanent tab, conversation tree +
-messages) and ConvoTabWindow (a single conversation popped into its
-own removable tab) used to duplicate almost their entire message-pane
-logic -- multiple rounds of bug fixes only landed in one class and not
-the other because of it (Alt+number mark-read, Left/Right reply-jump,
-the _reactToMessage argument-count crash). _ChatMessagePanelMixin below
-now owns everything that only needs "the currently displayed
-conversation's message list" (self._currentConvoId) -- reactions,
-Alt+number, Space-jump-to-unread, reply/copy/delete, the emoji picker,
-sending, Check for updates' shared bits. What's left on each class is
-only what's genuinely different: ChatWindow has the conversation tree
-and per-conversation actions (accept/decline/mute/leave/mark read);
-ConvoTabWindow has a fixed single conversation and its own tab-life-
-cycle hooks (onTabRemoved/onTabRenamed, TAB_TEMP_TYPE/KEY).
+- _ChatMessagePanelMixin owns everything that only needs "the currently
+  displayed conversation's messages" (self._currentConvoId): reactions,
+  Alt+number, Space-jump-to-unread, reply/copy/delete, emoji picker,
+  sending, shared Check-for-updates bits.
+- ChatWindow: the one permanent tab (conversation tree + message list +
+  compose box) and the per-conversation actions (accept/decline/mute/
+  leave/mark read/group management).
+- ConvoTabWindow: one conversation popped out into a removable tab.
 
-Confirmed design (several rounds of back-and-forth):
-  - ONE permanent "Chat" tab, not a tab per conversation.
-  - wx.TreeCtrl lists conversations (flat, one level); wx.ListCtrl
-    alongside it shows the messages of whichever conversation is
-    currently selected. Tab moves focus between them like any two
-    sibling controls.
-  - Expanding/selecting a conversation must be INSTANT -- messages are
-    read from the local cache only, never fetched on demand. Check for
-    updates (F5) syncs the conversation list AND every conversation's
-    messages in one pass specifically so this holds.
-  - A compose box + Send button at the bottom sends to whichever
-    conversation is currently selected.
-  - "Open in new tab" (from a conversation's context menu) pops it out
-    into its own REMOVABLE tab (title = the other person's name) with
-    just that conversation's messages + its own compose box -- opt-in,
-    not the default.
-  - Message-level read state (is_read) is re-derived from the server's
-    per-conversation unread_count on every sync (db.
-    reconcile_message_read_state), not guessed locally -- see that
-    function's docstring for why an earlier attempt at this got it
-    wrong. Reads are also pushed back to the server in the background
-    (client.mark_message_read) so other Bluesky clients stay in sync;
-    never surfaced to this UI either way.
+Design rules:
+- Selecting a conversation is instant: messages come from the local
+  cache only. F5/Ctrl+F5 sync the list and every conversation's messages.
+- Message is_read is re-derived from the server's per-conversation
+  unread_count on every sync (db.reconcile_message_read_state); reads
+  are pushed back in the background (client.mark_message_read).
 
-EXPERIMENTAL: first use of chat.bsky.convo.* in NVSky. Field names
-below were verified against the installed atproto Python SDK's actual
-model classes where possible, but several endpoints (addReaction/
-removeReaction, updateAllRead, getConvoForMembers, updateRead's
-messageId param) have never been exercised against a real account as
-of this writing. Paste back any traceback. Also see get_chat_client()'s
-docstring in client.py -- an account that has never opened Chat in the
-official Bluesky app may not have DMs enabled server-side yet.
+Some chat.bsky.* endpoints (see client.py) are still marked LOW
+CONFIDENCE. An account that never opened Chat in the official app may
+not have DMs enabled server-side yet (see client.get_chat_client).
 """
 import json
 import threading
@@ -73,21 +42,12 @@ from . import timeutils
 from . import uiutil
 from . import soundpack
 
-# LOW CONFIDENCE: Bluesky's DM character limit isn't published on the
-# docs site the way the 300-grapheme post limit is -- this number is a
-# best guess, not confirmed against a real send. If the server rejects
-# a message under this length (or accepts one over it), paste the
-# error back and this gets corrected.
+# LOW CONFIDENCE: the DM length limit isn't documented; 1000 is a best guess.
 CHAT_MESSAGE_MAX_LENGTH = 1000
 
-# How many characters go in the "Message" column before the rest
-# spills into "Message (more)" -- kept well under the ~511-character
-# native ListCtrl cell limit confirmed by testing (see plan-09.md) to
-# leave a safety margin, since the exact cutoff may vary slightly with
-# content (e.g. astral-plane emoji use a UTF-16 surrogate pair on
-# Windows despite counting as one Python character). Doesn't need to
-# be exact -- NVDA reads both columns back to back automatically when
-# arrow-navigating a row, so the user never notices the split.
+# Characters in the "Message" column before spilling into "Message (more)".
+# Kept under the ~511-char native ListCtrl cell limit with a margin (astral
+# emoji count double on Windows). NVDA reads both columns of a row anyway.
 MESSAGE_COLUMN_SPLIT_THRESHOLD = 450
 
 
@@ -271,26 +231,22 @@ class _ChatMessagePanelMixin:
     """
 
     def _buildMessageListColumns(self):
-        self.messageList.InsertColumn(0, "Reactions", width=100)
-        self.messageList.InsertColumn(1, "From", width=140)
-        self.messageList.InsertColumn(2, "Message", width=350)
-        self.messageList.InsertColumn(3, "Message (more)", width=250)
-        self.messageList.InsertColumn(4, "Sent", width=140)
+        # Translators: Column header for a chat message's emoji reactions.
+        self.messageList.InsertColumn(0, _("Reactions"), width=100)
+        # Translators: Column header for who sent a chat message.
+        self.messageList.InsertColumn(1, _("From"), width=140)
+        # Translators: Column header for a chat message's text.
+        self.messageList.InsertColumn(2, _("Message"), width=350)
+        # Translators: Column header for the overflow of a long chat message's text.
+        self.messageList.InsertColumn(3, _("Message (more)"), width=250)
+        # Translators: Column header for when a chat message was sent.
+        self.messageList.InsertColumn(4, _("Sent"), width=140)
 
     def _notifyConvoChanged(self, convoId):
-        # Cross-tab live sync: propagate a locally-known state change (a
-        # send, reaction, delete, or read-state change) to any OTHER
-        # currently-open panel showing this same conversation. Before
-        # this, a send/react/etc. only refreshed the panel where the
-        # action was taken -- an already-open ChatWindow and a
-        # ConvoTabWindow for the same convo (or two ConvoTabWindows,
-        # after Open in new tab used twice) stayed stale until their own
-        # next F5/Ctrl+F5/reopen. Cheap: the target panel just re-reads
-        # from the local DB (already fresh from this action) -- no extra
-        # network call. NOTE: this only covers actions taken locally in
-        # one of these panels -- a background/full Chat sync (Shift+F5/
-        # Ctrl+F5) discovering brand-new messages for a convo open
-        # elsewhere is a separate, still-uncovered case.
+        # Cross-tab live sync: every OTHER open panel showing this
+        # conversation re-reads the (already fresh) local DB. Covers only
+        # locally-taken actions; a full sync that finds new messages for a
+        # convo open elsewhere is not propagated.
         mainWindow = self.GetTopLevelParent()
         notify = getattr(mainWindow, "notifyConvoChanged", None)
         if notify:
@@ -319,28 +275,10 @@ class _ChatMessagePanelMixin:
         evt.Skip()
 
     def _focusNextUnreadMessage(self):
-        # Previously only moved focus (Focus/Select/EnsureVisible) and
-        # relied on onMessageFocused (EVT_LIST_ITEM_FOCUSED) firing as a
-        # side effect to do the actual read-marking. Per
-        # uiutil.move_focus_and_check_announce's own docstring, a
-        # ListCtrl only fires that event when the focused index is
-        # actually CHANGING -- so when the next unread message is
-        # already the focused row (e.g. the newest message, which gets
-        # default focus when a conversation is first opened), Focus(i)
-        # on the same index is a no-op state change: no event, nothing
-        # ever gets marked read, and Space appears to do nothing. Now
-        # marks read explicitly here, the same way _announceNthNewestMessage
-        # already does, instead of depending on the event firing at all.
+        # Marks read explicitly: EVT_LIST_ITEM_FOCUSED doesn't fire when the
+        # focused index doesn't change (e.g. the newest message on open).
         messages = getattr(self, "_currentMessages", [])
-        # Must always progress OLDEST-unread-first chronologically,
-        # regardless of Settings > Display sort order -- self._currentMessages'
-        # array order follows the on-screen display order (already
-        # reversed for newest-first), so iterating it directly picked
-        # the NEWEST unread message first when newest-first was set
-        # (jumping to the top, then working backward down through
-        # older messages) -- backwards from the intended "catch up from
-        # where you left off" behavior. Reverse the scan order when
-        # newest-first so this always starts from the oldest unread.
+        # Always scan OLDEST-unread-first, whatever the display sort order.
         newestFirst = getattr(self, "_messagesNewestFirst", False)
         indices = range(len(messages) - 1, -1, -1) if newestFirst else range(len(messages))
         for i in indices:
@@ -351,7 +289,8 @@ class _ChatMessagePanelMixin:
                         _describe_reactions(message.get("reactions_json")),
                         self._messageFromLabel(message),
                         self._messageDisplayText(message),
-                        _format_time(message["sent_at"]) if message.get("sent_at") else "Sending...",
+                        # Translators: Placeholder shown for a message still being sent.
+                        _format_time(message["sent_at"]) if message.get("sent_at") else _("Sending..."),
                     ]
                     nvdaUi.message(", ".join(p for p in parts if p))
                 convoId = self._currentConvoId
@@ -366,21 +305,13 @@ class _ChatMessagePanelMixin:
         nvdaUi.message(_("No unread messages."))
 
     def _pushMessageReadToServer(self, convoId, messageId):
-        # Silent, background-only -- see client.mark_message_read's
-        # docstring. Never surfaces success or failure to the user;
-        # this purely keeps the server's own state in sync with what
-        # the local DB (the actual source of truth for this app's UI)
-        # already reflects.
+        # Silent background push so the server matches the local DB.
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
                 client.mark_message_read(atprotoClient, convoId, messageId)
-                # Keep the cached convos.unread_count in step with what
-                # was just pushed -- otherwise the NEXT sync's
-                # reconcile_message_read_state() re-derives is_read from
-                # a stale, too-high unread_count and undoes this local
-                # read progress (confirmed: "read locally, but a
-                # refresh brings the unread count back").
+                # Keep convos.unread_count in step, or the next sync's
+                # reconcile would undo this local read progress.
                 if self._account:
                     remaining = db.get_unread_message_count(self._account["id"], convoId)
                     db.set_convo_unread_count(self._account["id"], convoId, remaining)
@@ -390,16 +321,9 @@ class _ChatMessagePanelMixin:
         threading.Thread(target=worker, daemon=True).start()
 
     def _announceNthNewestMessage(self, n: int):
-        # self._currentMessages is always in the SAME order as what's
-        # on screen (follows Settings > Display sort order), so index
-        # math flips depending on which end "newest" currently is.
-        # Doesn't move focus, just speaks it, so the user can stay
-        # wherever they were (e.g. typing in the compose box). Reads
-        # every field straight from self._currentMessages instead of
-        # the ListCtrl's own GetItemText -- confirmed by testing (see
-        # plan-09.md) that GetItemText's returned text is itself capped
-        # at ~511 characters on Windows regardless of LC_VIRTUAL, so it
-        # can never be trusted to carry a full-length message.
+        # _currentMessages follows the on-screen sort order, so the index
+        # flips with it. Speaks from the message dicts, not GetItemText
+        # (capped at ~511 chars).
         messages = getattr(self, "_currentMessages", [])
         newestFirst = getattr(self, "_messagesNewestFirst", False)
         index = (n - 1) if newestFirst else (len(messages) - n)
@@ -408,9 +332,7 @@ class _ChatMessagePanelMixin:
             nvdaUi.message(_("No message {}.").format(n))
             return
         message = messages[index]
-        # Alt+number doesn't move focus, so onMessageFocused never
-        # fires for it -- without this, reading a message aloud this
-        # way never marked it read.
+        # Marked read explicitly below: onMessageFocused may not fire.
         if uiutil.move_focus_and_check_announce(self.messageList, index):
             parts = [
                 _describe_reactions(message.get("reactions_json")),
@@ -554,6 +476,17 @@ class _ChatMessagePanelMixin:
         convoId = self._currentConvoId
         messageId = message["message_id"]
 
+        # Optimistic: remove locally right away instead of waiting on
+        # the network round trip, matching this file's reaction/
+        # mark-read convention. Rolled back (re-inserted) on failure.
+        if self._account:
+            db.delete_message(self._account["id"], convoId, messageId)
+        self._reloadMessagesIfCurrent(convoId)
+        self._notifyConvoChanged(convoId)
+        soundpack.play("delete")
+        # Translators: Announced after successfully deleting a chat message.
+        nvdaUi.message(_("Message deleted."))
+
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
@@ -561,33 +494,30 @@ class _ChatMessagePanelMixin:
                 error = None
             except Exception as e:
                 error = str(e)
-            wx.CallAfter(self._onDeleteMessageDone, convoId, error)
+            wx.CallAfter(self._onDeleteMessageDone, convoId, message, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     @uiutil.safe_ui_callback
-    def _onDeleteMessageDone(self, convoId, error):
-        if error:
-            log.error(f"NVSky: delete message failed: {error}")
-            soundpack.play("error")
-            # Translators: Announced when deleting a chat message fails. {} is the error message.
-            nvdaUi.message(_("Could not delete message: {}").format(error))
+    def _onDeleteMessageDone(self, convoId, message, error):
+        if not error:
             return
-        soundpack.play("delete")
-        # Translators: Announced after successfully deleting a chat message.
-        nvdaUi.message(_("Message deleted."))
+        log.error(f"NVSky: delete message failed: {error}")
+        soundpack.play("error")
+        # Roll back -- the server never actually deleted it. `message`
+        # still carries every column upsert_message needs, since it
+        # came straight from db.get_messages_for_convo.
+        if self._account:
+            db.upsert_message(message)
+        # Translators: Announced when deleting a chat message fails. {} is the error message.
+        nvdaUi.message(_("Could not delete message: {}").format(error))
         self._reloadMessagesIfCurrent(convoId)
         self._notifyConvoChanged(convoId)
 
     # ---------------- reactions ----------------
 
     def _applyReactionsLocally(self, convoId, message, reactions, announcement):
-        # Optimistic UI, matching the project-wide convention (already
-        # used for send/mark-read/mark-convo-read): update local DB +
-        # the on-screen row immediately instead of waiting on the
-        # add/remove-reaction round trip AND a full sync_convo_messages
-        # resync before the reaction even appeared, which is how this
-        # used to work.
+        # Optimistic: update the local DB and the on-screen row immediately.
         reactionsJson = json.dumps(reactions)
         message["reactions_json"] = reactionsJson
         db.set_message_reactions(self._account["id"], convoId, message["message_id"], reactionsJson)
@@ -759,12 +689,8 @@ class _ChatMessagePanelMixin:
         self.cancelReplyButton.Hide()
         self.Layout()
 
-        # Optimistic UI: render the message and show it right away
-        # instead of waiting on two network round-trips (send + full
-        # resync). send_message's own echoed-back response can't be
-        # trusted (see the SDK-bug note on send_message itself in
-        # client.py), so a real message_id only ever arrives via the
-        # silent resync below -- this temp row just holds the spot.
+        # Optimistic row; the real message_id only arrives via the silent
+        # resync below (send_message's echoed response can't be used).
         newestFirst = getattr(self, "_messagesNewestFirst", False)
         tempIndex = 0 if newestFirst else self.messageList.GetItemCount()
         mainText, moreText = _split_for_columns(text)
@@ -779,28 +705,14 @@ class _ChatMessagePanelMixin:
         self.messageList.EnsureVisible(tempIndex)
         if not hasattr(self, "_currentMessages"):
             self._currentMessages = []
-        # is_read=1 -- it's my own message, nothing to "catch up" on;
-        # the real row that lands via resync gets this from
-        # client._sync_convo_messages -> db.reconcile_message_read_state
-        # too, this just keeps the placeholder from flashing unread.
+        # is_read=1: my own message (the resynced row gets it via reconcile too).
         tempMessage = {"sender_did": self._account["did"], "text": text, "sent_at": None, "is_read": 1}
         self._currentMessages.insert(0, tempMessage) if newestFirst else self._currentMessages.append(tempMessage)
-        # The row above is already rendered synchronously by this point
-        # -- this pause is only so the spoken confirmation doesn't land
-        # in the exact same instant as the keypress.
         soundpack.play("send_message")
+        # Delayed so the confirmation doesn't land on the same instant as the keypress.
         # Translators: Announced after sending a chat message.
         wx.CallLater(250, nvdaUi.message, _("Message sent."))
-        # LOW CONFIDENCE fix for a reported "status bar shows just
-        # 'Send' after sending" -- no code was found that sets any
-        # status bar to that text, so the best guess is real keyboard
-        # focus lingering on the Send button after invoking it (normal
-        # wx behavior after a button click) and NVDA reading the
-        # button's own label instead. Returning focus to the compose
-        # box is also just better chat UX regardless. Please confirm
-        # this actually fixes what you saw -- if not, paste back
-        # exactly how you triggered send (Send button vs Ctrl+Enter)
-        # and what NVDA command you used to read the status bar.
+        # Return focus to the compose box (otherwise NVDA reads the Send button).
         self.composeText.SetFocus()
 
         def worker():
@@ -841,11 +753,7 @@ class _ChatMessagePanelMixin:
     # ---------------- keyboard shortcuts ----------------
 
     def onCheckAllConvos(self):
-        # Shift+F5 -- syncs EVERY conversation (client.sync_convos),
-        # not just whichever one is currently on screen, with a
-        # generic summary instead of onCheckForUpdates' per-conversation
-        # wording (which only ever reports on the currently selected
-        # convo -- correct for plain F5, misleading here).
+        # Shift+F5: sync EVERY conversation, with a generic summary message.
         if self._account is None:
             nvdaUi.message(_("No active account."))
             return
@@ -945,9 +853,7 @@ class _ChatMessagePanelMixin:
         evt.Skip()
 
 def _extract_join_code(text: str) -> str:
-    # LOW CONFIDENCE -- real bsky.app join-link URL format unknown, so
-    # this just takes the last non-empty path segment (query string
-    # stripped) as a best guess. Paste back a real link if this misparses.
+    # Invites are plain codes; a pasted link is reduced to its last path segment.
     text = text.strip()
     if not text:
         return ""
@@ -993,7 +899,8 @@ class JoinGroupDialog(wx.Dialog):
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
         # Translators: Button to join the group previewed above.
         self.joinButton = wx.Button(self, label=_("&Join"))
-        closeBtn = wx.Button(self, label="&Cancel")
+        # Translators: Button to cancel and close a dialog.
+        closeBtn = wx.Button(self, label=_("&Cancel"))
         actionRow.Add(self.joinButton, flag=wx.RIGHT, border=5)
         actionRow.Add(closeBtn)
         sizer.Add(actionRow, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
@@ -1093,7 +1000,8 @@ class JoinGroupDialog(wx.Dialog):
         ).format(
             # Translators: Fallback group name when the server didn't provide one.
             preview.get("name") or _("Group"),
-            owner.get("handle", "unknown"),
+            # Translators: Fallback owner handle when the server didn't provide one.
+            owner.get("handle", _("unknown")),
             preview.get("memberCount", "?"),
             preview.get("memberLimit", "?"),
             approvalText,
@@ -1267,7 +1175,8 @@ class NewChatDialog(wx.Dialog):
         self.startButton = wx.Button(self, label=_("St&art chat"))
         # Translators: Button to open the join-a-group dialog instead of starting a new chat.
         self.joinGroupButton = wx.Button(self, label=_("&Join group..."))
-        closeBtn = wx.Button(self, label="&Cancel")
+        # Translators: Button to cancel and close a dialog.
+        closeBtn = wx.Button(self, label=_("&Cancel"))
         actionRow.Add(self.startButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.joinGroupButton, flag=wx.RIGHT, border=5)
         actionRow.Add(closeBtn)
@@ -1503,7 +1412,8 @@ class JoinRequestsDialog(wx.Dialog):
         self.approveButton = wx.Button(self, label=_("&Approve"))
         # Translators: Button to reject the selected join request.
         self.rejectButton = wx.Button(self, label=_("&Reject"))
-        closeBtn = wx.Button(self, label="&Close")
+        # Translators: Button to close a dialog.
+        closeBtn = wx.Button(self, label=_("&Close"))
         actionRow.Add(self.approveButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.rejectButton, flag=wx.RIGHT, border=5)
         actionRow.Add(closeBtn)
@@ -1652,13 +1562,7 @@ class InviteLinkDialog(wx.Dialog):
         self._buildResultPanel(self.resultPanel)
         outerSizer.Add(self.resultPanel, proportion=1, flag=wx.EXPAND)
         self.resultPanel.Hide()
-        # Enable(False) alongside Hide() -- Hide() alone doesn't
-        # reliably remove a panel's children from wx's own tab-traversal
-        # chain, confirmed by testing: tabbing past urlText could land
-        # on a control inside the still-"tab-reachable" hidden
-        # setupPanel, which looked like the control had simply vanished
-        # (nothing visible/announced there). Disabling the hidden panel
-        # excludes it from traversal properly.
+        # Disable too: Hide() alone leaves the panel's children in the tab order.
         self.resultPanel.Enable(False)
 
         self.SetSizer(outerSizer)
@@ -1837,7 +1741,7 @@ class InviteLinkDialog(wx.Dialog):
             return
         if not joinLink:
             # Translators: Announced when the server response for the invite link is unexpectedly empty.
-            nvdaUi.message(_("The server didn't return link details -- check debug_dumps for the raw response."))
+            nvdaUi.message(_("The server didn't return link details."))
             return
         self._joinLink = joinLink
         # Translators: Announced after the invite link is created/updated.
@@ -1873,7 +1777,8 @@ class InviteLinkDialog(wx.Dialog):
             nvdaUi.message(_("Could not update invite link: {}").format(error))
             return
         if not joinLink:
-            nvdaUi.message(_("The server didn't return link details -- check debug_dumps for the raw response."))
+            # Translators: Announced when the server response for the invite link is unexpectedly empty.
+            nvdaUi.message(_("The server didn't return link details."))
             return
         self._joinLink = joinLink
         # Translators: Announced after enabling/disabling the invite link.
@@ -2252,7 +2157,8 @@ class ShareToChatDialog(wx.Dialog):
 
 
 class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
-    TAB_NAME = "Chat"
+    # Translators: Permanent tab label for Chat.
+    TAB_NAME = _("Chat")
     TAB_KEY = "chat"
 
     def __init__(self, parent):
@@ -2402,15 +2308,6 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             if sentAt:  # skip the still-"Sending..." optimistic row
                 self.messageList.SetItem(i, 4, _format_time(sentAt))
 
-    def onAccountChanged(self):
-        # Same purpose as FeedListMixin.onAccountChanged in
-        # feedWindow.py -- ChatWindow isn't a FeedListMixin host so it
-        # needs its own copy, but reuses its own existing _updateTitle/
-        # _loadFromCache.
-        self._account = db.get_active_account()
-        self._updateTitle()
-        self._loadFromCache()
-
     def _updateTitle(self):
         # Same pattern as FeedListMixin._updateTitle in feedWindow.py --
         # short tab label, full title only while this tab is active.
@@ -2435,7 +2332,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             self._suppressConvoSelectEvents = True
             try:
                 self.convoTree.DeleteAllItems()
-                self._convoRoot = self.convoTree.AddRoot("Conversations")
+                # Translators: Hidden root label of the conversation tree (used as its accessible name).
+                self._convoRoot = self.convoTree.AddRoot(_("Conversations"))
                 allConvos = db.get_convos(self._account["id"]) if self._account else []
                 requests = [c for c in allConvos if c.get("status") == "request"]
                 accepted = [c for c in allConvos if c.get("status") != "request"]
@@ -2481,6 +2379,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             tags = [_("request")]
         else:
             tags = []
+            if convo.get("muted"):
+                # Translators: Tag for a muted conversation.
+                tags.append(_("muted"))
             if convo.get("is_group"):
                 # Translators: Tag for a group conversation.
                 tags.append(_("group"))
@@ -2506,6 +2407,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             )
         # Translators: Chat tab status bar text. First {} is unread count, second {} is conversation count.
         self.statusBar.SetStatusText(_("Chat {} unread {} conversations").format(totalUnread, len(self._convos)))
+        from . import refresh_tray
+        refresh_tray()
 
     def _refreshConvoLabel(self, convoId):
         # Updates just this one conversation's tree label + the overall
@@ -2589,12 +2492,9 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             evt.Skip()
 
     def _showMessages(self, convoId):
-        # Only announce lock/request status on an actual selection
-        # change, not every resync-triggered redraw of the same convo.
+        # Lock/request status is announced only when the selection changes.
         previousConvoId = self._currentConvoId
-        # Restores focus to the same message on a reload of the SAME
-        # convo instead of snapping to newest -- matters since
-        # notifyConvoChanged reloads far more often than just F5.
+        # Keep focus on the same message when reloading the SAME convo.
         previousMessageId = None
         if convoId == previousConvoId:
             oldMessages = getattr(self, "_currentMessages", [])
@@ -2710,12 +2610,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
     def onAcceptButton(self, evt):
         convo = self._currentConvo()
-        # Guards against the Accept button's own &A mnemonic firing
-        # via Alt+A even while hidden (CONFIRMED: wx still dispatches a
-        # hidden button's mnemonic if it's merely Hide()'d, not also
-        # Disable()'d -- see _updateActionArea's matching fix) landing
-        # on a non-request conversation and silently accept_convo()-ing
-        # something that was never a pending request.
+        # A hidden button's mnemonic still fires; only accept real requests.
         if convo is not None and convo.get("status") == "request":
             self._acceptConvo(convo)
 
@@ -2936,6 +2831,16 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
     def _acceptConvo(self, convo):
         convoId = convo["convo_id"]
 
+        # Optimistic: flip local status immediately and re-render (a
+        # request becomes a normal convo -- compose box instead of
+        # Accept/Decline, re-sorts to after the remaining requests)
+        # instead of waiting on a full onCheckForUpdates() resync.
+        db.set_convo_status(self._account["id"], convoId, "accepted")
+        self._loadFromCache()
+        self._selectConvoById(convoId)
+        # Translators: Announced after accepting a chat message request.
+        nvdaUi.message(_("Accepted."))
+
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
@@ -2943,10 +2848,21 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = None
             except Exception as e:
                 error = str(e)
-            # Translators: Announced after accepting a chat message request.
-            wx.CallAfter(self._onConvoActionDone, _("Accepted.") if not error else None, error)
+            wx.CallAfter(self._onAcceptConvoDone, convoId, error)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onAcceptConvoDone(self, convoId, error):
+        if not error:
+            return
+        log.error(f"NVSky: accept conversation failed: {error}")
+        # Roll back -- the server never actually accepted it.
+        db.set_convo_status(self._account["id"], convoId, "request")
+        self._loadFromCache()
+        self._selectConvoById(convoId)
+        # Translators: Announced when a conversation action fails. {} is the error message.
+        nvdaUi.message(_("Action failed: {}").format(error))
 
     def _declineConvo(self, convo):
         name = db.describe_convo_from_members(convo, self._membersByConvo.get(convo["convo_id"], []))
@@ -3022,24 +2938,41 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         convoId = convo["convo_id"]
         wasMuted = bool(convo.get("muted"))
 
+        # Optimistic, same pattern as _setGroupLocked -- no more full
+        # onCheckForUpdates() resync just to flip one flag.
+        db.set_convo_muted(self._account["id"], convoId, not wasMuted)
+        convo["muted"] = int(not wasMuted)
+        self._refreshConvoLabel(convoId)
+        # Translators: Announced after unmuting a conversation.
+        # Translators: Announced after muting a conversation.
+        nvdaUi.message(_("Unmuted.") if wasMuted else _("Muted."))
+
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
                 if wasMuted:
                     client.unmute_convo(atprotoClient, convoId)
-                    # Translators: Announced after unmuting a conversation.
-                    message = _("Unmuted.")
                 else:
                     client.mute_convo(atprotoClient, convoId)
-                    # Translators: Announced after muting a conversation.
-                    message = _("Muted.")
                 error = None
             except Exception as e:
                 error = str(e)
-                message = None
-            wx.CallAfter(self._onConvoActionDone, message, error)
+            wx.CallAfter(self._onToggleMuteConvoDone, convo, wasMuted, error)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback
+    def _onToggleMuteConvoDone(self, convo, previousMuted, error):
+        if not error:
+            return
+        log.error(f"NVSky: mute/unmute conversation failed: {error}")
+        # Roll back the optimistic update -- the server never actually
+        # applied it.
+        db.set_convo_muted(self._account["id"], convo["convo_id"], previousMuted)
+        convo["muted"] = int(previousMuted)
+        self._refreshConvoLabel(convo["convo_id"])
+        # Translators: Announced when a conversation action fails. {} is the error message.
+        nvdaUi.message(_("Action failed: {}").format(error))
 
     def _leaveConvo(self, convo):
         name = db.describe_convo_from_members(convo, self._membersByConvo.get(convo["convo_id"], []))
@@ -3057,6 +2990,20 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
         convoId = convo["convo_id"]
 
+        # Optimistic: drop the tree item now; DB rows stay until the server
+        # succeeds (leaving can fail, e.g. OwnerCannotLeave).
+        item, cookie = self.convoTree.GetFirstChild(self._convoRoot)
+        while item.IsOk():
+            if self.convoTree.GetItemData(item) == convoId:
+                self.convoTree.Delete(item)
+                break
+            item, cookie = self.convoTree.GetNextChild(self._convoRoot, cookie)
+        self._convos = [c for c in self._convos if c["convo_id"] != convoId]
+        self._updateStatusBar()
+        soundpack.play("delete")
+        # Translators: Announced after leaving a conversation.
+        nvdaUi.message(_("Left conversation."))
+
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
@@ -3067,38 +3014,29 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onLeaveConvoDone, error)
 
-        uiutil.start_worker(worker)
+        # Plain thread, not uiutil.start_worker -- same fix as
+        # listsWindow.py's Remove list, same reasoning.
+        threading.Thread(target=worker, daemon=True).start()
 
     @uiutil.safe_ui_callback
     def _onLeaveConvoDone(self, error):
-        if error:
-            log.error(f"NVSky: leave conversation failed: {error}")
-            soundpack.play("error")
-            if "OwnerCannotLeave" in error:
-                # Translators: Announced when leaving fails because the account owns and hasn't locked this group.
-                nvdaUi.message(_(
-                    "You're the owner of this group -- lock it first "
-                    "(right-click the conversation, Lock this group), "
-                    "then you'll be able to leave."
-                ))
-            else:
-                # Translators: Announced when leaving a conversation fails. {} is the error message.
-                nvdaUi.message(_("Could not leave conversation: {}").format(error))
+        if not error:
             return
-        soundpack.play("delete")
-        # Translators: Announced after leaving a conversation.
-        nvdaUi.message(_("Left conversation."))
+        log.error(f"NVSky: leave conversation failed: {error}")
+        soundpack.play("error")
+        # Roll back -- the DB rows were never actually deleted, so a
+        # plain reload brings the conversation back.
         self._loadFromCache()
-
-    @uiutil.safe_ui_callback
-    def _onConvoActionDone(self, message, error):
-        if error:
-            log.error(f"NVSky: conversation action failed: {error}")
-            # Translators: Announced when a conversation action (accept/mute/etc.) fails. {} is the error message.
-            nvdaUi.message(_("Action failed: {}").format(error))
-            return
-        nvdaUi.message(message)
-        self.onCheckForUpdates(None)
+        if "OwnerCannotLeave" in error:
+            # Translators: Announced when leaving fails because the account owns and hasn't locked this group.
+            nvdaUi.message(_(
+                "You're the owner of this group -- lock it first "
+                "(right-click the conversation, Lock this group), "
+                "then you'll be able to leave."
+            ))
+        else:
+            # Translators: Announced when leaving a conversation fails. {} is the error message.
+            nvdaUi.message(_("Could not leave conversation: {}").format(error))
 
     def _openInNewTab(self, convo):
         mainWindow = self.GetTopLevelParent()
@@ -3139,8 +3077,6 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             wx.CallAfter(self._onRefreshSelectedConvoDone, convoId, error, previousMessageCount)
 
         threading.Thread(target=worker, daemon=True).start()
-        # (unchanged from before -- cursor persistence now lives inside
-        # client.debug_get_convo_log itself, see its docstring)
 
     @uiutil.safe_ui_callback
     def _onRefreshSelectedConvoDone(self, convoId, error, previousMessageCount):
@@ -3335,8 +3271,6 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         self.Layout()
 
     def _updateTitle(self):
-        # Same account-label pattern as ChatWindow -- see that class's
-        # _updateTitle history for why this needed adding.
         # Translators: Fallback account label in the window title when no account is active.
         accountLabel = self._account["handle"] if self._account else _("no account")
         notebook = self.GetParent()
@@ -3345,6 +3279,7 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
             notebook.SetPageText(index, self.TAB_NAME)
             if index == notebook.GetSelection():
                 self.GetTopLevelParent().SetTitle(f"{self.TAB_NAME} - NVSky - {accountLabel}")
+        self._updateStatusBar()
 
     def onTabActivated(self):
         # Translators: Announced when switching to a conversation tab. {} is the tab name.
@@ -3352,15 +3287,11 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         self._loadMessages()  # moveFocus=True by default -- handles it internally now
 
     def onTabRemoved(self):
-        # MainWindow.removeCurrentTab() calls this (if present) right
-        # before DeletePage() -- so a conversation tab the user closes
-        # with Ctrl+W doesn't come back next time NVSky opens.
+        # Called by MainWindow.removeCurrentTab() before DeletePage(): forget
+        # this tab so it isn't restored next launch.
         if self._account is not None:
             db.remove_open_temp_tab(self._account["id"], "conversation", self._convo["convo_id"])
-        # Return to wherever this conversation was opened FROM (the
-        # permanent Chat tab) instead of leaving the notebook to fall
-        # back on whatever wx.Notebook auto-selects next -- same
-        # pattern as FeedPreviewTabWindow.onTabRemoved.
+        # Return to the tab this was opened from, not wx.Notebook's auto-pick.
         if self._originTabKey:
             mainWindow = self.GetTopLevelParent()
             for panel in mainWindow.getOpenTabs():
@@ -3429,6 +3360,8 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         messages = getattr(self, "_currentMessages", [])
         # Translators: Conversation tab status bar text. First {} is the tab name, second {} is unread count, third {} is message count.
         self.statusBar.SetStatusText(_("{} {} unread {} messages").format(self.TAB_NAME, unread, len(messages)))
+        from . import refresh_tray
+        refresh_tray()
 
     def _loadMessages(self, moveFocus=True):
         # Refresh self._convo from DB every time -- this tab's copy is

@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import queue
 import threading
 
 # Add our own lib/ folder to sys.path FIRST (insert at index 0).
@@ -26,15 +27,18 @@ from . import client
 from . import uiutil
 from . import soundpack
 from . import attachments
+from . import jetstream
 from .settings import NVSkySettingsDialog, LoginDialog
 from .feedWindow import *
 from .notificationsWindow import NotificationsWindow
 from .listsWindow import ListsWindow, ListTabWindow, AddListDialog, SubscribeListDialog, ManageMembersDialog, AddToListDialog
 from .exploreWindow import ExploreWindow, StarterPackDetailsDialog
+from .peopleWindow import PeopleWindow
 from .feedTabs import ThreadTabWindow, QuotesTabWindow, ProfileDialog, UserListTabWindow, UserTimelineTabWindow, FeedPreviewTabWindow, SavedWindow, LikesWindow
 from .mainWindow import MainWindow
 from .chatWindow import ChatWindow, ConvoTabWindow
 from .compose import ComposeDialog
+from . import tray
 
 BG_SYNC_TICK_MS = 60_000  # check once a minute which categories are due
 
@@ -82,6 +86,28 @@ def open_settings_dialog():
         _activePlugin.onOpenSettings(None)
 
 
+def set_jetstream_enabled_runtime(enabled: bool):
+    """
+    Accessor for settings.py's GeneralPanel (no direct GlobalPlugin
+    reference) -- starts/stops the live Jetstream connection to match
+    the just-saved Settings toggle, without waiting for the next NVSky
+    restart.
+    """
+    if _activePlugin is None:
+        return
+    if enabled:
+        _activePlugin._startJetstream()
+    else:
+        _activePlugin._stopJetstream()
+
+
+def refresh_tray():
+    """Accessor for code with no GlobalPlugin reference (e.g. FeedWindow):
+    re-reads the Home unread count and updates the notification area icon."""
+    if _activePlugin is not None:
+        _activePlugin._refreshTray()
+
+
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     scriptCategory = _("NVSky")
 
@@ -98,6 +124,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._terminating = False
         self._mainWindow = None
         self._settingsDialog = None
+        self._jetstreamClient = None
+        self._jetstreamQueue = None
+        self._jetstreamWorkerThread = None
+        self._jetstreamAccountId = None
+        self._jetstreamSeenUris = {}
+        self._jetstreamHomeDids = set()
+        self._jetstreamListDids = {}
 
         # NVDA's own Preferences-menu convention for add-on settings --
         # replaces the old NVDASettingsDialog.categoryClasses hook,
@@ -115,6 +148,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         gui.mainFrame.Bind(wx.EVT_TIMER, self._onBgSyncTick, self._bgSyncTimer)
         self._bgSyncTimer.Start(BG_SYNC_TICK_MS)
 
+        # Delayed so DB init and the Settings menu are fully ready and
+        # NVDA's own startup isn't competing with a network call.
+        self._trayIcon = None
+        wx.CallLater(3000, self._autoStartJetstream)
+        wx.CallLater(3000, self._refreshTray)
+
         _activePlugin = self
 
     def terminate(self):
@@ -123,6 +162,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._bgSyncTimer.Stop()
         except Exception:
             pass
+        self._stopJetstream()
+        self._removeTray()
         self._terminating = True
         try:
             soundpack.reset_progress()
@@ -205,6 +246,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._runInitialFullSync()
         else:
             self._rebuildTabs()
+        self._restartJetstreamIfRunning()
+        self._refreshTray()
 
     def _onSettingsDialogClosed(self, evt):
         # NVSkySettingsDialog.onClose already calls gui.mainFrame.postPopup()
@@ -270,12 +313,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Translators: Permanent tab label.
             allTabs.append(("permanent", "chat", ChatWindow(notebook), _("Chat"), False))
         elif "chat" in enabledTabs:
-            log.info(f"NVSky: chat not supported for {account['handle']}, Chat tab skipped")
             # Translators: Announced when the active account doesn't support DMs, so the Chat tab is hidden.
             nvdaUi.message(_("This account doesn't support direct messages -- the Chat tab has been hidden."))
         if "lists" in enabledTabs:
             # Translators: Permanent tab label.
             allTabs.append(("permanent", "lists", ListsWindow(notebook), _("Lists"), False))
+        if "people" in enabledTabs:
+            # Translators: Permanent tab label.
+            allTabs.append(("permanent", "people", PeopleWindow(notebook), _("People"), False))
 
         if account is not None:
             for entry in db.get_open_temp_tabs(account["id"]):
@@ -296,7 +341,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                         db.remove_open_temp_tab(account["id"], "search_preview", entry.get("key"))
                         continue
                     # Translators: Fallback tab label when a restored search/feed preview tab has no name cached.
-                    name = entry.get("name", _("Preview"))
+                    name = entry.get("custom_name") or entry.get("name", _("Preview"))
                     tempTab = FeedPreviewTabWindow(
                         self._mainWindow.notebook, name, entry.get("kind", "feed"), entry.get("source_key"),
                         filters=entry.get("filters"), feed_key=entry.get("key"), origin_key=entry.get("origin_key"),
@@ -305,11 +350,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 elif entry.get("type") == "user_list":
                     kind = entry.get("list_kind")
                     userListTab = None
-                    if kind in ("followers", "following", "known_followers"):
+                    if kind in ("followers", "following", "known_followers", "muted", "blocked", "subscriptions"):
                         did = entry.get("did")
                         if did:
                             # Translators: Fallback owner label when a restored followers/following tab has no name cached.
-                            ownerLabel = entry.get("custom_name") or entry.get("owner_label", _("user"))
+                            ownerLabel = entry.get("owner_label", _("user"))
                             userListTab = UserListTabWindow(
                                 self._mainWindow.notebook, kind, did, ownerLabel, origin_key=entry.get("origin_key"),
                             )
@@ -322,7 +367,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     elif kind in ("likes", "reposts"):
                         postUri = entry.get("post_uri")
                         if postUri:
-                            ownerLabel = entry.get("custom_name") or entry.get("owner_label")
+                            ownerLabel = entry.get("owner_label")
                             userListTab = UserListTabWindow(
                                 self._mainWindow.notebook, kind, postUri, ownerLabel, origin_key=entry.get("origin_key"),
                             )
@@ -338,10 +383,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                         db.remove_open_temp_tab(account["id"], "user_timeline", entry.get("key"))
                         continue
                     # Translators: Fallback owner label when a restored user-timeline tab has no name cached.
-                    ownerLabel = entry.get("custom_name") or entry.get("owner_label", _("user"))
+                    ownerLabel = entry.get("owner_label", _("user"))
                     timelineTab = UserTimelineTabWindow(
                         self._mainWindow.notebook, did, ownerLabel, origin_key=entry.get("origin_key"),
                     )
+                    if entry.get("custom_name"):
+                        timelineTab.TAB_NAME = entry["custom_name"]
                     allTabs.append(("user_timeline", did, timelineTab, timelineTab.TAB_NAME, True))
                 elif entry.get("type") == "quotes":
                     targetUri = entry.get("target_uri")
@@ -352,6 +399,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     quotesTab = QuotesTabWindow(
                         self._mainWindow.notebook, targetUri, cachedQuotes, origin_key=entry.get("origin_key"),
                     )
+                    if entry.get("custom_name"):
+                        quotesTab.TAB_NAME = entry["custom_name"]
                     allTabs.append(("quotes", targetUri, quotesTab, quotesTab.TAB_NAME, True))
                 elif entry.get("type") == "thread":
                     rootUri = entry.get("root_uri")
@@ -370,6 +419,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                         self._mainWindow.notebook, rootUri, cachedPosts, targetIndex,
                         origin_key=entry.get("origin_key"),
                     )
+                    if entry.get("custom_name"):
+                        threadTab._customName = entry["custom_name"]
+                        threadTab.TAB_NAME = entry["custom_name"]
                     allTabs.append(("thread", rootUri, threadTab, threadTab.TAB_NAME, True))
                 elif entry.get("type") == "conversation":
                     if not chatSupported:
@@ -480,13 +532,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _onBgSyncCategoryDone(self, category, changed, names):
         if not changed:
             return
+        if category in ("home", "notifications", "chat"):
+            self._refreshTray()
         # "notification" sound covers every category with genuinely
         # new content, not just the Notifications tab itself -- a new
         # post appearing in Home/Lists/Chat/etc while background sync
         # runs deserves the same audible cue.
         soundpack.play("notification")
         if category in db.get_bg_sync_announce_categories() and names:
-            if len(names) == 1:
+            if category == "chat":
+                if len(names) == 1:
+                    # Translators: Announced when background sync finds a new chat message. {} is the conversation's name.
+                    nvdaUi.message(_("New chat with {}").format(names[0]))
+                else:
+                    # Translators: Announced when background sync finds new chat messages in several conversations. {} is a comma-separated list of conversation names.
+                    nvdaUi.message(_("New chats with {}").format(", ".join(names)))
+            elif len(names) == 1:
                 # Translators: Announced when background sync finds a new post in one feed/list. {} is its name.
                 nvdaUi.message(_("New post in: {}").format(names[0]))
             else:
@@ -729,3 +790,297 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         evt.Skip()
 
     script_quickNewPost.__doc__ = _("Open a quick new post window")
+
+    def script_readUnread(self, gesture):
+        ui.message(self._unreadSummary())
+
+    script_readUnread.__doc__ = _("Read the unread count of every open NVSky tab")
+
+    def _startJetstream(self):
+        if self._jetstreamClient is not None:
+            return
+        account = db.get_active_account()
+        if account is None:
+            return
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                follows = client.get_follows(atprotoClient, account["did"])
+                dids = [f["did"] for f in follows]
+                listUris = {
+                    l["list_uri"] for l in db.get_lists(account["id"])
+                    if l["purpose"] == client.LIST_PURPOSE_CURATE
+                }
+                for entry in db.get_open_temp_tabs(account["id"]):
+                    if entry.get("type") == "list" and entry.get("list_uri"):
+                        listUris.add(entry["list_uri"])
+                listMembers = {}
+                for listUri in listUris:
+                    try:
+                        info = client.get_list(atprotoClient, listUri)
+                    except Exception as e:
+                        log.error(f"NVSky: jetstream -- loading members of {listUri} failed: {e}")
+                        continue
+                    for member in info["members"]:
+                        listMembers.setdefault(member["did"], set()).add(listUri)
+                error = None
+            except Exception as e:
+                dids = None
+                listMembers = {}
+                error = str(e)
+            finally:
+                db.close_all_connections()
+            wx.CallAfter(self._onJetstreamFollowsReady, account["id"], dids, listMembers, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @uiutil.safe_ui_callback(check_app_closing=False)
+    def _onJetstreamFollowsReady(self, account_id, dids, listMembers, error):
+        if error:
+            log.error(f"NVSky: jetstream -- fetching follows failed: {error}")
+            # Translators: Announced when real-time (Jetstream) updates fail to start. {} is the error message.
+            nvdaUi.message(_("Could not start real-time updates: {}").format(error))
+            return
+        # Own posts/reposts already appear in the real Home/Following
+        # feed (getTimeline includes your own activity regardless of
+        # any actual follow record) -- Jetstream's wantedDids is a hard
+        # filter we control, so it needs the account's own did added
+        # explicitly to match that behavior.
+        account = db.get_active_account()
+        if account is not None and account["did"] not in dids:
+            dids = dids + [account["did"]]
+        homeDids = set(dids)
+        extraDids = [d for d in listMembers if d not in homeDids]
+        dids = dids + extraDids
+        # Jetstream's documented wantedDids cap (not tested with a real oversized list).
+        JETSTREAM_MAX_DIDS = 10000
+        if len(dids) > JETSTREAM_MAX_DIDS:
+            log.info(f"NVSky: jetstream -- following list ({len(dids)}) exceeds cap, truncating")
+            dids = dids[:JETSTREAM_MAX_DIDS]
+        self._jetstreamAccountId = account_id
+        self._jetstreamHomeDids = homeDids
+        self._jetstreamListDids = listMembers
+        self._jetstreamSeenUris = {}
+        self._jetstreamQueue = queue.Queue()
+        self._jetstreamWorkerThread = threading.Thread(target=self._jetstreamWorkerLoop, daemon=True)
+        self._jetstreamWorkerThread.start()
+
+        storedCursor = db.get_jetstream_cursor(account_id)
+        self._jetstreamClient = jetstream.JetstreamClient(
+            on_event=self._onJetstreamEvent,
+            on_cursor=lambda timeUs: db.set_jetstream_cursor(account_id, timeUs),
+            wanted_collections=["app.bsky.feed.post", "app.bsky.feed.repost"],
+            wanted_dids=dids,
+            cursor=storedCursor,
+        )
+        self._jetstreamClient.start()
+
+    def _onJetstreamEvent(self, event):
+        # Runs on Jetstream's asyncio thread: keep it cheap (lookups + queue.put).
+        # Resolving/storing happens in _jetstreamWorkerLoop. Deletes not handled.
+        parsed = jetstream.parse_commit_event(event)
+        if parsed is None:
+            return
+        uri, _cid, operation, collection = parsed
+        if operation != "create" or collection not in ("app.bsky.feed.post", "app.bsky.feed.repost"):
+            return
+        if uri in self._jetstreamSeenUris:
+            # A reconnect with a cursor replays the event at that cursor; skip repeats.
+            return
+        self._jetstreamSeenUris[uri] = True
+        if len(self._jetstreamSeenUris) > 500:
+            oldest = next(iter(self._jetstreamSeenUris))
+            del self._jetstreamSeenUris[oldest]
+
+        eventDid = event.get("did")
+        if collection == "app.bsky.feed.post":
+            feedKeys = []
+            if eventDid in self._jetstreamHomeDids:
+                feedKeys.append("home")
+            feedKeys.extend(sorted(self._jetstreamListDids.get(eventDid, ())))
+            if feedKeys:
+                self._jetstreamQueue.put(("post", uri, feedKeys))
+            return
+        if eventDid not in self._jetstreamHomeDids:
+            return
+        repostInfo = jetstream.parse_repost_subject(event)
+        if repostInfo is None:
+            return
+        subjectUri, subjectCid, reposterDid, createdAt = repostInfo
+        self._jetstreamQueue.put(("repost", subjectUri, subjectCid, reposterDid, createdAt))
+
+    def _jetstreamWorkerLoop(self):
+        accountId = self._jetstreamAccountId
+        pendingKeys = set()
+        try:
+            while True:
+                item = self._jetstreamQueue.get()
+                if item is None:
+                    break
+                kind = item[0]
+                try:
+                    atprotoClient = client.get_client_for_active_account()
+                    if kind == "post":
+                        uri = item[1]
+                        resolved = client.resolve_posts(atprotoClient, accountId, [uri])
+                        if uri not in resolved:
+                            continue
+                        postRow = db.get_post(uri)
+                        if postRow is None:
+                            continue
+                        for feedKey in item[2]:
+                            db.upsert_feed_item(accountId, feedKey, uri, postRow["indexed_at"])
+                            pendingKeys.add(feedKey)
+                    else:
+                        _kind, subjectUri, subjectCid, reposterDid, createdAt = item
+                        client.store_jetstream_repost(
+                            atprotoClient, accountId, subjectUri, subjectCid, reposterDid, createdAt
+                        )
+                        pendingKeys.add("home")
+                except Exception as e:
+                    log.error(f"NVSky: jetstream -- processing a {kind} event failed: {e}")
+                    continue
+                # A reconnect after sleep/shutdown replays every missed
+                # event at once -- notify/reload once per burst.
+                if self._jetstreamQueue.empty():
+                    wx.CallAfter(self._onJetstreamPostAdded, frozenset(pendingKeys))
+                    pendingKeys.clear()
+        finally:
+            db.close_all_connections()
+
+    @uiutil.safe_ui_callback(check_app_closing=False)
+    def _onJetstreamPostAdded(self, feedKeys=frozenset()):
+        soundpack.play("notification")
+        self._refreshTray()
+        if self._mainWindow is None:
+            return
+        activeIndex = self._mainWindow.notebook.GetSelection()
+        activePanel = self._mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
+        # Only feed-backed panels (Home, a Lists curation timeline, a
+        # list tab) qualify; FeedListMixin's own reload is used directly
+        # so ListsWindow doesn't rebuild its whole tree (focus risk).
+        if activePanel is None or not hasattr(activePanel, "_dbGetPage"):
+            return
+        if getattr(activePanel, "_feedKey", None) not in feedKeys:
+            return
+        try:
+            FeedListMixin._reloadAfterBulkCheck(activePanel, moveFocus=False)
+        except Exception as e:
+            log.error(f"NVSky: jetstream -- feed tab reload failed: {e}")
+
+    def _stopJetstream(self):
+        if self._jetstreamClient is not None:
+            self._jetstreamClient.stop()
+            self._jetstreamClient = None
+        if self._jetstreamQueue is not None:
+            self._jetstreamQueue.put(None)
+        if self._jetstreamWorkerThread is not None:
+            self._jetstreamWorkerThread.join(timeout=5)
+            self._jetstreamWorkerThread = None
+
+    def _chatUnreadTotal(self, accountId):
+        return sum(db.get_unread_message_count(accountId, c["convo_id"]) for c in db.get_convos(accountId))
+
+    def _panelUnread(self, panel, accountId):
+        """Unread count a tab reports, or None for tabs that don't track one."""
+        tabKey = getattr(panel, "TAB_KEY", None)
+        if tabKey == "chat":
+            return self._chatUnreadTotal(accountId)
+        if tabKey == "lists":
+            return sum(
+                db.get_unread_count(accountId, l["list_uri"])
+                for l in db.get_lists(accountId) if l["purpose"] == client.LIST_PURPOSE_CURATE
+            )
+        if getattr(panel, "TAB_TEMP_TYPE", None) == "conversation":
+            return db.get_unread_message_count(accountId, panel._convo["convo_id"])
+        if getattr(panel, "_tracksUnread", True) is False:
+            return None
+        countFn = getattr(panel, "_dbGetUnreadCount", None)
+        return countFn() if callable(countFn) else None
+
+    def _unreadSummary(self):
+        account = db.get_active_account()
+        if account is None:
+            return _("No active account.")
+        accountId = account["id"]
+        parts = []
+        if self._mainWindow is not None:
+            for panel in self._mainWindow.getOpenTabs():
+                try:
+                    count = self._panelUnread(panel, accountId)
+                except Exception as e:
+                    log.error(f"NVSky: reading a tab's unread count failed: {e}")
+                    continue
+                if count:
+                    parts.append(f"{getattr(panel, 'TAB_NAME', '')} {count}")
+        else:
+            enabledTabs = db.get_enabled_tabs()
+            counts = [(_("Home"), db.get_unread_count(accountId, db.get_home_active_filter(accountId)))]
+            if "notifications" in enabledTabs:
+                counts.append((_("Notifications"), db.get_unread_notification_count(accountId)))
+            if "chat" in enabledTabs and account.get("chat_supported", 1):
+                counts.append((_("Chat"), self._chatUnreadTotal(accountId)))
+            parts = [f"{name} {count}" for name, count in counts if count]
+        if not parts:
+            # Translators: Spoken by the "read unread counts" command when nothing is unread.
+            return _("NVSky: no unread")
+        # Translators: Spoken by the "read unread counts" command. {} is a list such as "Home 3, Chat 1".
+        return _("NVSky unread: {}").format(", ".join(parts))
+
+    def _trayCounts(self, account):
+        accountId = account["id"]
+        wanted = db.get_tray_categories()
+        labels = tray.category_labels()
+        counts = []
+        if "home" in wanted:
+            counts.append(("home", db.get_unread_count(accountId, db.get_home_active_filter(accountId))))
+        if "notifications" in wanted:
+            counts.append(("notifications", db.get_unread_notification_count(accountId)))
+        if "chat" in wanted and account.get("chat_supported", 1):
+            counts.append(("chat", self._chatUnreadTotal(accountId)))
+        return [(labels[key], n) for key, n in counts if n]
+
+    def _refreshTray(self):
+        if self._terminating:
+            return
+        try:
+            account = db.get_active_account()
+            if account is None or not db.get_tray_enabled():
+                self._removeTray()
+                return
+            counts = self._trayCounts(account)
+            if self._trayIcon is None:
+                self._trayIcon = tray.TrayIcon(
+                    on_open=lambda: self.script_openFeed(None),
+                    on_settings=lambda: self.onOpenSettings(None),
+                    counts=counts,
+                    per_tab=db.get_tray_per_tab(),
+                )
+            else:
+                self._trayIcon.set_counts(counts, db.get_tray_per_tab())
+        except Exception as e:
+            log.error(f"NVSky: updating the notification area icon failed: {e}")
+
+    def _removeTray(self):
+        if self._trayIcon is not None:
+            try:
+                self._trayIcon.cleanup()
+            except Exception as e:
+                log.error(f"NVSky: removing the notification area icon failed: {e}")
+            self._trayIcon = None
+
+    def _autoStartJetstream(self):
+        if self._terminating or not db.get_jetstream_enabled():
+            return
+        self._startJetstream()
+
+    def _restartJetstreamIfRunning(self):
+        # Called after an account switch/add/remove (see
+        # _onSettingsAccountChanged) -- the running subscription's
+        # wantedDids belongs to whichever account was active when it
+        # started, so it must restart under the new one rather than
+        # keep silently updating the old account's cache.
+        self._stopJetstream()
+        if db.get_jetstream_enabled() and db.get_active_account() is not None:
+            self._startJetstream()

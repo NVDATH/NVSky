@@ -129,15 +129,10 @@ class SoundEngine:
 
     def play_debounced(self, event_key: str, delay_ms: int = 0):
         """
-        Same as play(), but delayed and cancellable -- used for
-        focus-driven sounds (embed type on arrow-key navigation) where
-        firing on every single row during fast scrolling would produce
-        overlapping/garbled sound spam. Each call cancels any pending
-        call from a PREVIOUS play_debounced() (any event_key, not just
-        the same one) -- only the row the user actually settles on
-        should ever produce a sound. Fires on a background timer
-        thread, not wx's main thread, so it never blocks NVDA's own
-        speech for the row.
+        Like play(), for focus-driven sounds (embed type while arrowing).
+        Cancels any pending debounced call. delay_ms=0 (default) plays
+        immediately and blocking, so the sound lands before NVDA speaks the
+        row; delay_ms>0 plays later on a timer thread.
         """
         if event_key not in self._enabledEvents:
             return

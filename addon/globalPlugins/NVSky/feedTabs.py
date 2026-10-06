@@ -1,10 +1,9 @@
 """
 Miscellaneous tab/dialog classes for NVSky's feed views.
 
-Split out of feedWindow.py (see plan-17.md). ProfileDialog, UserListTabWindow,
-ThreadTabWindow, QuotesTabWindow, UserTimelineTabWindow, FeedPreviewTabWindow,
-and SavedWindow don't share enough to warrant their own dedicated files
-(unlike Lists/Explore/Notifications), so they're grouped here together.
+ProfileDialog, UserListTabWindow, ThreadTabWindow, QuotesTabWindow,
+UserTimelineTabWindow, FeedPreviewTabWindow, SavedWindow, and LikesWindow:
+the smaller tab/dialog classes that don't warrant their own files.
 """
 import threading
 import wx
@@ -29,8 +28,6 @@ from .feedWindow import (
     _search_feed_key,
     _announce_now,
     _embed_sound_event,
-    _visible_embed_text,
-    _visible_message_text,
     _post_web_url,
     _compose_copy_text,
 )
@@ -93,13 +90,10 @@ class ProfileDialog(UserActionMixin, wx.Dialog):
 
 class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Panel):
     """
-    Browsable user-list tab -- replaces the old UserListDialog and
-    covers three kinds: "followers"/"following" (fixed to one account's
-    did) and "search" (a people-search query, opened via Explore's
-    "Open in new tab"). F5 re-fetches from the network -- no local
-    cache/pagination, same fetch-once-per-refresh behavior the old
-    dialog had. Not persisted differently by kind -- all three
-    persist/restore the same way as any other temp tab.
+    Browsable user-list tab. Kinds: followers, following, known_followers,
+    likes, reposts (fixed to a did/post uri) and search (a people-search
+    query). Cache-first on open, then a silent refetch; F5 refetches. No
+    pagination.
     """
 
     _KIND_LABELS = {
@@ -115,6 +109,20 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
         "reposts": _("reposts"),
         # Translators: Noun used in status/loading text, e.g. "Loading known followers, please wait...".
         "known_followers": _("known followers"),
+        # Translators: Noun used in status/loading text, e.g. "Loading muted users, please wait...".
+        "muted": _("muted users"),
+        # Translators: Noun used in status/loading text, e.g. "Loading blocked users, please wait...".
+        "blocked": _("blocked users"),
+        # Translators: Noun used in status/loading text, e.g. "Loading activity subscriptions, please wait...".
+        "subscriptions": _("activity subscriptions"),
+    }
+    _OWN_LIST_NAMES = {
+        # Translators: Tab name for the account's own muted-users list.
+        "muted": _("Muted users"),
+        # Translators: Tab name for the account's own blocked-users list.
+        "blocked": _("Blocked users"),
+        # Translators: Tab name for the account's own activity-subscriptions list.
+        "subscriptions": _("Activity subscriptions"),
     }
 
     def __init__(self, parent, kind, target, owner_label=None, origin_key=None):
@@ -134,6 +142,8 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
         elif kind == "known_followers":
             # Translators: Tab name for a known-followers list. {} is the account owner.
             self.TAB_NAME = _("Known followers of {}").format(owner_label)
+        elif kind in self._OWN_LIST_NAMES:
+            self.TAB_NAME = self._OWN_LIST_NAMES[kind]
         elif kind in ("likes", "reposts"):
             kindLabels = {
                 # Translators: Tab-name kind label in "{kind} on {post}".
@@ -174,6 +184,7 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
         self.userList.Bind(wx.EVT_CONTEXT_MENU, self.onUserAction)
         self.Bind(wx.EVT_CHAR_HOOK, self.onUserListCharHook)
 
+        self._updateButtons()
         self._pendingIsInitial = True
         cached = db.get_user_list_cache(self._account["id"], self.TAB_TEMP_KEY) if self._account else None
         self._hadInitialCache = cached is not None
@@ -181,7 +192,8 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
             self._users = cached
             self._renderUsers()
         else:
-            self.statusBar.SetStatusText("Loading, please wait...")
+            # Translators: Status bar text while a user list loads for the first time.
+            self.statusBar.SetStatusText(_("Loading, please wait..."))
         self._fetch()
 
     def onTabActivated(self):
@@ -198,6 +210,22 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
     def _userListLabel(self):
         # Translators: Status bar text for a user-list tab. First {} is the tab name, second {} is the total count.
         return _("{} -- {} total").format(self.TAB_NAME, len(self._users))
+
+    def _updateStatusBar(self):
+        self.statusBar.SetStatusText(self._userListLabel())
+
+    def _listIsMine(self):
+        return self._account is not None and self._target == self._account["did"]
+
+    def _usersChanged(self):
+        if self._account is not None:
+            db.set_user_list_cache(self._account["id"], self.TAB_TEMP_KEY, self._users)
+
+    def _updateButtons(self):
+        hasUsers = bool(self._users)
+        self.userActionButton.Show(hasUsers)
+        self.userActionButton.Enable(hasUsers)
+        self.Layout()
 
     def onCheckForUpdates(self, evt=None):
         if self._account is None:
@@ -246,6 +274,12 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
                     users = client.get_post_likes(atprotoClient, self._target)
                 elif self._kind == "reposts":
                     users = client.get_post_reposted_by(atprotoClient, self._target)
+                elif self._kind == "muted":
+                    users = client.get_muted_actors(atprotoClient)
+                elif self._kind == "blocked":
+                    users = client.get_blocked_actors(atprotoClient)
+                elif self._kind == "subscriptions":
+                    users = client.get_activity_subscriptions(atprotoClient)
                 else:
                     response = client.search_actors(atprotoClient, self._target)
                     users = [
@@ -256,10 +290,13 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
                         }
                         for a in response.actors
                     ]
+                db.cache_relationship_authors(users, self._kind)
                 error = None
             except Exception as e:
                 users = None
                 error = str(e)
+            finally:
+                db.close_all_connections()
             wx.CallAfter(self._onFetchDone, users, error)
 
         uiutil.start_worker(worker, progress=progress)
@@ -300,19 +337,11 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
 
 class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     """
-    Full thread view, popped into its own removable tab -- replaces
-    ThreadDialog. NOT a FeedListMixin host: a thread is a tree
-    (ancestors + depth-first replies), not chronological pagination,
-    so there's no "load older" -- F5 always re-fetches the WHOLE thread
-    fresh (a genuinely new reply from someone else can appear this
-    way). Cache-first on open via db.get_user_list_cache/
-    set_user_list_cache under key f"thread:{root_uri}" -- same
-    convention UserListTabWindow uses, just reused here rather than a
-    separate helper since the shape (a plain list of dicts) is
-    identical.
-
-    Same reduced Post-action set as before conversion (Like, Copy,
-    Embed) -- Reply/Repost/Quote parity still deferred.
+    Full thread in a removable tab. Not a FeedListMixin host: a thread is a
+    tree (ancestors + depth-first replies), so there is no "load older";
+    F5 re-fetches the whole thread. Cache-first on open via
+    db.get_user_list_cache under f"thread:{root_uri}". Reduced Post action
+    set (Like, Copy, Embed).
     """
 
     def __init__(self, parent, root_uri, posts, target_index, origin_key=None):
@@ -325,20 +354,14 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         self._posts = posts
         self._targetUri = posts[target_index]["uri"] if posts and target_index < len(posts) else root_uri
         self.TAB_NAME = self._makeTabName(posts)
-        # Guards onItemFocused's embed-sound hook against firing for
-        # programmatic focus (initial render's auto-focus onto the
-        # target post, or a re-render after F5) -- same purpose as
-        # FeedListMixin._suppressFocusEvents, just a local copy since
-        # this class isn't a FeedListMixin host.
+        # Set by a user rename (or restore); stops refresh from resetting the name.
+        self._customName = None
+        # Skips the embed sound for programmatic focus (initial render / refresh).
         self._suppressFocusEvents = False
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.postList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        # Column order matches FeedListMixin._buildFeedListColumns
-        # (Embed/Author/Message/Posted) for UX consistency across every
-        # post list in the add-on -- this was previously Author/
-        # Message/Posted/Embed here, the odd one out.
         # Translators: Column header for a post's embed summary (image/video/link/quote).
         self.postList.InsertColumn(0, _("Embed"), width=140)
         # Translators: Column header for a post's author.
@@ -394,6 +417,10 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
             db.delete_user_list_cache(self._account["id"], f"thread:{self._rootUri}")
         self._jumpBackToOrigin()
 
+    def onTabRenamed(self, newName):
+        self._customName = newName
+        super().onTabRenamed(newName)
+
     def onClearCache(self, evt=None):
         confirm = wx.MessageDialog(
             self,
@@ -444,17 +471,13 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         parts = [
             self._displayLabel(post.get("handle"), post.get("display_name")),
             _message_text(post),
-            _format_post_time(post.get("indexed_at")),
         ]
         url = _post_web_url(post.get("uri"), post.get("handle") or post.get("author_did"))
         uiutil.copy_text_to_clipboard(_compose_copy_text(parts, url))
 
     def _renderThread(self, target_index=None):
-        # Keeps whichever post is currently focused (by uri) unless
-        # target_index is given explicitly -- mirrors the "stay on the
-        # same message" principle used elsewhere (e.g. ChatWindow.
-        # _showMessages), since a re-fetch can insert a genuinely new
-        # reply anywhere in the list.
+        # Keep the focused post (by uri) unless target_index is given; a
+        # re-fetch can insert replies anywhere.
         previousUri = None
         if target_index is None:
             focused = self._getFocusedPost()
@@ -498,6 +521,17 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         finally:
             self.postList.Thaw()
 
+        self._updateStatusBar()
+        self._updateActionButtons()
+
+    def _updateActionButtons(self):
+        hasItems = bool(self._posts)
+        for button in (self.postActionButton, self.userActionButton):
+            button.Show(hasItems)
+            button.Enable(hasItems)
+        self.Layout()
+
+    def _updateStatusBar(self):
         # Translators: Thread tab status bar text. First {} is the tab name, second {} is the post count.
         self.statusBar.SetStatusText(_("{} -- {} posts").format(self.TAB_NAME, len(self._posts)))
 
@@ -528,7 +562,8 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
             nvdaUi.message(_("Could not refresh thread: {}").format(error))
             return
         self._posts = posts or []
-        self.TAB_NAME = self._makeTabName(self._posts)
+        if not self._customName:
+            self.TAB_NAME = self._makeTabName(self._posts)
         self._updateTitle()
         self._renderThread()
         if self._account is not None:
@@ -537,17 +572,7 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         nvdaUi.message(_("{} posts in thread.").format(len(self._posts)))
 
     def onItemFocused(self, evt):
-        # BUG FIX: ThreadTabWindow isn't a FeedListMixin host (see this
-        # class's own docstring), so it never got the shared embed-type
-        # sound hook FeedListMixin.onItemFocused provides -- confirmed
-        # NOT a column-order issue, _embed_sound_event reads straight
-        # from the post dict's embed_json field regardless of what
-        # column order is displayed. Added directly here instead.
-        # BUG FIX #2: also skips while _suppressFocusEvents is set --
-        # without this, the auto-focus onto the target post right after
-        # opening/refreshing the tab fired this exactly like a real
-        # user-driven arrow-key move, playing an embed sound the user
-        # never asked for (confirmed: heard on the tab's initial post).
+        # Embed sound on focus (not a FeedListMixin host); skipped for programmatic focus.
         if self._suppressFocusEvents:
             evt.Skip()
             return
@@ -659,16 +684,12 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         self._originTabKey = origin_key
         self._posts = quotes
         self.TAB_NAME = self._makeTabName()
-        # See ThreadTabWindow's identical attribute for why this exists.
+        # Skips the embed sound for programmatic focus (see ThreadTabWindow).
         self._suppressFocusEvents = False
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.postList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        # Column order matches FeedListMixin._buildFeedListColumns
-        # (Embed/Author/Message/Posted) for UX consistency across every
-        # post list in the add-on -- this was previously Author/
-        # Message/Posted/Embed here, the odd one out.
         # Translators: Column header for a post's embed summary (image/video/link/quote).
         self.postList.InsertColumn(0, _("Embed"), width=140)
         # Translators: Column header for a post's author.
@@ -755,7 +776,6 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         parts = [
             self._displayLabel(post.get("handle"), post.get("display_name")),
             _message_text(post),
-            _format_post_time(post.get("indexed_at")),
         ]
         url = _post_web_url(post.get("uri"), post.get("handle") or post.get("author_did"))
         uiutil.copy_text_to_clipboard(_compose_copy_text(parts, url))
@@ -789,6 +809,17 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         finally:
             self.postList.Thaw()
 
+        self._updateStatusBar()
+        self._updateActionButtons()
+
+    def _updateActionButtons(self):
+        hasItems = bool(self._posts)
+        for button in (self.postActionButton, self.userActionButton):
+            button.Show(hasItems)
+            button.Enable(hasItems)
+        self.Layout()
+
+    def _updateStatusBar(self):
         # Translators: Quotes tab status bar text. First {} is the tab name, second {} is the quote count.
         self.statusBar.SetStatusText(_("{} -- {} quotes").format(self.TAB_NAME, len(self._posts)))
 
@@ -826,11 +857,7 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         nvdaUi.message(_("{} quotes.").format(len(self._posts)))
 
     def onItemFocused(self, evt):
-        # Same bug/fix as ThreadTabWindow.onItemFocused just above --
-        # QuotesTabWindow isn't a FeedListMixin host either, so it
-        # never had the embed-type sound hook wired at all. Also guards
-        # against programmatic auto-focus the same way (see
-        # ThreadTabWindow.onItemFocused's own comment on this).
+        # Embed sound on focus; skipped for programmatic focus (see ThreadTabWindow).
         if self._suppressFocusEvents:
             evt.Skip()
             return
@@ -965,6 +992,8 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
             if p["uri"] == quotingPost["uri"]:
                 del self._posts[i]
                 self._render()
+                if not self._posts:
+                    uiutil.focus_check_updates_button(self)
                 break
         # Translators: Announced after detaching your post from someone's quote.
         self._onActionDone(_("Detached."), None)
@@ -972,10 +1001,9 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
 
 class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     """
-    A user's own post timeline, popped into its own removable tab --
-    replaces UserTimelineDialog. Full FeedListMixin cache-first/
-    lazy-load machinery via client.sync_author_feed_page's feed_key
-    (f"user_timeline:{did}"). Not user-renameable.
+    A user's own timeline in a removable tab: FeedListMixin cache-first/
+    lazy-load via client.sync_author_feed_page (feed_key
+    f"user_timeline:{did}"). Not user-renameable.
     """
 
     SUPPORTS_FOCUS_NEXT_UNREAD = True
@@ -999,7 +1027,9 @@ class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, U
         self._finishStandardFeedInit(sync_if_empty=True)
 
     def onTabActivated(self):
-        self._render()
+        # Re-reads from the DB -- see notificationsWindow.py's
+        # onTabActivated for why _render() alone isn't enough.
+        self._loadFromCache(reset=True)
         if self._account is not None:
             # Translators: Announced when switching to this tab. {} is the tab name.
             nvdaUi.message(_("{} tab").format(self.TAB_NAME))
@@ -1011,6 +1041,7 @@ class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, U
                 value.Stop()
         if self._account is not None:
             db.remove_open_temp_tab(self._account["id"], "user_timeline", self._did)
+            db.clear_feed_key_cache(self._account["id"], self._feedKey)
         self._jumpBackToOrigin()
 
     def _getActionablePost(self):
@@ -1019,12 +1050,6 @@ class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, U
             # Translators: Announced when the post-action menu is invoked with no post focused.
             nvdaUi.message(_("No post selected."))
         return post
-
-    def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _visible_embed_text(post))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _visible_message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
@@ -1102,7 +1127,9 @@ class FeedPreviewTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, Us
         self._finishStandardFeedInit(sync_if_empty=True)
 
     def onTabActivated(self):
-        self._render()
+        # Re-reads from the DB -- see notificationsWindow.py's
+        # onTabActivated for why _render() alone isn't enough.
+        self._loadFromCache(reset=True)
         if self._account is not None:
             # Translators: Announced when switching to this tab. {} is the tab name.
             nvdaUi.message(_("{} tab").format(self.TAB_NAME))
@@ -1181,22 +1208,9 @@ class FeedPreviewTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, Us
 
 
 class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
+    """Saved posts (bookmarks): feed_key "saved" via sync_saved(). Unsaving a post removes its row (_onBookmarkChanged)."""
+
     TAB_KEY = "saved"
-
-    """
-    Saved posts (bookmarks) -- structurally identical to FeedWindow's
-    Home feed (real posts, same ItemActionMixin Post action menu
-    applies unchanged), just backed by feed_key "saved" / sync_saved()
-    instead of the Following timeline. No filter -- there's only one
-    "Saved" list, unlike Home's Following/Discover choice.
-
-    NOTE: unsaving a post from its own Post action menu (Alt+A -> Save/
-    Unsave, already shared via ItemActionMixin) toggles the bookmark on
-    the server but does NOT remove the row from this list immediately
-    -- same as everywhere else, that only happens on next Check for
-    updates (F5). Matches existing behavior elsewhere (e.g. Hide post),
-    not a new gap introduced here.
-    """
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -1213,7 +1227,9 @@ class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         self._finishStandardFeedInit()
 
     def onTabActivated(self):
-        self._render()
+        # Re-reads from the DB -- see notificationsWindow.py's
+        # onTabActivated for why _render() alone isn't enough.
+        self._loadFromCache(reset=True)
         if self._account is not None:
             # Translators: Announced when switching to this tab. {} is the tab name.
             nvdaUi.message(_("{} tab").format(self.TAB_NAME))
@@ -1239,12 +1255,6 @@ class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                     self.postList.Focus(newIndex)
                     self.postList.Select(newIndex)
                 break
-
-    def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _visible_embed_text(post))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _visible_message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
@@ -1290,7 +1300,9 @@ class LikesWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         self._finishStandardFeedInit()
 
     def onTabActivated(self):
-        self._render()
+        # Re-reads from the DB -- see notificationsWindow.py's
+        # onTabActivated for why _render() alone isn't enough.
+        self._loadFromCache(reset=True)
         if self._account is not None:
             # Translators: Announced when switching to this tab. {} is the tab name.
             nvdaUi.message(_("{} tab").format(self.TAB_NAME))

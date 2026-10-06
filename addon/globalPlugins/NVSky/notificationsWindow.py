@@ -1,10 +1,8 @@
 """
 Notifications tab for NVSky.
 
-Split out of feedWindow.py (see plan-17.md) -- structurally identical
-FeedListMixin host to FeedWindow/SavedWindow/ListsWindow, just backed
-by the `notifications` table instead of posts/feed_items, since a
-notification isn't shaped like a post.
+A FeedListMixin host backed by the `notifications` table (a notification
+isn't shaped like a post).
 """
 import wx
 
@@ -41,6 +39,8 @@ def _describe_notification(notif: dict) -> str:
         "mention": _("Mentioned you"),
         # Translators: Notification-type label.
         "quote": _("Quoted"),
+        # Translators: Notification-type label -- the bell-icon activity subscription feature (subscribed to someone's new posts).
+        "subscribed-post": _("New post"),
     # Translators: Fallback notification-type label when the reason is unrecognized.
     }.get(reason, reason or _("Notification"))
 
@@ -53,21 +53,16 @@ def _describe_notification(notif: dict) -> str:
 
 
 class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
+    """
+    Notifications: likes, reposts, follows, replies, mentions, quotes and
+    subscribed-account posts. Permanent tab; FeedListMixin over the
+    notifications table.
+    """
+
     TAB_KEY = "notifications"
     SUPPORTS_FOCUS_NEXT_UNREAD = True
     SUPPORTS_SELECT_ALL = True
-    TIME_COLUMN_INDEX = 2  # Author(0)/Notification(1)/Received(2) -- only 3 columns, not the usual 4
-
-    """
-    Notifications list -- likes, reposts, follows, replies, mentions,
-    quotes. Reuses FeedListMixin the same way FeedWindow does, but
-    backed by its own `notifications` table instead of posts/
-    feed_items, since a notification isn't shaped like a post.
-
-    Permanent tab embedded in MainWindow (same category as Home) --
-    no per-panel Close button/Escape/Ctrl+W handling, same as
-    FeedWindow's conversion.
-    """
+    TIME_COLUMN_INDEX = 2  # Author(0)/Notification(1)/Received(2): 3 columns, not the usual 4
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -98,10 +93,6 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
         actionRow.Add(self.userActionButton)
         sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
-        # Check for updates used to have its own button here -- now a
-        # toolbar-level button shared across every tab in MainWindow
-        # instead (see mainWindow.py). F5 still works as a keyboard
-        # shortcut while this tab has focus, via onCharHook below.
         self.statusBar = wx.StatusBar(self)
         sizer.Add(self.statusBar, flag=wx.EXPAND)
 
@@ -121,15 +112,15 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
             # Translators: Announced when opening a tab with no active account.
             nvdaUi.message(_("No active account. Log in from Settings first."))
         else:
-            # moveFocus=False -- see the matching comment in
-            # FeedWindow.__init__ for why (this panel gets constructed
-            # BEFORE MainWindow.addTab() adds it, so grabbing real
-            # focus here would steal it from whichever tab is actually
-            # meant to be visible).
+            # moveFocus=False: the panel isn't in the notebook yet (see _restoreFocusPosition).
             self._restoreFocusPosition(moveFocus=False)
 
     def onTabActivated(self):
-        self._render()
+        # Re-reads from the DB, not just re-renders in-memory state --
+        # a background sync may have updated this tab's data while it
+        # wasn't the active tab (see __init__.py's _onBgSyncCategoryDone,
+        # which only live-refreshes the currently-visible tab).
+        self._loadFromCache(reset=True)
         if self._account is not None:
             # Translators: Announced when switching to this tab. {} is the tab name.
             nvdaUi.message(_("{} tab").format(self.TAB_NAME))
@@ -151,6 +142,56 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
 
     def _markItemRead(self, notif):
         db.mark_notification_read(notif["uri"])
+
+    def _setMarkRead(self, post, read: bool):
+        # Mark as... acts on the focused notification, not on the post it is about.
+        notif = self._getFocusedPost()
+        if notif is None:
+            return
+        if read:
+            db.mark_notification_read(notif["uri"])
+            notif["is_read"] = 1
+            # Translators: Announced after marking a notification read.
+            message = _("Marked as read.")
+        else:
+            db.mark_notification_unread(notif["uri"])
+            notif["is_read"] = 0
+            # Translators: Announced after marking a notification unread.
+            message = _("Marked as unread.")
+        self._updateStatusBar()
+        _announce_now(message)
+
+    def onItemActivated(self, evt):
+        # Enter acts on the post the notification is about, not on the notification record.
+        notif = self._getFocusedPost()
+        if notif is None:
+            return
+        action = db.get_ui_state("enter_action") or "view_thread"
+        if action == "mark_read":
+            read = not notif.get("is_read")
+            if self.postList.GetSelectedItemCount() > 1:
+                self._markSelectedNotificationsRead(read)
+            else:
+                self._setMarkRead(None, read)
+            return
+        post = self._getActionablePost()
+        if post is None:
+            return
+        if action == "reply":
+            self._openReply(post)
+        elif action == "quote":
+            self._openQuote(post)
+        elif action == "repost":
+            self._toggleRepost(post)
+        elif action == "like":
+            self._togglePostLike(post)
+        else:
+            self._openThread(post)
+
+    def onDeletePostShortcut(self):
+        # Delete would otherwise target the post behind the notification.
+        # Translators: Announced when Delete is pressed on a notification.
+        nvdaUi.message(_("Delete doesn't apply to notifications. Use Post action (Alt+A) to manage the post."))
 
     def onUserAction(self, evt=None):
         notif = self._getFocusedPost()
@@ -224,12 +265,7 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
         return post
 
     def _showBulkPostActionMenu(self, selectedCount):
-        # Bulk reply/like/repost/etc. on several notifications' underlying
-        # posts still isn't coherent (that part stays single-item-only,
-        # via _getActionablePost above) -- but bulk mark read/unread IS
-        # meaningful: it marks the NOTIFICATIONS themselves, the same
-        # thing single-item read-tracking already does elsewhere in this
-        # tab, not their underlying posts.
+        # Only bulk mark read/unread (of the notifications themselves) makes sense here.
         menu = wx.Menu()
         markMenu = wx.Menu()
         # Translators: Bulk mark-read menu item. {} is the selected count.
@@ -257,9 +293,3 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
         # Translators: Announced after marking notifications read.
         # Translators: Announced after marking notifications unread.
         _announce_now(_("Marked as read.") if read else _("Marked as unread."))
-
-    # onCharHook is inherited from FeedListMixin (see SUPPORTS_* flags
-    # above). This also fixes a real bug: this class's old onCharHook
-    # never had the "Ctrl+F5 bubbles up to MainWindow" guard the other
-    # 4 tabs have, so Ctrl+F5 here was silently doing a single-tab F5
-    # sync instead of MainWindow.checkAllOpenTabs' full sweep.

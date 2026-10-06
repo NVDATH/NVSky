@@ -23,6 +23,7 @@ from . import client
 from . import uiutil
 from . import timeutils
 from . import soundpack
+from .compose import CONTENT_LABEL_DISPLAY_NAMES
 
 APP_PASSWORD_URL = "https://bsky.app/settings/app-passwords"
 STRFTIME_REFERENCE_URL = "https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes"
@@ -30,10 +31,14 @@ STRFTIME_REFERENCE_URL = "https://docs.python.org/3/library/datetime.html#strfti
 APP_PASSWORD_PATTERN = re.compile(r"^[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$", re.IGNORECASE)
 
 TIME_MODE_CHOICES = [
-    ("Relative (up to 24h, then full date/time)", "relative_24h"),
-    ("Relative always (minutes/hours/days/months/years ago)", "relative_always"),
-    ("Full date and time", "absolute"),
-    ("Custom format...", "custom"),
+    # Translators: Post time format choice.
+    (_("Relative (up to 24h, then full date/time)"), "relative_24h"),
+    # Translators: Post time format choice.
+    (_("Relative always (minutes/hours/days/months/years ago)"), "relative_always"),
+    # Translators: Post time format choice.
+    (_("Full date and time"), "absolute"),
+    # Translators: Post time format choice.
+    (_("Custom format..."), "custom"),
 ]
 
 
@@ -48,7 +53,8 @@ class _Task:
 
 class LoginDialog(wx.Dialog):
     def __init__(self, parent):
-        super().__init__(parent, title="Log in to Bluesky")
+        # Translators: Title of the login dialog.
+        super().__init__(parent, title=_("Log in to Bluesky"))
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -268,12 +274,18 @@ class AccountsPanel(wx.Panel):
 
 
 ENTER_ACTION_CHOICES = [
-    ("view_thread", "View thread"),
-    ("reply", "Reply"),
-    ("quote", "Quote post"),
-    ("repost", "Repost / Undo repost"),
-    ("like", "Like / Unlike"),
-    ("mark_read", "Toggle read/unread"),
+    # Translators: Enter-key action choice.
+    ("view_thread", _("View thread")),
+    # Translators: Enter-key action choice.
+    ("reply", _("Reply")),
+    # Translators: Enter-key action choice.
+    ("quote", _("Quote post")),
+    # Translators: Enter-key action choice.
+    ("repost", _("Repost / Undo repost")),
+    # Translators: Enter-key action choice.
+    ("like", _("Like / Unlike")),
+    # Translators: Enter-key action choice.
+    ("mark_read", _("Toggle read/unread")),
 ]
 
 BG_SYNC_CATEGORY_LABELS = [
@@ -337,6 +349,14 @@ SOUND_EVENT_LABELS = {
     "ready": _("Sync / loading finished"),
     # Translators: Sound event label.
     "max_length": _("Text exceeds the length limit"),
+    # Translators: Sound event label.
+    "embed_image": _("Post with an image focused"),
+    # Translators: Sound event label.
+    "embed_video": _("Post with a video focused"),
+    # Translators: Sound event label.
+    "embed_link": _("Post with a link preview focused"),
+    # Translators: Sound event label.
+    "embed_quote": _("Quote post focused"),
     # Translators: Sound event label.
     "content_warning": _("Content-warned post focused"),
     # Translators: Sound event label.
@@ -405,6 +425,31 @@ class GeneralPanel(wx.Panel):
             # Translators: Background sync category label (thread views).
             ("thread", _("&Thread")),
         ]
+        # Translators: Checkbox to enable real-time Home feed updates via Jetstream instead of waiting for scheduled polling.
+        self.jetstreamCheck = wx.CheckBox(self, label=_("Enable &real-time Home feed updates (Jetstream)"))
+        self.jetstreamCheck.SetValue(db.get_jetstream_enabled())
+        sizer.Add(self.jetstreamCheck, flag=wx.LEFT | wx.TOP, border=10)
+        jetstreamNote = wx.StaticText(
+            self,
+            # Translators: Explanatory note under the Jetstream checkbox.
+            label=_(
+                "Keeps a live connection open so new posts (and reposts) from people you "
+                "follow appear immediately in Home, and new posts from members of your own "
+                "lists appear immediately there too -- instead of waiting for their scheduled "
+                "checks below. Replaces Home's and Lists' own scheduled checks while enabled. "
+                "Uses a small amount of extra network/CPU continuously while NVSky is running."
+            ),
+        )
+        jetstreamNote.Wrap(500)
+        sizer.Add(jetstreamNote, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
+
+        self._homeRowLabel = None
+        self._homeRowSpin = None
+        self._homeRowItem = None
+        self._listRowLabel = None
+        self._listRowSpin = None
+        self._listRowItem = None
+
         for category, label in bgSyncFields:
             row = wx.BoxSizer(wx.HORIZONTAL)
             # Translators: Label for one background-sync-interval spin control. {} is the category name (e.g. "Home").
@@ -415,8 +460,16 @@ class GeneralPanel(wx.Panel):
             )
             row.Add(rowLabel, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
             row.Add(spin)
-            sizer.Add(row, flag=wx.LEFT | wx.TOP, border=10)
+            rowItem = sizer.Add(row, flag=wx.LEFT | wx.TOP, border=10)
             self._bgSyncSpins[category] = spin
+            if category == "home":
+                self._homeRowLabel = rowLabel
+                self._homeRowSpin = spin
+                self._homeRowItem = rowItem
+            elif category == "lists":
+                self._listRowLabel = rowLabel
+                self._listRowSpin = spin
+                self._listRowItem = rowItem
 
         # Translators: Label above the "clear all cache" section in Settings > General.
         cacheLabel = wx.StaticText(self, label=_("All cached data (active account):"))
@@ -438,6 +491,25 @@ class GeneralPanel(wx.Panel):
         self.SetSizer(sizer)
 
         self.clearCacheButton.Bind(wx.EVT_BUTTON, self.onClearCache)
+        self.jetstreamCheck.Bind(wx.EVT_CHECKBOX, self._onJetstreamCheckChanged)
+        self._onJetstreamCheckChanged(None)
+
+    def _onJetstreamCheckChanged(self, evt):
+        enabled = self.jetstreamCheck.GetValue()
+        if self._homeRowLabel is not None:
+            self._homeRowLabel.Show(not enabled)
+            self._homeRowSpin.Show(not enabled)
+            if self._homeRowItem:
+                self._homeRowItem.Show(not enabled)
+        if self._listRowLabel is not None:
+            self._listRowLabel.Show(not enabled)
+            self._listRowSpin.Show(not enabled)
+            if self._listRowItem:
+                self._listRowItem.Show(not enabled)
+
+        self.Layout()
+        if evt is not None:
+            evt.Skip()
 
     def onTabActivated(self):
         self.enterActionChoice.SetFocus()
@@ -448,6 +520,13 @@ class GeneralPanel(wx.Panel):
             db.set_bg_sync_interval(category, spin.GetValue())
         checkedCategories = {BG_SYNC_CATEGORY_LABELS[i][0] for i in self.bgSyncAnnounceList.CheckedItems}
         db.set_bg_sync_announce_categories(checkedCategories)
+
+        wasEnabled = db.get_jetstream_enabled()
+        nowEnabled = self.jetstreamCheck.GetValue()
+        db.set_jetstream_enabled(nowEnabled)
+        if nowEnabled != wasEnabled:
+            from . import set_jetstream_enabled_runtime
+            set_jetstream_enabled_runtime(nowEnabled)
 
     def onClearCache(self, evt):
         account = db.get_active_account()
@@ -542,6 +621,43 @@ class DisplayPanel(wx.Panel):
         self.tabsList.SetSelection(0)
         sizer.Add(self.tabsList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP | wx.BOTTOM, border=10)
 
+        # Translators: Checkbox to show an icon in the notification area whose tooltip is the Home unread count.
+        self.trayCheck = wx.CheckBox(self, label=_("Show an &icon in the notification area with the unread count"))
+        self.trayCheck.SetValue(db.get_tray_enabled())
+        sizer.Add(self.trayCheck, flag=wx.LEFT | wx.BOTTOM, border=10)
+
+        # Translators: Label above the checklist of tabs counted by the notification area icon.
+        self.trayCategoriesLabel = wx.StaticText(self, label=_("Count &unread items from these tabs in the icon:"))
+        sizer.Add(self.trayCategoriesLabel, flag=wx.LEFT, border=10)
+        self.trayCategoriesList = gui.nvdaControls.CustomCheckListBox(
+            self, choices=[label for _key, label in TRAY_CATEGORY_CHOICES]
+        )
+        trayWanted = db.get_tray_categories()
+        self.trayCategoriesList.CheckedItems = [
+            i for i, (key, _label) in enumerate(TRAY_CATEGORY_CHOICES) if key in trayWanted
+        ]
+        self.trayCategoriesList.SetSelection(0)
+        sizer.Add(self.trayCategoriesList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
+
+        # Translators: Label of the dropdown choosing how the notification area icon words its unread counts.
+        self.trayTextLabel = wx.StaticText(self, label=_("Icon te&xt:"))
+        sizer.Add(self.trayTextLabel, flag=wx.LEFT, border=10)
+        self.trayTextChoice = wx.Choice(self, choices=[
+            # Translators: Icon text choice: one total across the chosen tabs, e.g. "NVSky: 5 unread".
+            _("Total unread count"),
+            # Translators: Icon text choice: each tab's count with its name, e.g. "NVSky: Home 3, Noti 2".
+            _("Unread count of each tab, with tab names"),
+        ])
+        self.trayTextChoice.SetSelection(1 if db.get_tray_per_tab() else 0)
+        sizer.Add(self.trayTextChoice, flag=wx.LEFT | wx.BOTTOM, border=10)
+
+        # Translators: Button that opens Windows' taskbar settings, where NVDA's notification area icons can be shown.
+        self.taskbarButton = wx.Button(self, label=_("Open &Windows taskbar settings..."))
+        sizer.Add(self.taskbarButton, flag=wx.LEFT | wx.BOTTOM, border=10)
+        self.taskbarButton.Bind(wx.EVT_BUTTON, lambda e: os.startfile("ms-settings:taskbar"))
+        self.trayCheck.Bind(wx.EVT_CHECKBOX, self._onTrayCheckChanged)
+        self._onTrayCheckChanged(None)
+
         contentLabelNote = wx.StaticText(
             self,
             # Translators: Explanatory note above the content-label visibility list.
@@ -623,6 +739,18 @@ class DisplayPanel(wx.Panel):
             self._notificationLoadedOnce = True
             self._loadNotificationPrefs()
 
+    def _onTrayCheckChanged(self, evt):
+        shown = self.trayCheck.GetValue()
+        for control in (
+            self.taskbarButton, self.trayCategoriesLabel, self.trayCategoriesList,
+            self.trayTextLabel, self.trayTextChoice,
+        ):
+            control.Show(shown)
+            control.Enable(shown)
+        self.Layout()
+        if evt is not None:
+            evt.Skip()
+
     def _updateCustomPatternState(self):
         isCustom = TIME_MODE_CHOICES[self.timeModeChoice.GetSelection()][1] == "custom"
         self.customPatternCtrl.Enable(isCustom)
@@ -648,6 +776,12 @@ class DisplayPanel(wx.Panel):
         if checkedTabs != db.get_enabled_tabs():
             db.set_enabled_tabs(checkedTabs)
             self.tabsChanged = True
+
+        db.set_tray_enabled(self.trayCheck.GetValue())
+        db.set_tray_categories({TRAY_CATEGORY_CHOICES[i][0] for i in self.trayCategoriesList.CheckedItems})
+        db.set_tray_per_tab(self.trayTextChoice.GetSelection() == 1)
+        from . import refresh_tray
+        refresh_tray()
 
     def pendingTasks(self):
         return self._contentLabelTasks() + self._notificationTasks()
@@ -1057,7 +1191,8 @@ class FeedManagerPanel(wx.Panel):
                 if uri not in removed:
                     client.set_feed_pinned(atprotoClient, uri, value)
             if orderedUris and not client.reorder_saved_feeds(atprotoClient, orderedUris):
-                raise RuntimeError("the feed list changed on the server; refresh and try again")
+                # Translators: Shown (after "Could not save: feeds:") when the feed list changed on the server meanwhile.
+                raise RuntimeError(_("the feed list changed on the server; refresh and try again"))
 
         def commit():
             self._baselineFeeds = [dict(f) for f in snapshot]
@@ -1133,7 +1268,9 @@ class FeedManagerPanel(wx.Panel):
             for i, feed in enumerate(self._feeds):
                 self.feedList.InsertItem(i, feed["display_name"])
                 self.feedList.SetItem(i, 1, f"@{feed['creator_handle']}" if feed["creator_handle"] else "")
-                self.feedList.SetItem(i, 2, "Yes" if feed["pinned"] else "No")
+                # Translators: Pinned column value in Settings > Feed manager (feed is pinned).
+                # Translators: Pinned column value in Settings > Feed manager (feed is not pinned).
+                self.feedList.SetItem(i, 2, _("Yes") if feed["pinned"] else _("No"))
 
             if not self._feeds:
                 index = None
@@ -1631,244 +1768,6 @@ class MutedWordsPanel(wx.Panel):
         return [_Task(_("muted words"), run, commit)]
 
 
-ACTOR_LIST_CATEGORY_KEYS = ["muted", "blocked"]
-
-
-class MutedBlockedActorsPanel(wx.Panel):
-    """
-    Settings > Muted users / Blocked users (one instance per category). The
-    list is re-fetched fresh on tab activation. "Undo checked" only stages the change:
-    checked users leave the list now and are unmuted/unblocked on OK/Apply.
-
-    A CustomCheckListBox with zero items raises a real wxAssertionError on
-    Windows, so it stays hidden whenever there is nothing to show and focus
-    falls back to the Refresh button.
-    """
-
-    def __init__(self, parent, category):
-        super().__init__(parent)
-        self._category = category  # "muted" or "blocked"
-        self._actors = []
-        self._pendingRemovals = {"muted": {}, "blocked": {}}  # category -> {did: actor}
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        # Translators: Initial status text while the user list loads.
-        self.statusLabel = wx.StaticText(self, label=_("Loading, please wait..."))
-        sizer.Add(self.statusLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
-
-        # Translators: Label above the users checklist.
-        self.listLabel = wx.StaticText(self, label=_("&Users (check to select several):"))
-        sizer.Add(self.listLabel, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
-        self.actorList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
-        sizer.Add(self.actorList, proportion=1, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-        self.listLabel.Hide()
-        self.actorList.Hide()
-
-        buttonRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to stage unmuting/unblocking the checked users. Relabeled per category.
-        self.removeButton = wx.Button(self, label=_("&Undo checked"))
-        # Translators: Button to refresh the user list.
-        self.refreshButton = wx.Button(self, label=_("&Refresh"))
-        buttonRow.Add(self.removeButton, flag=wx.RIGHT, border=5)
-        buttonRow.Add(self.refreshButton)
-        sizer.Add(buttonRow, flag=wx.LEFT | wx.TOP | wx.BOTTOM, border=10)
-
-        self.SetSizer(sizer)
-
-        self.removeButton.Hide()
-        self.removeButton.Disable()
-        self.refreshButton.Disable()
-
-        self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
-        self.refreshButton.Bind(wx.EVT_BUTTON, lambda e: self._load())
-
-        self._updateRemoveButtonLabel()
-
-    def _currentCategory(self):
-        return self._category
-
-    def _updateRemoveButtonLabel(self):
-        labels = {
-            # Translators: Button to unmute every checked user.
-            "muted": _("Un&mute checked"),
-            # Translators: Button to unblock every checked user.
-            "blocked": _("Unbloc&k checked"),
-        }
-        self.removeButton.SetLabel(labels[self._currentCategory()])
-
-    def onTabActivated(self):
-        if self._actors:
-            self.actorList.SetFocus()
-        else:
-            self.refreshButton.SetFocus()
-        self._load()
-
-    def reload(self):
-        # Account switched: pending edits belong to the old account, drop them.
-        self._pendingRemovals = {"muted": {}, "blocked": {}}
-        self._load()
-
-    def _isActiveTabPage(self):
-        parent = self.GetParent()
-        if not isinstance(parent, wx.Notebook):
-            return False
-        index = parent.GetSelection()
-        return index != wx.NOT_FOUND and parent.GetPage(index) is self
-
-    def _actorLabel(self, actor):
-        # Translators: Fallback shown for a user with no display name. Used as "@handle ({})".
-        return f'@{actor["handle"]} ({actor.get("display_name") or _("no display name")})'
-
-    def _categoryCountText(self, category, count):
-        texts = {
-            # Translators: Status text showing how many users are muted. {} is the count.
-            "muted": _("{} muted user(s).").format(count),
-            # Translators: Status text showing how many users are blocked. {} is the count.
-            "blocked": _("{} blocked user(s).").format(count),
-        }
-        return texts[category]
-
-    def _renderActors(self, target_index=None):
-        hasActors = bool(self._actors)
-        self.listLabel.Show(hasActors)
-        self.actorList.Show(hasActors)
-        self.removeButton.Show(hasActors)
-        self.removeButton.Enable(hasActors)
-
-        self.statusLabel.SetLabel(self._categoryCountText(self._currentCategory(), len(self._actors)))
-
-        if not hasActors:
-            self.actorList.Set([])
-            self.Layout()
-            return
-
-        previousSelection = self.actorList.GetSelection()
-        self.actorList.Set([self._actorLabel(a) for a in self._actors])
-        self.actorList.CheckedItems = []
-        if target_index is not None:
-            index = max(0, min(target_index, len(self._actors) - 1))
-        elif previousSelection != wx.NOT_FOUND and previousSelection < len(self._actors):
-            index = previousSelection
-        else:
-            index = 0
-        self.actorList.SetSelection(index)
-        self.Layout()
-
-    def _load(self):
-        # Translators: Status text while the user list loads.
-        self.statusLabel.SetLabel(_("Loading, please wait..."))
-        self.removeButton.Disable()
-        self.refreshButton.Disable()
-        soundpack.start_progress()
-        category = self._currentCategory()
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                if category == "muted":
-                    actors = client.get_muted_actors(atprotoClient)
-                else:
-                    actors = client.get_blocked_actors(atprotoClient)
-                error = None
-            except Exception as e:
-                actors = None
-                error = str(e)
-            wx.CallAfter(self._onLoaded, category, actors, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @uiutil.safe_ui_callback(check_app_closing=False)
-    def _onLoaded(self, category, actors, error):
-        soundpack.stop_progress()
-        if category != self._currentCategory():
-            return  # user already switched categories again -- stale result
-        if error:
-            labels = {
-                # Translators: Status text when loading muted users fails. {} is the error message.
-                "muted": _("Could not load muted users: {}").format(error),
-                # Translators: Status text when loading blocked users fails. {} is the error message.
-                "blocked": _("Could not load blocked users: {}").format(error),
-            }
-            self.statusLabel.SetLabel(labels[category])
-            self.refreshButton.Enable()
-            return
-        pending = self._pendingRemovals[category]
-        self._actors = [a for a in (actors or []) if a["did"] not in pending]
-        self._renderActors(target_index=0)
-        self.removeButton.Enable(bool(self._actors))
-        self.refreshButton.Enable()
-        if self._isActiveTabPage():
-            if self._actors:
-                self.actorList.SetFocus()
-            else:
-                self.refreshButton.SetFocus()
-
-    def onRemove(self, evt):
-        indices = list(self.actorList.CheckedItems)
-        if not self._actors or not indices:
-            # Translators: Spoken when trying to undo relationships with nothing checked.
-            nvdaUi.message(_("No users checked."))
-            return
-        staged = [self._actors[i] for i in indices if 0 <= i < len(self._actors)]
-        if not staged:
-            return
-        category = self._currentCategory()
-        for actor in staged:
-            self._pendingRemovals[category][actor["did"]] = actor
-        stagedDids = {a["did"] for a in staged}
-        self._actors = [a for a in self._actors if a["did"] not in stagedDids]
-        self._renderActors()
-        if self._actors:
-            self.actorList.SetFocus()
-        else:
-            self.refreshButton.SetFocus()
-        doneTexts = {
-            # Translators: Announced after staging users to unmute. {} is the count.
-            "muted": _("{} user(s) will be unmuted when you press OK or Apply.").format(len(staged)),
-            # Translators: Announced after staging users to unblock. {} is the count.
-            "blocked": _("{} user(s) will be unblocked when you press OK or Apply.").format(len(staged)),
-        }
-        nvdaUi.message(doneTexts[category])
-
-    def _actorTask(self, category, actor):
-        def run(atprotoClient):
-            if category == "muted":
-                client.unmute_actor(atprotoClient, actor["did"])
-            else:
-                blockingUri = actor.get("blocking_uri")
-                if not blockingUri:
-                    raise RuntimeError("no block record uri cached for this user")
-                client.unblock_actor(atprotoClient, blockingUri)
-
-        def commit():
-            self._pendingRemovals[category].pop(actor["did"], None)
-            if category == "muted":
-                db.set_author_muted(actor["did"], False)
-            else:
-                db.set_author_blocking(actor["did"], None)
-
-        return _Task(f'@{actor["handle"]}', run, commit)
-
-    def pendingTasks(self):
-        tasks = []
-        for category in ACTOR_LIST_CATEGORY_KEYS:
-            for actor in list(self._pendingRemovals[category].values()):
-                tasks.append(self._actorTask(category, actor))
-        return tasks
-
-
-CONTENT_LABEL_DISPLAY_NAMES = {
-    # Translators: Content label display name.
-    "porn": _("Pornography"),
-    # Translators: Content label display name.
-    "sexual": _("Sexually suggestive"),
-    # Translators: Content label display name.
-    "nudity": _("Nudity"),
-    # Translators: Content label display name.
-    "graphic-media": _("Graphic media"),
-}
-
 OPTIONAL_TAB_CHOICES = [
     # Translators: Tab name in the Settings > Display tabs checklist.
     ("notifications", _("Notifications")),
@@ -1882,6 +1781,17 @@ OPTIONAL_TAB_CHOICES = [
     ("chat", _("Chat")),
     # Translators: Tab name in the Settings > Display tabs checklist.
     ("lists", _("Lists")),
+    # Translators: Tab name in the Settings > Display tabs checklist.
+    ("people", _("People")),
+]
+
+TRAY_CATEGORY_CHOICES = [
+    # Translators: Tab name in the notification area icon's checklist in Settings > Display.
+    ("home", _("Home")),
+    # Translators: Tab name in the notification area icon's checklist in Settings > Display.
+    ("notifications", _("Notifications")),
+    # Translators: Tab name in the notification area icon's checklist in Settings > Display.
+    ("chat", _("Chat")),
 ]
 
 CONTENT_LABEL_VISIBILITY_CHOICES = [
@@ -1985,8 +1895,6 @@ class NVSkySettingsDialog(wx.Dialog):
         self.soundPanel = SoundPanel(self.notebook)
         self.profilePanel = ProfilePanel(self.notebook)
         self.mutedWordsPanel = MutedWordsPanel(self.notebook)
-        self.mutedUsersPanel = MutedBlockedActorsPanel(self.notebook, "muted")
-        self.blockedUsersPanel = MutedBlockedActorsPanel(self.notebook, "blocked")
 
         # Translators: Settings dialog tab name (accounts management).
         self.notebook.AddPage(self.accountsPanel, _("Accounts"))
@@ -2002,10 +1910,6 @@ class NVSkySettingsDialog(wx.Dialog):
         self.notebook.AddPage(self.profilePanel, _("Profile"))
         # Translators: Settings dialog tab name (muted words/tags management).
         self.notebook.AddPage(self.mutedWordsPanel, _("Muted words"))
-        # Translators: Settings dialog tab name (muted user accounts management).
-        self.notebook.AddPage(self.mutedUsersPanel, _("Muted users"))
-        # Translators: Settings dialog tab name (blocked user accounts management).
-        self.notebook.AddPage(self.blockedUsersPanel, _("Blocked users"))
 
         self.okBtn.Bind(wx.EVT_BUTTON, self.onOk)
         self.cancelBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
@@ -2036,8 +1940,6 @@ class NVSkySettingsDialog(wx.Dialog):
         self.profilePanel.reload()
         self.mutedWordsPanel.reload()
         self.feedManagerPanel.reload()
-        self.mutedUsersPanel.reload()
-        self.blockedUsersPanel.reload()
         self.displayPanel.reloadContentLabels()
         self.displayPanel.reloadNotificationPrefs()
         if self._onAccountChangedExternal:

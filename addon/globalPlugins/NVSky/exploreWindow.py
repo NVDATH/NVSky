@@ -1,11 +1,9 @@
 """
 Explore tab and starter-pack details dialog for NVSky.
 
-Split out of feedWindow.py (see plan-17.md). Posts result type reuses
-FeedListMixin fully; People/Starter packs/Feeds are simpler dedicated
-lists swapped in via Show/Hide.
+Posts results reuse FeedListMixin; People/Starter packs/Feeds are simpler
+dedicated lists swapped in via Show/Hide.
 """
-import threading
 import webbrowser
 import wx
 
@@ -112,14 +110,10 @@ class StarterPackDetailsDialog(wx.Dialog):
 
 
 class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMixin, EmbedViewMixin, wx.Panel):
-    """Posts result type reuses FeedListMixin fully (search results
-    hydrated into the same posts cache via client.search_posts_hydrated,
-    same as notifications' resolve_posts -- Post action/React/Reply/
-    View thread all just work). People/Starter packs/Feeds are simpler
-    dedicated lists swapped in via Show/Hide, People reusing
-    UserActionMixin's menu the same way ManageGroupMembersDialog does.
-    _dbGetPage/_syncPage are unused stubs -- this never goes through
-    FeedListMixin's cache/pagination path, only _runSearch below."""
+    """Posts results go through FeedListMixin, cached under a synthetic
+    feed_key via client.sync_search_page, so Post action/Reply/View thread
+    work as elsewhere. People/Starter packs/Feeds are simpler lists swapped
+    in via Show/Hide; People reuses UserActionMixin's menu."""
 
     TAB_KEY = "explore"
     SUPPORTS_SELECT_ALL = True
@@ -154,7 +148,8 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         super().__init__(parent)
 
         self._account = db.get_active_account()
-        self.TAB_NAME = "Explore"
+        # Translators: Permanent tab label for Explore.
+        self.TAB_NAME = _("Explore")
         self._feedKey = "explore"
         self._tracksUnread = False
         self._initFeedListState()
@@ -181,23 +176,9 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         )
         sizer.Add(self.typeRadio, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
-        # LOW CONFIDENCE -- since/until/author/lang params never tested
-        # against a real server, recalled from general lexicon
-        # knowledge not a debug_dump. Only used for Posts.
-        # wx.CollapsiblePane instead of a checkbox -- it doesn't
-        # support native mnemonic dispatch, so the & in the label is
-        # cosmetic only; real Alt+V activation is wired up via a
-        # manual AcceleratorTable below (see onToggleAdvancedAccel).
-        # State text ("expanded"/"collapsed") is written into the
-        # label by hand rather than relying on any automatic
-        # accessible-state announcement.
-        # Plain wx.Button + wx.Panel instead of wx.CollapsiblePane --
-        # CollapsiblePane's internal child structure fires TWO
-        # accessibility events on Windows (its own UIA wrapper plus the
-        # underlying native disclosure triangle), which reads the
-        # label twice the first time focus lands on it -- confirmed
-        # unfixable from the wx/app side (see plan-13.md follow-up). A
-        # plain Button is a single atomic control and never has this.
+        # Advanced search (Posts only): a plain Button + Panel, not
+        # CollapsiblePane, whose children make NVDA read the label twice.
+        # State is written into the label by hand; Alt+V is an accelerator below.
         self.advBtn = wx.Button(self, label="")
         sizer.Add(self.advBtn, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
@@ -297,10 +278,10 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
     def _setAdvExpanded(self, expanded, layout=True):
         self._advExpanded = expanded
         self.advPanel.Show(expanded)
-        # Translators: Advanced-search toggle button label, showing its current state. {} is "expanded" or "collapsed".
-        # Translators: State word used in "Advanced search ({})".
-        # Translators: State word used in "Advanced search ({})".
+        # Translators: State word in the "Advanced search ({})" button label (panel open).
+        # Translators: State word in the "Advanced search ({})" button label (panel closed).
         status = _("expanded") if expanded else _("collapsed")
+        # Translators: Advanced-search toggle button label, showing its current state. {} is "expanded" or "collapsed".
         self.advBtn.SetLabel(_("Ad&vanced search ({})").format(status))
         if layout:
             self.Layout()
@@ -329,6 +310,10 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         # only the very first ever call goes to the search box.
         super()._restoreFocusPosition(moveFocus=moveFocus)
 
+    @uiutil.safe_ui_callback
+    def _focusWhenEmpty(self):
+        self.searchText.SetFocus()
+
     def onTabActivated(self):
         # Translators: Announced when switching to this tab. {} is the tab name.
         nvdaUi.message(_("{} tab").format(self.TAB_NAME))
@@ -344,7 +329,7 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         # Translators: Announced when clearing cache in Explore, which has nothing persistent to clear.
         nvdaUi.message(_("Nothing to clear here."))
 
-    # ---------------- FeedListMixin contract -- unused, search bypasses the cache path ----------------
+    # ---------------- FeedListMixin contract (Posts search results) ----------------
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         if not self._feedKey:
@@ -357,13 +342,8 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         return db.get_unread_count(self._account["id"], self._feedKey)
 
     def _syncPage(self, atprotoClient, cursor, limit):
-        # NOTE: guard on _sourceQuery, not _feedKey -- _feedKey is set
-        # to a fixed "explore" placeholder from __init__ (so
-        # _dbGetPage works before any search), so it's always truthy
-        # and never actually guards anything here. _sourceQuery is the
-        # real "has a Posts search actually run yet" signal; without
-        # this guard, Ctrl+F5's checkAllOpenTabs hit this on every
-        # untouched Explore tab and called search_posts(q=None).
+        # Guard on _sourceQuery: _feedKey is a truthy placeholder before any
+        # search, and Ctrl+F5 would call search_posts(q=None).
         if not self._sourceQuery:
             return None
         return client.sync_search_page(
@@ -374,14 +354,6 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
 
     def _markItemRead(self, post):
         db.mark_post_read(post["uri"])
-
-    def _getSelectedPosts(self):
-        indices = []
-        i = self.postList.GetFirstSelected()
-        while i != -1:
-            indices.append(i)
-            i = self.postList.GetNextSelected(i)
-        return [self._posts[i] for i in indices if 0 <= i < len(self._posts)]
 
     def _render(self):
         super()._render()
@@ -406,14 +378,8 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         return self.RESULT_TYPE_KEYS[self.typeRadio.GetSelection()]
 
     def onCharHook(self, evt):
-        # Alt+A/Alt+U for non-Posts result types needs to route to
-        # onResultAction/onPeopleContextMenu instead of the generic
-        # ItemActionMixin.onCharHook's onPostAction()/onUserAction() --
-        # those act on self.postList's focused post regardless of
-        # which result list actually has focus, so Alt+A on a stale
-        # Posts search's leftover focused post was firing instead of
-        # the Feeds/Starter packs/People action shown on the "Action..."
-        # button's own label. Posts stays on the normal mixin path.
+        # For non-Posts result types the mixin's handlers would act on a stale
+        # postList; route Alt+A/Alt+U/Alt+number/Shift+F5 to the active list.
         if self._currentType() != "posts":
             keyCode = evt.GetKeyCode()
             if evt.AltDown() and keyCode == ord("A"):
@@ -422,14 +388,6 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
             if evt.AltDown() and keyCode == ord("U") and self._currentType() == "people":
                 self.onResultAction()
                 return
-            # Alt+1-9 (announce Nth newest post) and Shift+F5 (fetch
-            # older posts) both read/act on self._posts unconditionally
-            # in the generic ItemActionMixin handler below, same class
-            # of bug Alt+A had -- self._posts is Posts-search-only here,
-            # so these would announce a stale/empty post instead of
-            # doing anything meaningful for People/Starter packs/Feeds
-            # results. Space and Ctrl+A don't need the same treatment,
-            # they already guard on self.FindFocus() is self.postList.
             if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
                 self._announceNthResult(keyCode - ord("0"))
                 return
@@ -526,11 +484,7 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
                 "lang": self.advLangText.GetValue().strip() or None,
             }
             self._feedKey = _search_feed_key(query, self._filters)
-            # onCheckForUpdates (not _loadFromCache directly) is what
-            # actually calls _syncPage -- _loadFromCache alone only
-            # reads whatever's already cached under _feedKey, which is
-            # why a fresh query showed 0 and a repeated one silently
-            # showed stale results.
+            # Must go through the sync path; _loadFromCache alone shows only stale cache.
             super().onCheckForUpdates(None)
             return
 
@@ -723,9 +677,6 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
             "type": "search_preview", "key": panel._feedKey, "kind": "feed", "source_key": feedGen.uri,
             "name": name, "origin_key": "explore",
         })
-
-    def onPostAction(self, evt=None):
-        super().onPostAction(evt)
 
     def _openSearchInNewTab(self):
         if not self._feedKey or self._currentType() != "posts":

@@ -17,18 +17,9 @@ import wx
 import ui as nvdaUi
 from logHandler import log
 
-# Set True by MainWindow.onClose (feedWindow.py) right before it calls
-# Destroy(), reset back to False at the start of MainWindow.__init__
-# for the next time the user opens NVSky in the same NVDA session.
-# safe_ui_callback checks this FIRST, before even attempting to touch
-# any wx object -- catching RuntimeError("has been deleted") after the
-# fact only helps when the C++ object is already fully torn down;
-# during active teardown (window mid-destruction while a background
-# thread's wx.CallAfter callback lands) that same touch can apparently
-# reach a native crash instead of a clean Python exception (confirmed
-# by testing -- see plan-09.md). Skipping the attempt entirely during
-# shutdown avoids that window regardless of which failure mode a given
-# race would have hit.
+# Set True by MainWindow.onClose just before Destroy(), reset in
+# MainWindow.__init__. safe_ui_callback checks it first: touching a window
+# mid-teardown can crash natively instead of raising RuntimeError.
 app_closing = False
 
 
@@ -60,6 +51,14 @@ def copy_text_to_clipboard(text: str) -> bool:
     # Translators: Announced after Ctrl+C copies the focused row's text to the clipboard.
     nvdaUi.message(_("Copied."))
     return True
+
+
+def focus_check_updates_button(window):
+    """Fallback focus for a list that just lost its last row: a ListCtrl
+    that keeps focus with no rows makes NVDA report "unknown"."""
+    button = getattr(window.GetTopLevelParent(), "checkUpdatesButton", None)
+    if button is not None:
+        button.SetFocus()
 
 
 _jump_title = ""
@@ -210,34 +209,17 @@ def copy_focused_row(ctrl) -> bool:
 
 def single_line(text: str) -> str:
     """
-    Collapses embedded newlines into a plain space before handing text
-    to a wx.ListCtrl column. ListCtrl (SysListView32 underneath on
-    Windows) is single-line-per-cell -- confirmed via testing that a
-    long multi-paragraph message displays/reads truncated in a column
-    even though the full text is intact both in memory and in the DB
-    (copying the raw text straight from the message/post dict comes
-    out complete) -- only the ListCtrl's own copy was short. Collapsing
-    the newlines is the fix being tried first since it's cheap to test;
-    if a message with no embedded newlines still truncates at the same
-    length, this isn't the (whole) story and a real per-cell character
-    limit is the next thing to check.
+    Collapses newlines to spaces: ListCtrl cells are single-line. (A
+    separate ~511-char cell limit exists; see chatWindow's column split.)
     """
     return text.replace("\r\n", " ").replace("\n", " ")
 
 
 def move_focus_and_check_announce(list_ctrl, index: int) -> bool:
     """
-    Moves a ListCtrl's real focused-item position to `index`
-    (Focus/Select/EnsureVisible) and returns True if the caller needs
-    to announce that row itself.
-
-    A ListCtrl only fires an accessible focus event (which NVDA
-    announces automatically) when BOTH (a) the control already has
-    real OS focus and (b) the focused item is actually moving to a
-    different index -- so callers must announce explicitly whenever
-    either condition fails, or the row change goes unannounced
-    (control doesn't have real focus) or NVDA stays silent entirely
-    (same index repeated -- no state change, no event).
+    Moves focus to row `index` (Focus/Select/EnsureVisible); returns True
+    if the caller must announce the row itself. NVDA only announces
+    automatically when the control has real focus AND the index changes.
     """
     hadRealFocus = list_ctrl.HasFocus()
     previousIndex = list_ctrl.GetFocusedItem()
@@ -264,48 +246,21 @@ def move_focus_and_check_announce(list_ctrl, index: int) -> bool:
 
 def safe_ui_callback(func=None, *, check_app_closing=True):
     """
-    Decorator for methods that are the target of wx.CallAfter(...)
-    from a background worker thread (the self._onXxxDone pattern used
-    throughout feedWindow.py/chatWindow.py).
+    Decorator for methods used as wx.CallAfter targets from worker threads
+    (the self._onXxxDone pattern). By the time the callback runs, the target
+    window may be destroyed: this skips the call when app_closing is set and
+    turns RuntimeError("... has been deleted") into a logged no-op. Any other
+    exception propagates.
 
-    By the time the main-thread event loop actually runs a queued
-    CallAfter, the panel/window it targets may already have been
-    destroyed -- e.g. the user opened MainWindow and closed it again
-    before a background network call finished. Touching any wx
-    control on a destroyed window raises RuntimeError("wrapped C/C++
-    object of type X has been deleted"); this decorator catches
-    exactly that specific error and turns it into a silent no-op
-    instead of an unhandled exception (which previously force-
-    restarted NVDA -- see the ListsWindow._onSyncListsDone crash).
-
-    Only RuntimeErrors whose message contains "has been deleted" are
-    swallowed -- any other exception (including other RuntimeErrors)
-    still propagates normally, so this can't hide unrelated bugs.
-
-    check_app_closing=False (default True) opts a method OUT of the
-    app_closing early-check below. Confirmed via testing that the
-    default True was wrongly applied to dialogs with NO relationship
-    to MainWindow's lifecycle at all (LoginDialog, ProfilePanel,
-    MutedWordsPanel -- all opened from NVDA's own Settings dialog,
-    independent of whether MainWindow is even open): app_closing only
-    ever gets reset to False by MainWindow.__init__, so once MainWindow
-    had been closed and NOT reopened in the same NVDA session, EVERY
-    safe_ui_callback-wrapped method anywhere in the add-on silently
-    no-op'd forever, including totally unrelated ones -- e.g. login
-    completing successfully server-side but the dialog never noticing.
-    Use check_app_closing=False for anything not parented into
-    MainWindow's own tree.
-
-    TEMPORARY: logs every time this actually catches something, so we
-    can confirm in testing that this is the crash path being hit and
-    how often. Safe to remove the log.info call once confirmed stable
-    -- the try/except itself should stay permanently.
+    check_app_closing=False opts out of the app_closing check. Use it for
+    anything not parented into MainWindow (LoginDialog, Settings panels):
+    app_closing stays True after MainWindow closes until it reopens, which
+    would silently drop their callbacks.
     """
     def decorator(f):
         @functools.wraps(f)
         def wrapper(self, *args, **kwargs):
             if check_app_closing and app_closing:
-                log.info(f"NVSky: {f.__qualname__} skipped -- app is closing")
                 return None
             try:
                 return f(self, *args, **kwargs)
@@ -320,8 +275,6 @@ def safe_ui_callback(func=None, *, check_app_closing=True):
         return wrapper
 
     if func is not None:
-        # Bare @uiutil.safe_ui_callback usage (no parens) -- the
-        # existing 43+ call sites across the add-on all use this form,
-        # kept working unchanged with check_app_closing defaulting True.
+        # Bare @safe_ui_callback usage (no parentheses).
         return decorator(func)
     return decorator

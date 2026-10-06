@@ -9,8 +9,7 @@ so this deliberately does NOT go through the atproto client.
 
 Sending a file to Be My Eyes uses the same ShellExecute trick Explorer
 uses for "Open with" on a UWP app: targeting shell:appsFolder\\<AUMID>
-with the file path as the parameter. This is EXPERIMENTAL -- paste
-back the traceback if it doesn't behave as expected on your machine.
+with the file path as the parameter.
 """
 
 import ctypes
@@ -49,18 +48,14 @@ def cleanup_old_temp_files(max_age_seconds: int = 86400):
 
 def download_to_temp(url: str, suffix: str = "") -> str:
     """
-    Downloads `url` to a new temp file and returns its path, or raises.
-    Sends a browser-like User-Agent and a Referer pointing at bsky.app --
-    Bluesky's CDN appears to hotlink-protect and can return an HTML/JSON
-    error page instead of the real file for requests without a
-    same-site-looking Referer. Content-Type is checked against `suffix`
-    so that kind of error gets caught here with a clear message, instead
-    of failing downstream as a confusing "unknown image data format".
-
-    Logs status/content-type/size/first-bytes for every download --
-    TEMPORARY while chasing the image-download bug; safe to remove the
-    log.info line once it's confirmed fixed.
+    Downloads `url` to a temp file and returns its path, or raises. Sends a
+    browser-like User-Agent and a bsky.app Referer (the CDN can return an
+    error page without it); Content-Type is checked against `suffix` so that
+    surfaces here with a clear message. WebP is converted to PNG.
     """
+    if urllib.parse.urlparse(url).scheme.lower() not in ("http", "https"):
+        # Translators: Shown when a download address isn't http or https.
+        raise OSError(_("Only http and https addresses can be downloaded."))
     request = urllib.request.Request(
         url,
         headers={
@@ -75,11 +70,13 @@ def download_to_temp(url: str, suffix: str = "") -> str:
         data = response.read()
 
     if status >= 400:
-        raise OSError(f"Download failed: HTTP {status} ({len(data)} bytes)")
+        # Translators: Shown when a download fails. First {} is the HTTP status, second {} is the response size in bytes.
+        raise OSError(_("Download failed: HTTP {} ({} bytes)").format(status, len(data)))
 
     if suffix in (".jpg", ".jpeg", ".png", ".gif", ".webp") and not content_type.startswith("image/"):
         snippet = data[:200].decode("utf-8", errors="replace")
-        raise OSError(f"Expected an image, got Content-Type '{content_type}': {snippet}")
+        # Translators: Shown when a downloaded "image" isn't one. First {} is the Content-Type, second {} is the start of the response.
+        raise OSError(_("Expected an image, got Content-Type '{}': {}").format(content_type, snippet))
 
     # Force suffix to .webp if the server actually sent WebP (even if
     # the caller originally asked for .jpg).
@@ -115,7 +112,8 @@ def download_to_temp(url: str, suffix: str = "") -> str:
                 os.remove(path)
             except OSError:
                 pass
-            raise OSError(f"Could not convert WebP image for GUI display: {e}")
+            # Translators: Shown when a WebP image can't be converted for display. {} is the error message.
+            raise OSError(_("Could not convert WebP image for GUI display: {}").format(e))
 
     return path    
 
@@ -137,7 +135,8 @@ def download_video_playlist_to_temp(url: str) -> str:
         text = response.read().decode("utf-8", errors="replace")
 
     if status >= 400:
-        raise OSError(f"Download failed: HTTP {status}")
+        # Translators: Shown when a video playlist download fails. {} is the HTTP status.
+        raise OSError(_("Download failed: HTTP {}").format(status))
 
     rewritten_lines = []
     for line in text.splitlines():

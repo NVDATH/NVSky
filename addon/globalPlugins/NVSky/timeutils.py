@@ -8,39 +8,21 @@ timezone before displaying it -- relative text like "5 minutes ago"
 does NOT need this, since it's a time difference and is timezone
 independent either way.
 
-This also centralizes reading the user's Settings > Display time-format
-choice (relative_24h / relative_always / absolute / custom) so every
-list column -- posts, notifications, and chat messages -- honors it the
-same way. Previously chatWindow.py had its own crude string-slicing
-formatter that ignored both the timezone and this setting entirely.
-
-Used by feedWindow.py (posts/notifications) and chatWindow.py
-(messages). Do not duplicate this logic in either file again -- import
-from here.
+This also reads the user's Settings > Display time-format choice
+(relative_24h / relative_always / absolute / custom) so posts,
+notifications, and chat messages all honor it. Used by feedWindow.py and
+chatWindow.py; don't duplicate it there.
 """
 import datetime
 
-# In-memory cache for the Settings > Display time-format choice.
-# Read via db.get_ui_state() on every single row of every post/message
-# list before this -- confirmed (via NVDA log timing) to be the single
-# biggest contributor to the ~700-800ms MainWindow-open freeze, since
-# _format_post_time()/_format_time() are called once per rendered row
-# AND again every 60s via each tab's refresh timer. This setting only
-# ever changes when the user is actively sitting in Settings > Display
-# changing it, so caching it here and invalidating on save (see
-# invalidate_time_format_cache(), called from settings.py's
-# DisplayPanel.onChanged) is safe and avoids threading mode/pattern as
-# parameters through every render call site.
+# In-memory cache of the Settings > Display time-format choice: reading it
+# from the DB per rendered row was the biggest cost of the MainWindow-open
+# freeze. Invalidated on save (DisplayPanel.apply).
 _cache = None
 
 
 def current_mode_and_pattern(db_module):
-    """
-    Reads the user's Settings > Display time-format choice.
-    `db_module` is the caller's already-imported `db` module (passed in
-    rather than imported here to avoid a circular import between
-    timeutils/db). Cached in memory -- see module docstring above.
-    """
+    """Settings > Display time-format choice as (mode, custom_pattern); `db_module` is the caller's db module. Cached (see _cache)."""
     global _cache
     if _cache is None:
         mode = db_module.get_ui_state("time_format_mode") or "relative_24h"
@@ -50,9 +32,7 @@ def current_mode_and_pattern(db_module):
 
 
 def invalidate_time_format_cache():
-    """Call after writing time_format_mode/time_format_custom_pattern
-    to db (currently only settings.py's DisplayPanel.onChanged) so the
-    next read picks up the new value instead of the stale cache."""
+    """Call after writing time_format_mode/time_format_custom_pattern (DisplayPanel.apply)."""
     global _cache
     _cache = None
 
@@ -72,11 +52,7 @@ def format_timestamp(iso_timestamp: str, mode: str = "relative_24h", custom_patt
     now = datetime.datetime.now(datetime.timezone.utc)
     seconds = max((now - dt).total_seconds(), 0)
 
-    # Convert to the local system timezone for anything that prints an
-    # absolute point in time. astimezone() with no argument reads the
-    # OS's own local timezone directly -- no extra dependency (pytz /
-    # zoneinfo data) needed since this always runs on the user's own
-    # machine.
+    # Absolute times are shown in the OS's local timezone (astimezone() needs no extra dependency).
     dtLocal = dt.astimezone()
 
     if mode == "absolute":

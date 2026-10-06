@@ -47,8 +47,6 @@ CONTENT_LABEL_DISPLAY_NAMES = {
 POST_MAX_LENGTH = 300
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 1_000_000
-# Translators: File-type label in the attach-media file picker (before the extension list).
-IMAGE_WILDCARD = _("Image files") + " (*.jpg;*.jpeg;*.png;*.gif;*.webp)|*.jpg;*.jpeg;*.png;*.gif;*.webp"
 MEDIA_WILDCARD = (
     # Translators: File-type label in the attach-media file picker (before the extension list).
     _("Media files") + " (*.jpg;*.jpeg;*.png;*.gif;*.webp;*.mp4;*.mpeg;*.mpg;*.mov;*.webm)|"
@@ -78,14 +76,8 @@ class VideoUploadDialog(wx.Dialog):
         self.statusLabel = wx.StaticText(self, label="")
         sizer.Add(self.statusLabel, flag=wx.ALL | wx.EXPAND, border=10)
 
-        # Real percent IS available from getJobStatus's own "progress"
-        # field (confirmed via testing: goes 0 during
-        # JOB_STATE_ENCODING, then a real climbing number during
-        # JOB_STATE_UPLOADING, then 100 at JOB_STATE_COMPLETED) -- no
-        # pulsing/indeterminate mode needed. Starts at 0 and stays
-        # there during the plain "uploading" phase (before any poll
-        # has happened yet -- there's genuinely no percent for that
-        # part, the file send itself is one blocking call).
+        # getJobStatus "progress": 0 while encoding, climbing while uploading,
+        # 100 when done. Stays 0 during the initial file send (one blocking call).
         self.gauge = wx.Gauge(self, range=100, size=(320, 20))
         sizer.Add(self.gauge, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
@@ -116,14 +108,7 @@ class VideoUploadDialog(wx.Dialog):
     _BEEP_PITCHES = {0: 300, 1: 380, 2: 460, 3: 540, 4: 650, 5: 800, 6: 1000}
 
     def _onBeepTick(self, evt):
-        # Continuous beeping while waiting, same pattern as
-        # feedWindow.py's _startLoadingBeep/_onLoadingBeepTick -- a
-        # single one-shot beep at each state change doesn't tell the
-        # user anything is still happening during the long stretches
-        # between state changes, which is most of the wait. 6 distinct
-        # pitch levels (0-5) so each processing phase sounds clearly
-        # different from the last, giving a sense of forward progress
-        # even though the underlying percentages aren't reliable.
+        # Beeps while waiting (long gaps between state changes); pitch rises with each phase.
         pitch = self._BEEP_PITCHES[self._currentStep]
         tones.beep(pitch, 80)
 
@@ -143,25 +128,10 @@ class VideoUploadDialog(wx.Dialog):
             return
         self._cancelled.set()
         self._beepTimer.Stop()
-        # Close IMMEDIATELY -- previously waited for the background
-        # worker to notice cancellation (up to a full 3s poll
-        # interval), which felt like Cancel didn't respond at once.
-        # Confirmed no server-side "abort this video job" endpoint
-        # exists (LOW CONFIDENCE, no such lexicon method found) -- this
-        # is a client-side discard only. The worker thread keeps
-        # running in the background (a blocking network call can't be
-        # interrupted mid-flight) and will eventually call _onDone via
-        # wx.CallAfter, but _onDone checks self._cancelled first and
-        # simply discards whatever it got, even a fully successful
-        # blob -- the user asked to cancel, so nothing gets attached
-        # regardless of how far the upload/processing had gotten.
-        # No spoken "Cancelling..." needed either -- the user pressed
-        # Cancel themselves; focus returning to ComposeDialog already
-        # tells them it worked.
+        # Close at once (client-side discard; no server abort endpoint is
+        # known). The worker keeps running until its blocking call returns;
+        # _onDone then discards the result, even a successful blob.
         self.EndModal(wx.ID_CANCEL)
-        # Dialog closes once the worker notices and reports back (see
-        # _onDone) -- the upload POST can't be interrupted mid-flight,
-        # only the polling phase actually stops.
 
     def _startUpload(self):
         def onProgress(state, extra):
@@ -192,20 +162,10 @@ class VideoUploadDialog(wx.Dialog):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # state name -> (status phrase, beep step). Step climbs 0..4 across
-    # the known processing states; step 5 (highest pitch) is reserved
-    # for the final "attached" announcement in _onVideoLimitsChecked-
-    # adjacent code, not fired from here. Exact server semantics behind
-    # each state name aren't confirmed -- these labels are chosen to
-    # feel like clear forward progress to the user rather than to
-    # precisely mirror the backend's own processing pipeline.
-    # Step 0 is reserved for the dialog's OWN initial "Attaching..."
-    # text (set in __init__, before _startUpload even calls
-    # client.upload_video) -- the "uploading" state below, fired once
-    # the actual network send begins, is a genuinely later phase and
-    # needs its own step. Confirmed by testing: sharing step 0 between
-    # both made "Attaching..." and "Uploading..." sound identical even
-    # though the displayed text visibly changed between them.
+    # state name -> (status phrase, beep step). Step 0 is the dialog's own
+    # initial "Attaching..." text, steps 1-5 climb with the job states, and
+    # step 6 is the success beep in _onDone. Labels aim for a sense of
+    # progress, not an exact mirror of the server pipeline.
     _STATE_INFO = {
         # Translators: Video upload status. {name} is the file name.
         "uploading": (_("Uploading {name}..."), 1),
@@ -228,11 +188,8 @@ class VideoUploadDialog(wx.Dialog):
         if info is not None:
             phrase, step = info
         else:
-            # An unrecognized state (server added a new one, or a
-            # naming variant not seen during testing) -- never show the
-            # raw state string to the user, just a generic "still
-            # working on it" phrase with a mid-range beep, and log the
-            # real value so this can be added to _STATE_INFO later.
+            # Unknown state: show a generic phrase, never the raw string; log it
+            # so it can be added to _STATE_INFO.
             log.info(f"NVSky: unrecognized video job state {state!r} (percent={percent!r})")
             # Translators: Fallback video-upload status for an unrecognized server state. {name} is the file name.
             phrase, step = _("Processing {name}..."), self._FALLBACK_STEP
@@ -243,11 +200,7 @@ class VideoUploadDialog(wx.Dialog):
 
     @uiutil.safe_ui_callback(check_app_closing=False)
     def _onDone(self, blob, error):
-        # The dialog may already be gone by the time this fires (see
-        # onCancel -- it closes immediately, doesn't wait for this).
-        # If the user already cancelled, discard whatever came back --
-        # including a fully successful blob -- and don't touch the
-        # (possibly already-destroyed) dialog again.
+        # After a cancel the dialog is already gone: discard the result and don't touch it.
         if self._cancelled.is_set():
             return
         self._beepTimer.Stop()
@@ -399,11 +352,7 @@ class ComposeDialog(wx.Dialog):
                 suffix = _(" ({} picture attachments)").format(count)
             else:
                 suffix = ""
-        # BUG FIX: this used to always rebuild the title as "New post
-        # ...", overwriting the Reply/Quote title set in __init__ the
-        # moment the user typed a single character -- base is now
-        # recomputed from self._replyTo/self._quoteOf every time, same
-        # as __init__'s own initial title logic.
+        # Base title is recomputed each time so Reply/Quote titles survive typing.
         if self._replyTo:
             # Translators: Compose window title base while replying. {} is the handle being replied to.
             base = _("Reply to @{}").format(self._replyTo["handle"])
@@ -504,10 +453,7 @@ class ComposeDialog(wx.Dialog):
 
         if videoPaths:
             if imagePaths or self._attachments:
-                # A dialog, not just a status label -- this is a real
-                # decision point (which images to drop?), not a passive
-                # status update, and speech for a plain label can be
-                # gone before the user's caught up to what happened.
+                # A dialog, not a status label: this needs the user's attention.
                 wx.MessageBox(
                     # Translators: Shown when trying to attach a video alongside images. Images must be removed first.
                     _(
@@ -533,12 +479,23 @@ class ComposeDialog(wx.Dialog):
 
     def _attachImages(self, paths):
         addedCount = 0
-        oversizedNames = []
+        skippedNames = []
         for path in paths:
             size = os.path.getsize(path)
             if size > MAX_IMAGE_BYTES:
-                oversizedNames.append(os.path.basename(path))
-                continue
+                # Resizing happens at upload time (client._upload_blob_dict); just let it through.
+                confirmResize = wx.MessageBox(
+                    # Translators: Asks whether to auto-resize an oversized image. First {} is the file name, second {} is its size in MB.
+                    _("{} is {:.1f}MB, over Bluesky's 1MB image limit. "
+                      "Would you like NVSky to resize it automatically so it can be attached?").format(
+                        os.path.basename(path), size / 1_000_000),
+                    # Translators: Title of the image-too-large dialog.
+                    _("Image too large"), wx.YES_NO | wx.ICON_QUESTION, self,
+                )
+                if confirmResize != wx.YES:
+                    skippedNames.append(os.path.basename(path))
+                    continue
+
             if path.lower().endswith(".gif"):
                 # Translators: Announced when attaching a GIF, which Bluesky only shows as a static first frame.
                 nvdaUi.message(_("Note: Bluesky only shows the first frame of GIFs, not the animation."))
@@ -561,16 +518,16 @@ class ComposeDialog(wx.Dialog):
         if addedCount:
             # Translators: Announced after attaching one or more images. {} is the total attached so far.
             self.statusLabel.SetLabel(_("{} image(s) attached.").format(len(self._attachments)))
-        if oversizedNames:
-            names = ", ".join(oversizedNames)
-            if len(oversizedNames) == 1:
-                # Translators: Shown when a single attached image exceeds Bluesky's size limit. {} is the file name.
-                message = _("{} is over Bluesky's 1MB image limit -- compress and try again.").format(names)
+        if skippedNames:
+            names = ", ".join(skippedNames)
+            if len(skippedNames) == 1:
+                # Translators: Shown when the user declines to auto-resize a single oversized image. {} is the file name.
+                message = _("Skipped {} (over Bluesky's 1MB image limit).").format(names)
             else:
-                # Translators: Shown when several attached images exceed Bluesky's size limit. {} is a comma-separated list of file names.
-                message = _("{} are over Bluesky's 1MB image limit -- compress and try again.").format(names)
+                # Translators: Shown when the user declines to auto-resize several oversized images. {} is a comma-separated list of file names.
+                message = _("Skipped: {} (over Bluesky's 1MB image limit).").format(names)
             # Translators: Title of the image-too-large message box.
-            wx.MessageBox(message, _("Image too large"), wx.OK | wx.ICON_WARNING, self)
+            wx.MessageBox(message, _("Image too large"), wx.OK | wx.ICON_INFORMATION, self)
 
     def _startVideoUpload(self, video_path):
         validation = client.validate_video_file(video_path)
@@ -579,11 +536,7 @@ class ComposeDialog(wx.Dialog):
             wx.MessageBox(validation["message"], _("Can't attach video"), wx.OK | wx.ICON_WARNING, self)
             return
 
-        # Straight into the progress dialog -- no separate "checking
-        # limits" status text first. The limits check still happens
-        # (inside VideoUploadDialog's own worker, before the real
-        # upload starts) but the user doesn't need to see that as a
-        # distinct step; they just want pass/fail.
+        # The limits check runs inside VideoUploadDialog's worker, not as a separate step.
         self.attachButton.Disable()
         dlg = VideoUploadDialog(self, video_path)
         result = dlg.ShowModal()
@@ -658,10 +611,8 @@ class ComposeDialog(wx.Dialog):
             self.statusLabel.SetLabel(_("Post is too long ({}/{}).").format(length, POST_MAX_LENGTH))
             return
 
-        # Disable both buttons, not just Post -- disabling the focused
-        # button shifts focus to the next control, and an accidental extra
-        # keypress right after submitting shouldn't be able to hit Cancel
-        # while the post is in flight.
+        # Disable Cancel too: focus shifts when Post is disabled, and a stray
+        # key must not cancel an in-flight post.
         self.postButton.Disable()
         self.cancelButton.Disable()
         self.attachButton.Disable()
@@ -731,34 +682,16 @@ class ComposeDialog(wx.Dialog):
         soundpack.play("send_post")
         # Translators: Announced after a post is successfully published.
         nvdaUi.message(_("Posted successfully."))
-        # Delay the actual close instead of delaying whatever happens
-        # after -- Close() is what jumps focus back to the parent window
-        # and triggers NVDA to announce it, cutting off the message above.
-        # Buttons are already disabled, so staying open silently for a
+        # Delay Close(): it returns focus to the parent and NVDA would cut off the message above.
         wx.CallLater(1000, self.Close)
-        # moment longer doesn't let anything unwanted happen.
 
     def _insertOptimisticPost(self, createdPost, video=None):
         """
-        Best-effort local insert of the just-created post into the Home
-        (Following) feed cache, then a quiet in-place re-render of an
-        already-open Home tab IF it's currently showing that feed --
-        never moves real focus. Fields the SDK's create_record response
-        doesn't give us client-side (like/repost counts, server-
-        processed image thumbnail URLs, video playlist URL) are left
-        blank/zero here; the next real sync (manual or background)
-        fills them in properly. Any failure here is silently swallowed
-        -- the post itself already succeeded server-side regardless of
-        whether this cosmetic step works.
-
-        video, if given, is self._video ({"blob", "path"}) -- confirmed
-        by testing that omitting embed_json entirely for a video post
-        left the row showing as empty text with no embed at all until
-        the next real sync/F5 corrected it.
-
-        self._selectedSelfLabels() is read directly here (not passed
-        in) since this is only ever called right after a successful
-        post, from the same checklist state onPost already read.
+        Best-effort insert of the just-created post into the Home cache,
+        then a quiet reload of an open Home tab (never moves focus).
+        Counts and server-processed media URLs stay blank until the next
+        sync. Failures are only logged: the post itself already succeeded.
+        video is self._video; without embed_json a video post showed as empty text.
         """
         try:
             account = db.get_active_account()
@@ -771,16 +704,7 @@ class ComposeDialog(wx.Dialog):
 
             embedData = None
             if video:
-                # No playlist/thumbnail URL available client-side yet
-                # (that's only known once the server finishes its own
-                # processing) -- $type alone is enough for
-                # _describe_embed() to correctly show "Video" instead
-                # of blank; "View embed" won't have a URL to open until
-                # a real sync replaces this row. alt text IS known
-                # immediately though (the user just typed it) -- was
-                # missing here even though self._video already carried
-                # it, a leftover gap from adding the alt-text prompt in
-                # a separate later patch.
+                # Only $type and alt are known client-side; "Embed..." has no URL until a sync replaces this row.
                 embedData = {"$type": "app.bsky.embed.video"}
                 if video.get("alt"):
                     embedData["alt"] = video["alt"]

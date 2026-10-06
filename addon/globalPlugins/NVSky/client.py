@@ -1,15 +1,14 @@
 """
 Bluesky (AT Protocol) client wrapper for NVSky.
 
-IMPORTANT: `atproto` is imported lazily inside functions, not at module
-load time, to keep NVDA startup fast (pydantic's import cost is slow).
+The atproto Client class is imported lazily inside functions to keep
+NVDA startup fast (pydantic's import cost is slow).
 
-Most write actions use low-level repo.create_record/delete_record with
-plain dict records instead of the SDK's typed Record models -- send_post()'s
-sibling image-embed helpers hit a known, still-open atproto SDK bug
-(MarshalX/atproto#354) with discriminated-union tags; plain dicts sidestep
-that model layer. Several are EXPERIMENTAL -- paste back the traceback if
-one errors.
+Record writes and several chat/preferences calls bypass the SDK's typed
+models (raw invoke_procedure/invoke_query, DotDict or plain JSON)
+because pydantic's discriminated-union handling is broken for them --
+see _create_record and send_message. Functions still marked LOW
+CONFIDENCE have not been exercised against a real server.
 """
 
 import json
@@ -48,7 +47,41 @@ def _normalize_handle(handle: str) -> str:
     return handle
 
 
+def _friendly_rate_limit_message(e: Exception):
+    """
+    Friendly message for a rate-limit error, or None if `e` isn't one.
+    Detects by exception class name (LOW CONFIDENCE: "RateLimitExceededError"
+    never seen on a real instance) or a plain HTTP 429. Uses the
+    RateLimit-Reset header for the wait time when present.
+    """
+    isNamedRateLimitError = type(e).__name__ == "RateLimitExceededError"
+    response = getattr(e, "response", None)
+    status = getattr(response, "status_code", None)
+    if not isNamedRateLimitError and status != 429:
+        return None
+
+    headers = getattr(response, "headers", None) or {}
+    resetHeader = headers.get("RateLimit-Reset") or headers.get("ratelimit-reset")
+    if resetHeader:
+        try:
+            resetTime = datetime.fromtimestamp(int(resetHeader), tz=timezone.utc)
+            waitSeconds = max(0, (resetTime - datetime.now(timezone.utc)).total_seconds())
+            waitMinutes = int(waitSeconds // 60) + (1 if waitSeconds % 60 else 0)
+            if waitMinutes <= 1:
+                # Translators: Shown when the server rate-limits the account.
+                return _("You're sending requests too quickly. Try again in about a minute.")
+            # Translators: Shown when the server rate-limits the account. {} is the number of minutes.
+            return _("You're sending requests too quickly. Try again in about {} minutes.").format(waitMinutes)
+        except (ValueError, TypeError, OSError):
+            pass
+    # Translators: Shown when the server rate-limits the account and no wait time is known.
+    return _("You're sending requests too quickly. Please wait a bit before trying again.")
+
+
 def _extract_error_message(e: Exception) -> str:
+    rateLimitMessage = _friendly_rate_limit_message(e)
+    if rateLimitMessage:
+        return rateLimitMessage
     content = getattr(e, "content", None)
     if content is None:
         response = getattr(e, "response", None)
@@ -86,9 +119,11 @@ def login(handle: str, app_password: str) -> dict:
     except Exception as e:
         message = _extract_error_message(e)
         log.error(f"NVSky: login failed for {normalized_handle}: {message}")
+        # Translators: Shown when login fails. First {} is the handle, second {} is the server's error message.
         raise LoginError(
-            f'Could not log in as "{normalized_handle}". '
-            f"Check your handle and App Password are correct. ({message})"
+            _('Could not log in as "{}". Check your handle and App Password are correct. ({})').format(
+                normalized_handle, message
+            )
         ) from e
 
     encrypted = crypto.encrypt(app_password)
@@ -98,7 +133,6 @@ def login(handle: str, app_password: str) -> dict:
     chatSupported = check_chat_supported(client)
     db.set_chat_supported(account_id, chatSupported)
 
-    log.info(f"NVSky: logged in as {profile.handle} (chat supported: {chatSupported})")
     return {"id": account_id, "handle": profile.handle, "did": profile.did, "chat_supported": chatSupported}
 
 
@@ -162,10 +196,9 @@ def _client_from_cached_session(account):
             raise RuntimeError("cached session belongs to another account")
         _remember_session(client, account)
         return client
-    except Exception as e:
+    except Exception:
         with _session_lock:
             _session_cache.pop(account["did"], None)
-        log.info(f"NVSky: cached session rejected, logging in fresh: {e}")
         return None
 
 
@@ -174,7 +207,8 @@ def get_client_for_active_account():
 
     account = db.get_active_account()
     if account is None:
-        raise LoginError("No active account is stored.")
+        # Translators: Shown when an action needs an account but none is stored.
+        raise LoginError(_("No active account is stored."))
 
     cachedClient = _client_from_cached_session(account)
     if cachedClient is not None:
@@ -182,12 +216,8 @@ def get_client_for_active_account():
 
     app_password = crypto.decrypt(account["encrypted_password"])
 
-    # LOW CONFIDENCE: reported WinError 10038 ("not a socket") here
-    # looked like a transient OS/network-layer glitch, not a real auth
-    # failure -- a fresh ATProtoClient() + one retry with a short pause
-    # resolved it in testing. Paste back the traceback if this keeps
-    # happening after the retry too; that would mean it's a real
-    # recurring problem, not a one-off blip.
+    # Retry once with a fresh client: a transient WinError 10038
+    # ("not a socket") was seen here and cleared on retry.
     lastError = None
     for attempt in range(2):
         client = ATProtoClient()
@@ -209,15 +239,8 @@ def get_client_for_active_account():
 
 def debug_dump(obj, label: str = "debug"):
     """
-    Ad-hoc dev tool: writes whatever the SDK actually returned to a
-    JSON file instead of guessing field names one log.info at a time
-    (confirmed repeatedly this session to waste rounds -- kind's real
-    shape, the group-name field, the never-found admin/role field, all
-    took multiple back-and-forth rounds each). Handles pydantic models,
-    plain dicts/lists/lists-of-models, and falls back to repr() for
-    anything it can't otherwise serialize. Files land in
-    globalPlugins/NVSky/debug_dumps/ -- open one and paste back
-    whatever's relevant instead of another log.info round.
+    Dev-only: writes what the SDK returned to debug_dumps/<label>_<time>.json.
+    No-op unless that folder exists (it is not shipped with releases).
     """
     import json
     import os
@@ -262,64 +285,27 @@ def _store_convo(convo, account_id: int, my_did: str, status: str):
         {"did": m.did, "handle": m.handle, "display_name": getattr(m, "display_name", None)}
         for m in convo.members if m.did != my_did
     ]
-    # LOW CONFIDENCE: no confirmed field on ConvoView that explicitly
-    # flags a group vs a 1:1 DM -- using "more than one other member"
-    # as a heuristic until a real listConvos/getConvo response for a
-    # group is seen (this project will generate one via the new
-    # create_group() below, so it'll get confirmed on first real test).
-    # Paste back the raw convo (repr) if a 1:1 ever misclassifies as a
-    # group or vice versa.
-    # CONFIRMED via testing: convo.kind is itself a nested
-    # discriminated-union object (chat.bsky.convo.defs#groupConvo or
-    # #directConvo), not a plain string -- a first attempt logging
-    # str(convo.kind) just dumped this whole nested object as text
-    # instead of the simple value expected. It carries is_group (via
-    # its own $type/py_type discriminator), the group's real name
-    # (kind.name), and lock state (kind.lock_status, 'locked' or
-    # 'unlocked') directly -- none of this was ever on the top-level
-    # convo object, which is why earlier attempts guessing convo.name
-    # and a plain convo.kind string both came back empty.
-    # kind.py_type/$type turned out to be a dead end -- getattr(kind,
-    # "py_type", ...) returns pydantic's FieldInfo schema metadata
-    # object, not the actual runtime discriminator string (confirmed:
-    # the logged value was literally "FieldInfo(annotation=NoneType,
-    # ..., default='chat.bsky.convo.defs#groupConvo', ...)", not a
-    # plain string), so comparing it with .endswith() never matched
-    # anything. Detecting by field presence instead: a real groupConvo
-    # instance carries name/lock_status/member_count/created_at (all
-    # confirmed present with real values in earlier testing); a real
-    # directConvo instance carries none of those extra fields at all.
+    # convo.kind is a nested union (groupConvo/directConvo) whose $type
+    # discriminator is unreliable in this SDK, and under 0.0.72 both
+    # subtypes' fields exist as attributes. Detect a group by the VALUE
+    # of lock_status (always "locked"/"unlocked" for a group, else None).
     kind = convo.kind
-    if kind is not None and hasattr(kind, "name") and hasattr(kind, "lock_status"):
+    lockStatus = getattr(kind, "lock_status", None) if kind is not None else None
+    if kind is not None and lockStatus is not None:
         isGroup = True
         groupName = getattr(kind, "name", None)
-        locked = getattr(kind, "lock_status", None) == "locked"
+        locked = lockStatus == "locked"
     elif kind is not None:
         isGroup = False
         groupName = None
         locked = False
     else:
-        log.info(f"NVSky: convo.kind was None for convo {getattr(convo, 'id', '?')}")
         isGroup = len(otherMembers) > 1
         groupName = None
         locked = False
 
-    # Gave up on GUESSING admin/owner via log.info -- see debug_dump()
-    # above. This dumps the full convo + kind + members ONE TIME (only
-    # when a group's own member list is still empty in the local DB,
-    # i.e. first time this exact convo is ever synced) so the real
-    # shape can be read directly out of the JSON file instead of
-    # another round of field-name guessing. Remove this call once
-    # admin/owner detection (if it turns out to exist at all) is
-    # confirmed and hardcoded.
-    # CONFIRMED via debug_dump: role lives on member.kind.role (kind
-    # here is chat.bsky.actor.defs#groupConvoMember, e.g.
-    # {"role": "owner", "added_by": null, ...}) -- a member-level
-    # nested object, distinct from the convo-level "kind" above
-    # (chat.bsky.convo.defs#groupConvo/#directConvo). Both direct
-    # member.role (first guess) and log.info-only field dumps (second
-    # attempt) missed this because it's one level deeper than either
-    # checked.
+    # Role lives on member.kind.role (chat.bsky.actor.defs#groupConvoMember),
+    # one level deeper than the convo-level kind above.
     isAdmin = False
     if isGroup:
         myMember = next((m for m in convo.members if m.did == my_did), None)
@@ -396,7 +382,7 @@ def _upsert_message_from_raw(account_id: int, convo_id: str, message: dict) -> b
         "convo_id": convo_id,
         "message_id": message.get("id"),
         "sender_did": sender.get("did"),
-        "text": message.get("text", ""),
+        "text": expand_link_facets(message.get("text", ""), message.get("facets")),
         "sent_at": message.get("sentAt"),
         "reply_to_message_id": replyTo.get("id"),
         "reply_to_text": replyTo.get("text"),
@@ -407,38 +393,21 @@ def _upsert_message_from_raw(account_id: int, convo_id: str, message: dict) -> b
 
 
 def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int = 0, limit: int = 100):
-    # Same SDK bug _fetch_thread_json above works around for View
-    # Thread -- pydantic can't resolve chat.bsky.convo.defs#messageView's
-    # discriminated union on some real responses ("Unable to extract tag
-    # using discriminator 'py_type' | 'pyType'"), even though the SDK's
-    # own model classes handle a $type-keyed dict fine in isolation --
-    # something in the strict response-parsing pipeline loses it.
-    # Bypass the typed Response model entirely and parse the raw JSON
-    # ourselves, same principle as _fetch_thread_json, just via an
-    # authenticated call since DMs aren't public data.
+    # Raw-JSON bypass: the typed dm.get_messages() fails on messageView's
+    # discriminated union (still broken under 0.0.72). Re-test only on a
+    # future atproto upgrade.
     params = models.ChatBskyConvoGetMessages.Params(convo_id=convo_id, limit=limit)
     response = dm._client.invoke_query(
         "chat.bsky.convo.getMessages", params=params, output_encoding="application/json"
     )
     rawMessages = response.content.get("messages", []) if isinstance(response.content, dict) else []
 
-    # Sound feedback for a genuinely NEW incoming message (someone
-    # else's, not our own optimistic row) -- compares against what was
-    # already cached before this sync writes anything, since
-    # upsert_message's own ON CONFLICT can't tell "new" from "already
-    # had this one" on its own.
+    # "New incoming" = not cached before this sync and not sent by us.
     existingIds = {
         m["message_id"] for m in db.get_messages_for_convo(account_id, convo_id)
     }
-    # BUG GUARD: an empty existingIds means this conversation has never
-    # been synced/cached before (first-ever open, or right after a
-    # cache clear) -- every message in rawMessages would then count as
-    # "new", which would fire the new_message sound once per historical
-    # message in a single burst instead of once for a real incoming
-    # message. Since this exact scenario is hard to trigger reliably in
-    # testing (see plan-18.md), this guard is defensive: skip the sound
-    # entirely on a convo's first-ever sync, even though every message
-    # loaded is technically "new" to the local cache.
+    # First-ever sync of a convo (or right after a cache clear): every
+    # message looks new, so skip the sound instead of playing a burst.
     isFirstSyncForConvo = not existingIds
     myDid = db.get_active_account()
     myDid = myDid["did"] if myDid else None
@@ -458,25 +427,17 @@ def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int =
     if hasNewIncoming:
         soundpack.play("new_message")
 
-    # Re-derive is_read for every cached message in this conversation
-    # from the server's own unread_count, instead of guessing per
-    # message at insert time (a prior attempt guessed by sender_did,
-    # which defaulted every already-read historical message back to
-    # unread -- see db.reconcile_message_read_state's docstring).
+    # is_read is re-derived from the server's unread_count, never guessed per message.
     db.reconcile_message_read_state(account_id, convo_id, unread_count)
+
+
 def sync_convos(client, account_id: int, my_did: str, limit: int = 50):
     """
-    EXPERIMENTAL -- first use of chat.bsky.convo.listConvos/getMessages
-    in NVSky, paste back the traceback if this errors (may also mean
-    the account has never used DMs in the official app -- see
-    get_chat_client()'s docstring above). Per the confirmed design,
-    this pulls BOTH the conversation list AND every conversation's full
-    message history in one pass -- expanding/selecting a conversation
-    in the UI must be instant from the local cache, never a per-select
-    network round-trip. Fetches "request" (message requests not yet
-    accepted) and "accepted" (normal open conversations) separately --
-    listConvos filters by exactly one status per call, there's no
-    "give me both" option.
+    Full sync: the conversation list AND every conversation's messages,
+    so selecting a conversation is instant from the local cache.
+    "request" and "accepted" are fetched separately (listConvos filters
+    by one status per call). Only the first `limit` per status -- no
+    pagination yet (listed under Known issues in the readme).
     """
     dm = get_chat_client(client).chat.bsky.convo
 
@@ -487,26 +448,14 @@ def sync_convos(client, account_id: int, my_did: str, limit: int = 50):
                 _store_convo(convo, account_id, my_did, status)
                 _sync_convo_messages(dm, convo.id, account_id, convo.unread_count or 0)
             except Exception as e:
-                # No raw object dump here anymore -- a transient server
-                # error (502 etc) doesn't need one, and dumping the full
-                # ConvoView repr (deeply nested, 30KB+) straight into
-                # log.info was blocking NVDA's shared log lock long
-                # enough to freeze speech/the whole session, confirmed
-                # via a real capture. This path fires far more often
-                # now that background sync calls sync_convos every
-                # couple of minutes instead of only on manual F5.
+                # Never dump the ConvoView repr here: 30KB+ log lines froze NVDA's speech.
                 log.error(f"NVSky: failed to sync a conversation: {e}")
+
+
 def get_convo(client, convo_id: str):
     """
-    Fetches a single conversation's current state via
-    chat.bsky.convo.getConvo -- unlike list_convos, this returns just
-    one ConvoView, letting sync_convo_messages get a FRESH unread_count
-    for this one conversation instead of reusing whatever sync_convos
-    last wrote (closes the LOW CONFIDENCE gap that used to be
-    documented here). Typed call -- list_convos already resolves this
-    same ConvoView type fine in _store_convo without needing a
-    raw-JSON bypass, so this should behave the same. Returns None if
-    the conversation doesn't exist or the call fails.
+    One conversation's current ConvoView (fresh unread_count, lock/name/
+    muted state), or None if it doesn't exist or the call fails.
     """
     dm = get_chat_client(client).chat.bsky.convo
     try:
@@ -1104,18 +1053,7 @@ def delete_message_for_self(client, convo_id: str, message_id: str):
 
 
 def sync_saved(client, account_id: int, cursor: str = None, limit: int = 50) -> str:
-    """
-    EXPERIMENTAL -- first use of app.bsky.bookmark.getBookmarks in
-    NVSky, paste back the traceback (or a print of the raw response
-    object) if this errors or nothing shows up. The exact response
-    shape wasn't confirmed against real data before writing this --
-    Bluesky's docs page for this endpoint doesn't render its schema in
-    a fetchable way, so this is inferred from the bookmark record's own
-    lexicon (subject + createdAt) and the general "*View" wrapper
-    pattern used everywhere else in this API. Tries both `.subject` and
-    `.item` as the field name holding the bookmarked post, since which
-    one the SDK actually uses wasn't confirmed either.
-    """
+    """Syncs one page of bookmarks (getBookmarks) into the "saved" feed."""
     resp = client.app.bsky.bookmark.get_bookmarks(params={"cursor": cursor, "limit": limit})
 
     for bookmark in resp.bookmarks:
@@ -1138,7 +1076,6 @@ def sync_saved(client, account_id: int, cursor: str = None, limit: int = 50) -> 
             db.upsert_feed_item(account_id, "saved", post.uri, createdAt)
         except Exception as e:
             log.error(f"NVSky: failed to store a bookmark: {e}")
-            log.info(f"NVSky: raw bookmark that failed = {bookmark!r}")
 
     return resp.cursor
 
@@ -1170,7 +1107,6 @@ def sync_timeline(client, account_id: int, cursor: str = None, limit: int = 50, 
             _store_feed_item(item, account_id, feed_key)
         except Exception as e:
             log.error(f"NVSky: failed to store a feed item: {e}")
-            log.info(f"NVSky: raw item that failed = {item!r}")
 
     return resp.cursor
 
@@ -1252,7 +1188,10 @@ def _extract_embed_info(post):
         else:
             _fill_media_info(info, embedView, embedType)
     except Exception as e:
-        log.info(f"NVSky: partial embed extraction failure for {post.uri}: {e}")
+        # embedType included since 0.0.72 -- helps pin down which
+        # embed variant's generated model has the broken field once
+        # this fires again.
+        log.info(f"NVSky: partial embed extraction failure for {post.uri} (embed type: {embedType}): {e}")
 
     return info
 
@@ -1290,11 +1229,58 @@ def _fill_media_info(info: dict, mediaView, mediaType: str):
 
 
 def _view_field(obj, name):
+    """
+    getattr(obj, name, None) alone isn't safe when `obj` turns out to
+    be a plain dict instead of a resolved model (a discriminated union
+    that failed to resolve to its typed class, e.g. some
+    app.bsky.embed.gallery items under 0.0.72) -- a name like "items"
+    then resolves to dict's own built-in .items() METHOD instead of
+    None, and callers iterating the "missing" result directly hit
+    'method' object is not iterable. Treat a callable result the same
+    as a missing one and fall through to the dict .get() path.
+    """
     value = getattr(obj, name, None)
-    if value is None:
+    if value is None or callable(value):
         getter = _dict_get(obj)
         value = getter(name) if getter is not None else None
     return value
+
+
+def expand_link_facets(text: str, facets) -> str:
+    """Replaces each link facet's visible text with its full URL. Official
+    clients store long URLs shortened ("example.com/pa...") in the text and
+    keep the real one only in the facet, which this add-on doesn't render.
+    Handles dict, namespace, and typed-model facets."""
+    if not text or not facets:
+        return text
+    try:
+        data = text.encode("utf-8")
+        edits = []
+        for facet in facets:
+            index = _view_field(facet, "index")
+            start = _view_field(index, "byteStart")
+            if start is None:
+                start = _view_field(index, "byte_start")
+            end = _view_field(index, "byteEnd")
+            if end is None:
+                end = _view_field(index, "byte_end")
+            uri = None
+            for feature in _view_field(facet, "features") or []:
+                uri = _view_field(feature, "uri")
+                if uri:
+                    break
+            if uri and isinstance(start, int) and isinstance(end, int) and 0 <= start < end <= len(data):
+                edits.append((start, end, uri))
+        previousStart = len(data)
+        for start, end, uri in sorted(edits, reverse=True):
+            if end > previousStart or data[start:end].decode("utf-8", errors="replace") == uri:
+                continue
+            data = data[:start] + uri.encode("utf-8") + data[end:]
+            previousStart = start
+        return data.decode("utf-8", errors="replace")
+    except Exception as e:
+        log.error(f"NVSky: expanding link facets failed: {e}")
+        return text
 
 
 def _store_feed_item(item, account_id: int, feed_key: str = "home"):
@@ -1311,6 +1297,7 @@ def _store_feed_item(item, account_id: int, feed_key: str = "home"):
         text = getattr(record, "text", "") or ""
         created_at = getattr(record, "created_at", None) or getattr(record, "createdAt", None)
         facets_data = None
+    text = expand_link_facets(text, _view_field(record, "facets"))
 
     authorViewer = getattr(author, "viewer", None)
     db.upsert_author(
@@ -1321,12 +1308,15 @@ def _store_feed_item(item, account_id: int, feed_key: str = "home"):
         viewer_following=getattr(authorViewer, "following", None) if authorViewer else None,
         viewer_muted=bool(getattr(authorViewer, "muted", False)) if authorViewer else False,
         viewer_blocking=getattr(authorViewer, "blocking", None) if authorViewer else None,
+        viewer_activity_subscription=getattr(authorViewer, "activity_subscription", None) is not None if authorViewer else False,
     )
 
-    is_repost = item.reason is not None
-    reposted_by_handle = item.reason.by.handle if is_repost else None
-    reposted_by_display_name = getattr(item.reason.by, "display_name", None) if is_repost else None
-    reposted_by_did = item.reason.by.did if is_repost else None
+    # ReasonPin (a pinned post in an author feed) has no "by"; only a repost does.
+    repostBy = getattr(item.reason, "by", None) if item.reason is not None else None
+    is_repost = repostBy is not None
+    reposted_by_handle = repostBy.handle if is_repost else None
+    reposted_by_display_name = getattr(repostBy, "display_name", None) if is_repost else None
+    reposted_by_did = repostBy.did if is_repost else None
     # A repost's position in the feed is when it was RE-posted, not when
     # the underlying post was originally created -- using post.indexed_at
     # for feed ordering made old posts that just got reposted sort (and
@@ -1334,6 +1324,51 @@ def _store_feed_item(item, account_id: int, feed_key: str = "home"):
     # whenever a repost was involved.
     feedIndexedAt = item.reason.indexed_at if is_repost else post.indexed_at
 
+    # posts/feed_items hold one row per uri, so another followed
+    # account's repost of the same post (listed AFTER ours in the
+    # timeline response) would overwrite our own repost framing.
+    # viewer.repost confirms server-side that we still repost it.
+    selfAccount = db.get_active_account()
+    if is_repost and selfAccount is not None and selfAccount["id"] == account_id and reposted_by_did != selfAccount["did"]:
+        postViewer = getattr(post, "viewer", None)
+        if postViewer is not None and getattr(postViewer, "repost", None):
+            existingSelf = db.get_post(post.uri)
+            if (
+                existingSelf is not None and existingSelf.get("is_repost")
+                and existingSelf.get("reposted_by_did") == selfAccount["did"]
+            ):
+                reposted_by_did = existingSelf["reposted_by_did"]
+                reposted_by_handle = existingSelf.get("reposted_by_handle")
+                reposted_by_display_name = existingSelf.get("reposted_by_display_name")
+                keptIndexedAt = db.get_feed_item_indexed_at(account_id, feed_key, post.uri)
+                if keptIndexedAt:
+                    feedIndexedAt = keptIndexedAt
+
+    if not is_repost:
+        # LOW CONFIDENCE: observed via testing that a manual/background
+        # sync's real getTimeline response for a post the active account
+        # itself just reposted (recorded via jetstream.py's real-time
+        # path) can come back with no `reason` at all -- silently
+        # clobbering the repost framing and sinking the entry to the
+        # ORIGINAL post's own, possibly much older, indexed_at. Explicit
+        # un-repost is handled entirely by itemActions.py's
+        # _toggleRepost/_onRepostDone, never by this generic sync path,
+        # so it's safe to preserve existing self-repost state here
+        # rather than let an incomplete API response erase it.
+        existingPost = db.get_post(post.uri)
+        account = db.get_active_account()
+        if (
+            existingPost is not None and existingPost.get("is_repost")
+            and account is not None and account["id"] == account_id
+            and existingPost.get("reposted_by_did") == account["did"]
+        ):
+            is_repost = True
+            reposted_by_did = existingPost["reposted_by_did"]
+            reposted_by_handle = existingPost.get("reposted_by_handle")
+            reposted_by_display_name = existingPost.get("reposted_by_display_name")
+            existingIndexedAt = db.get_feed_item_indexed_at(account_id, feed_key, post.uri)
+            if existingIndexedAt:
+                feedIndexedAt = existingIndexedAt
     reply = item.reply
     reply_parent_uri = reply.parent.uri if reply else None
     reply_to_author = getattr(getattr(reply, "parent", None), "author", None) if reply else None
@@ -1400,6 +1435,19 @@ def _store_resolved_post(post, account_id: int):
         text = getattr(record, "text", "") or ""
         created_at = getattr(record, "created_at", None) or getattr(record, "createdAt", None)
         facets_data = None
+    text = expand_link_facets(text, _view_field(record, "facets"))
+
+    replyParentUri = None
+    replyToDid = None
+    replyToHandle = None
+    replyRef = _view_field(record, "reply")
+    if replyRef is not None:
+        parentRef = _view_field(replyRef, "parent")
+        replyParentUri = _view_field(parentRef, "uri") if parentRef is not None else None
+        if replyParentUri:
+            replyToDid = replyParentUri.replace("at://", "").split("/")[0]
+            cachedParentAuthor = db.get_author(replyToDid)
+            replyToHandle = cachedParentAuthor["handle"] if cachedParentAuthor else None
 
     authorViewer = getattr(author, "viewer", None)
     db.upsert_author(
@@ -1410,6 +1458,7 @@ def _store_resolved_post(post, account_id: int):
         viewer_following=getattr(authorViewer, "following", None) if authorViewer else None,
         viewer_muted=bool(getattr(authorViewer, "muted", False)) if authorViewer else False,
         viewer_blocking=getattr(authorViewer, "blocking", None) if authorViewer else None,
+        viewer_activity_subscription=getattr(authorViewer, "activity_subscription", None) is not None if authorViewer else False,
     )
 
     viewer = getattr(post, "viewer", None)
@@ -1433,9 +1482,9 @@ def _store_resolved_post(post, account_id: int):
         "like_count": post.like_count or 0,
         "repost_count": post.repost_count or 0,
         "reply_count": post.reply_count or 0,
-        "reply_parent_uri": None,
-        "reply_to_did": None,
-        "reply_to_handle": None,
+        "reply_parent_uri": replyParentUri,
+        "reply_to_did": replyToDid,
+        "reply_to_handle": replyToHandle,
         "is_repost": 0,
         "reposted_by_did": None,
         "reposted_by_handle": None,
@@ -1452,48 +1501,19 @@ def _store_resolved_post(post, account_id: int):
     })
 
 
-def search_posts_hydrated(
-    client, account_id: int, query: str, sort: str = "latest", cursor: str = None, limit: int = 25,
-    author: str = None, since: str = None, until: str = None, lang: str = None,
-):
-    """Search + hydrate into the local posts cache via
-    _store_resolved_post (same helper resolve_posts uses for
-    notifications) -- Post action (Alt+A)/React/etc. then work on
-    search results exactly like any other post, no separate converter
-    needed. Returns (uris, cursor) -- caller reads db.get_post(uri) per
-    result to build display dicts. LOW CONFIDENCE: author/since/until/
-    lang param names recalled from lexicon knowledge, never tested."""
-    params = {"q": query, "sort": sort, "cursor": cursor, "limit": limit}
-    if author:
-        params["author"] = author
-    if since:
-        params["since"] = since
-    if until:
-        params["until"] = until
-    if lang:
-        params["lang"] = [lang]
-    response = client.app.bsky.feed.search_posts(params=params)
-    uris = []
-    for post in response.posts:
-        try:
-            _store_resolved_post(post, account_id)
-            uris.append(post.uri)
-        except Exception as e:
-            log.error(f"NVSky: failed to store a search result post: {e}")
-    return uris, response.cursor
-
-
 def follow_starter_pack_members(client, full) -> int:
-    """Follows every profile in list_items_sample. LOW CONFIDENCE on
-    field names (same as get_starter_pack_full). Returns count
-    actually followed; skips ones already followed (viewer.following set)."""
+    """Follows every profile in list_items_sample (a sample, possibly not
+    the whole pack) that the account doesn't follow yet. Compares against
+    the real follows list, since the sample's viewer state can't be trusted.
+    Returns the count followed."""
+    alreadyFollowing = {f["did"] for f in get_follows(client, client.me.did)}
     count = 0
     for item in getattr(full, "list_items_sample", None) or []:
-        subject = item.subject
-        viewer = getattr(subject, "viewer", None)
-        if viewer and getattr(viewer, "following", None):
+        did = item.subject.did
+        if did in alreadyFollowing:
             continue
-        client.app.bsky.graph.follow(data={"subject": subject.did})
+        follow_actor(client, did)
+        alreadyFollowing.add(did)
         count += 1
     return count
 
@@ -1539,26 +1559,9 @@ def sync_search_page(
 
 
 def get_starter_pack_full(client, uri: str):
-    """LOW CONFIDENCE -- graph.get_starter_pack never exercised. Guessed
-    input {starterPack: uri} matching the usual single-record-by-uri
-    param shape elsewhere."""
+    """Full starter pack view (creator, feeds, list_items_sample)."""
     response = client.app.bsky.graph.get_starter_pack(params={"starter_pack": uri})
     return response.starter_pack
-
-
-def get_feed_preview(client, account_id: int, feed_uri: str, limit: int = 30) -> list:
-    """One-shot fetch (no cursor loop, no local feed-membership row --
-    see FeedPreviewTabWindow's docstring) via app.bsky.feed.getFeed,
-    hydrated through the same _store_resolved_post path search results use."""
-    response = client.app.bsky.feed.get_feed(params={"feed": feed_uri, "limit": limit})
-    uris = []
-    for item in response.feed:
-        try:
-            _store_resolved_post(item.post, account_id)
-            uris.append(item.post.uri)
-        except Exception as e:
-            log.error(f"NVSky: failed to store a feed preview post: {e}")
-    return uris
 
 
 def search_actors(client, query: str, cursor: str = None, limit: int = 25):
@@ -1570,11 +1573,8 @@ def search_starter_packs(client, query: str, cursor: str = None, limit: int = 25
 
 
 def search_feeds(client, query: str, limit: int = 25):
-    """LOW CONFIDENCE -- no dedicated 'search feed generators' endpoint
-    in the SDK dump; get_popular_feed_generators is the closest match
-    and its "query" param is unconfirmed to actually filter by keyword
-    vs just being ignored (falling back to popular-only). Paste back
-    the result if search terms don't seem to affect what comes back."""
+    """Keyword feed search via get_popular_feed_generators (its "query"
+    param filters results; confirmed by testing)."""
     params = {"limit": limit}
     if query:
         params["query"] = query
@@ -1631,6 +1631,39 @@ class _RawJsonModel:
         return json.dumps(self._payload, ensure_ascii=False, separators=(",", ":"))
 
 
+def _pref_to_dict(pref):
+    """
+    Converts one entry from getPreferences() into a plain dict. Normal
+    case: a typed pydantic model, dumped via model_dump. Fallback:
+    the SDK sometimes can't resolve a preference into its typed model
+    (e.g. a contentLabelPref for a label value it doesn't recognize,
+    like a labeler-specific "hate" tag not in its known enum) and
+    hands back a raw DotDict instead -- CONFIRMED via a real
+    debug_dump that a DotDict's own .model_dump attribute resolves to
+    None instead of raising AttributeError (same bug class _dict_get's
+    docstring documents elsewhere), so calling it raises "'NoneType'
+    object is not callable" rather than failing cleanly. DotDict is
+    itself a dict subclass, so dict(pref) is already the right shape
+    once detected.
+    """
+    dumpMethod = getattr(pref, "model_dump", None)
+    if callable(dumpMethod):
+        return dumpMethod(mode="json", by_alias=True, exclude_none=True)
+    # DotDict fallback -- CONFIRMED via testing it is NOT a real dict
+    # subclass (isinstance(pref, dict) is False) despite looking like
+    # one in repr(); dict()/vars() below cover it without assuming its
+    # exact internal shape.
+    try:
+        return dict(pref)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return dict(vars(pref))
+    except TypeError:
+        pass
+    raise TypeError(f"Don't know how to convert preference of type {type(pref).__name__} to a dict")
+
+
 def _get_cleaned_preferences(client) -> list:
     """Fetches app.bsky.actor.getPreferences and returns it as a list
     of plain, FieldInfo-safe dicts. Every savedFeedsPrefV2 read/write
@@ -1660,7 +1693,7 @@ def _get_cleaned_preferences(client) -> list:
     prefs = []
     try:
         for pref in prefs_response.preferences:
-            dumped = pref.model_dump(mode="json", by_alias=True, exclude_none=True)
+            dumped = _pref_to_dict(pref)
             prefs.append(_clean_dumped(dumped))
     except Exception as e:
         log.error("NVSky: failed to serialize preferences: %s", e, exc_info=True)
@@ -1848,14 +1881,9 @@ def get_feed_generators_info(client, uris: list) -> dict:
 
     
 def resolve_posts(client, account_id: int, uris: list) -> dict:
-    """Batch-resolves post URIs (a notification's actionable post) to
-    their text + author handle for display, AND fully hydrates each
-    one into the local `posts` cache via _store_resolved_post() so Post
-    action (Alt+A) has real data (cid, viewer like/repost/bookmark
-    state, counts) to work with -- not just display text. EXPERIMENTAL
-    -- first use of app.bsky.feed.getPosts in NVSky, paste back the
-    traceback if this errors. Chunks into batches of 25 (the API's max
-    per call)."""
+    """Batch-resolves post URIs to text + author handle AND hydrates each
+    into the local `posts` cache via _store_resolved_post(), so Post
+    action has real data to work with. Chunks of 25 (the API's max)."""
     resolved = {}
     uris = list({u for u in uris if u})
     for i in range(0, len(uris), 25):
@@ -1878,6 +1906,38 @@ def resolve_posts(client, account_id: int, uris: list) -> dict:
             except Exception as e:
                 log.info(f"NVSky: failed to cache resolved post {post.uri}: {e}")
     return resolved
+
+
+def store_jetstream_repost(client, account_id: int, subject_uri: str, subject_cid: str, reposter_did: str, created_at: str = None):
+    """
+    Hydrates and threads a repost discovered via Jetstream (see
+    jetstream.py) into the Home feed cache. Resolves the reposted post
+    itself via resolve_posts (same path notifications/search already
+    use), fetches/caches the reposting account's author info if not
+    already cached, marks the post row as a repost, and inserts the
+    feed_items row at the repost's OWN timestamp (not the original
+    post's) -- matches _store_feed_item's own reasoning for feed
+    ordering.
+    """
+    resolved = resolve_posts(client, account_id, [subject_uri])
+    if subject_uri not in resolved:
+        return
+    reposter = db.get_author(reposter_did)
+    if reposter is None:
+        try:
+            profile = get_profile(client, reposter_did)
+            db.upsert_author(
+                did=profile["did"], handle=profile["handle"],
+                display_name=profile.get("display_name"), avatar_url=None,
+            )
+            reposter = db.get_author(reposter_did)
+        except Exception as e:
+            log.info(f"NVSky: jetstream -- could not resolve reposter profile {reposter_did}: {e}")
+    reposterHandle = reposter["handle"] if reposter else None
+    reposterDisplayName = reposter.get("display_name") if reposter else None
+    db.mark_post_reposted(subject_uri, reposter_did, reposterHandle, reposterDisplayName)
+    feedIndexedAt = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    db.upsert_feed_item(account_id, "home", subject_uri, feedIndexedAt)
 
 
 NOTIFICATION_SYNC_MAX_PAGES = 20  # safety cap -- see sync_notifications' docstring
@@ -1925,7 +1985,7 @@ def sync_notifications(client, account_id: int, cursor: str = None, limit: int =
 
         urisToResolve = []
         for notif in resp.notifications:
-            if notif.reason in ("reply", "mention", "quote"):
+            if notif.reason in ("reply", "mention", "quote", "subscribed-post"):
                 urisToResolve.append(notif.uri)
             elif notif.reason in ("like", "repost") and notif.reason_subject:
                 urisToResolve.append(notif.reason_subject)
@@ -1940,7 +2000,6 @@ def sync_notifications(client, account_id: int, cursor: str = None, limit: int =
                 _store_notification(notif, account_id, resolvedSubjects)
             except Exception as e:
                 log.error(f"NVSky: failed to store a notification: {e}")
-                log.info(f"NVSky: raw notification that failed = {notif!r}")
 
         pagesWalked += 1
         if not isResumeSync:
@@ -1978,16 +2037,19 @@ def _store_notification(notif, account_id: int, resolvedSubjects: dict):
         viewer_following=getattr(authorViewer, "following", None) if authorViewer else None,
         viewer_muted=bool(getattr(authorViewer, "muted", False)) if authorViewer else False,
         viewer_blocking=getattr(authorViewer, "blocking", None) if authorViewer else None,
+        viewer_activity_subscription=getattr(authorViewer, "activity_subscription", None) is not None if authorViewer else False,
     )
 
     reason = notif.reason
     subjectText = ""
     subjectAuthorHandle = None
 
-    if reason in ("reply", "mention", "quote"):
+    if reason in ("reply", "mention", "quote", "subscribed-post"):
         # For these, the notification's own record/uri IS the new post
         # the author just wrote -- that's also the actionable post for
-        # Post action (Alt+A).
+        # Post action (Alt+A). subscribed-post is the activity-
+        # subscription bell-icon feature -- same shape as reply/mention/
+        # quote (a real new post), just no reply/mention/quote context.
         subjectUri = notif.uri
         record = notif.record
         recordGet = _dict_get(record)
@@ -2094,16 +2156,12 @@ def _upload_blob_dict(client, image_path: str) -> dict:
             pass
     upload = client.com.atproto.repo.upload_blob(image_bytes)
     blob = upload.blob
-    try:
-        return {
-            "$type": "blob",
-            "ref": {"$link": blob.ref.link},
-            "mimeType": blob.mime_type,
-            "size": blob.size,
-        }
-    except AttributeError:
-        log.info(f"NVSky: upload_blob() result shape = {blob!r}")
-        raise
+    return {
+        "$type": "blob",
+        "ref": {"$link": blob.ref.link},
+        "mimeType": blob.mime_type,
+        "size": blob.size,
+    }
 
 
 VIDEO_EXTENSIONS = (".mp4", ".mpeg", ".mpg", ".mov", ".webm")
@@ -2197,30 +2255,37 @@ def validate_video_file(video_path: str) -> dict:
     would fail anyway."""
     ext = os.path.splitext(video_path)[1].lower()
     if ext not in VIDEO_EXTENSIONS:
+        # Translators: Shown when a video file's format isn't supported. First {} is the extension (or "no extension"), second {} is the accepted list.
         return {
             "ok": False,
-            "message": f"Unsupported video format ({ext or 'no extension'}). "
-                       f"Bluesky accepts: {', '.join(VIDEO_EXTENSIONS)}.",
+            "message": _("Unsupported video format ({}). Bluesky accepts: {}.").format(
+                ext or _("no extension"), ", ".join(VIDEO_EXTENSIONS)
+            ),
         }
 
     try:
         size = os.path.getsize(video_path)
     except OSError as e:
-        return {"ok": False, "message": f"Could not read file: {e}"}
+        # Translators: Shown when a video file can't be read. {} is the error message.
+        return {"ok": False, "message": _("Could not read file: {}").format(e)}
     if size > VIDEO_MAX_BYTES:
+        # Translators: Shown when a video is too large. First {} is its size in MB, second {} is the limit in MB.
         return {
             "ok": False,
-            "message": f"Video is {size / 1_000_000:.0f}MB, over Bluesky's current "
-                       f"{VIDEO_MAX_BYTES / 1_000_000:.0f}MB limit.",
+            "message": _("Video is {}MB, over Bluesky's current {}MB limit.").format(
+                f"{size / 1_000_000:.0f}", f"{VIDEO_MAX_BYTES / 1_000_000:.0f}"
+            ),
         }
 
     if ext in (".mp4", ".mov"):
         duration = _read_mp4_duration_seconds(video_path)
         if duration is not None and duration > VIDEO_MAX_DURATION_SECONDS:
+            # Translators: Shown when a video is too long. First {} is its length in seconds, second {} is the limit in seconds.
             return {
                 "ok": False,
-                "message": f"Video is {duration:.0f}s long, over Bluesky's current "
-                           f"{VIDEO_MAX_DURATION_SECONDS}s limit.",
+                "message": _("Video is {}s long, over Bluesky's current {}s limit.").format(
+                    f"{duration:.0f}", VIDEO_MAX_DURATION_SECONDS
+                ),
             }
 
     return {"ok": True}
@@ -2228,19 +2293,9 @@ def validate_video_file(video_path: str) -> dict:
 
 def _get_pds_service_did(client) -> str:
     """
-    Returns the user's own PDS's service DID (did:web:<pds-domain>) --
-    NOT video.bsky.app's -- for use as getServiceAuth's `aud`.
-    CONFIRMED via docs.bsky.app's own video upload tutorial: the token
-    must be scoped to the user's PDS even though it's then used to
-    call video.bsky.app; video.bsky.app validates against the PDS's
-    identity, not its own. A first attempt using
-    "did:web:video.bsky.app" directly produced a real 401 Unauthorized.
-
-    A second attempt tried resolving this via client.me.did_doc, which
-    doesn't exist on this SDK version (client.me is a plain
-    ProfileViewDetailed, confirmed via a real AttributeError) -- the
-    session itself already carries the PDS endpoint from login, no
-    separate DID document fetch/resolution needed.
+    The user's own PDS service DID (did:web:<pds-domain>), used as
+    getServiceAuth's `aud` for uploadVideo -- NOT video.bsky.app's
+    (that gives a 401). Read from the session's pds_endpoint.
     """
     session = getattr(client, "_session", None)
     pdsEndpoint = getattr(session, "pds_endpoint", None) if session is not None else None
@@ -2285,11 +2340,8 @@ def _get_video_query_auth(client, lxm: str) -> str:
 
 
 def get_video_upload_limits(client) -> dict:
-    """LOW CONFIDENCE -- app.bsky.video.getUploadLimits never
-    exercised in this project before now. Raw-JSON bypass, same
-    reasoning as every other EXPERIMENTAL endpoint here. Expected
-    shape per public examples: {"canUpload": bool, "message": str,
-    "remainingDailyBytes": int, "remainingDailyVideos": int}."""
+    """Raw HTTP to video.bsky.app. Returns {"canUpload", "message",
+    "remainingDailyBytes", "remainingDailyVideos"}."""
     token = _get_video_query_auth(client, "app.bsky.video.getUploadLimits")
     request = urllib.request.Request(
         "https://video.bsky.app/xrpc/app.bsky.video.getUploadLimits",
@@ -2305,10 +2357,7 @@ def upload_video(client, video_path: str, progress_callback=None, cancel_event=N
     returning the blob dict (same shape _upload_blob_dict returns for
     images -- usable directly in a post embed).
 
-    LOW CONFIDENCE end to end -- app.bsky.video.uploadVideo/
-    getJobStatus never exercised in this project. Raw HTTP, not the
-    typed SDK. Paste back the traceback (or a debug_dump of the raw
-    job status) if this doesn't work.
+    Raw HTTP (uploadVideo + getJobStatus), not the typed SDK.
 
     progress_callback(state, extra), if given, is called with
     "uploading" once the file is sent, then the job's own state string
@@ -2362,13 +2411,14 @@ def upload_video(client, video_path: str, progress_callback=None, cancel_event=N
     jobId = jobStatus.get("jobId")
     if not jobId:
         debug_dump(jobStatus, "video_upload_no_job_id")
-        raise RuntimeError("Video upload returned neither a blob nor a job ID.")
+        # Translators: Shown when the server's video upload response has no blob and no job ID.
+        raise RuntimeError(_("Video upload returned neither a blob nor a job ID."))
 
     pollToken = _get_video_query_auth(client, "app.bsky.video.getJobStatus")
     pollParams = urllib.parse.urlencode({"jobId": jobId})
     pollUrl = f"https://video.bsky.app/xrpc/app.bsky.video.getJobStatus?{pollParams}"
 
-    for _ in range(200):  # ~10 min at 3s intervals
+    for _attempt in range(200):  # ~10 min at 3s intervals
         if cancel_event is not None and cancel_event.is_set():
             raise VideoUploadCancelled()
         time.sleep(3)
@@ -2384,11 +2434,14 @@ def upload_video(client, video_path: str, progress_callback=None, cancel_event=N
             if blob:
                 return blob
             debug_dump(jobStatus, "video_job_completed_no_blob")
-            raise RuntimeError("Video processing completed but returned no blob.")
+            # Translators: Shown when video processing finished but the server returned no video.
+            raise RuntimeError(_("Video processing completed but returned no blob."))
         if state == "JOB_STATE_FAILED":
-            raise RuntimeError(jobStatus.get("error") or jobStatus.get("message") or "Video processing failed.")
+            # Translators: Fallback shown when video processing fails with no server message.
+            raise RuntimeError(jobStatus.get("error") or jobStatus.get("message") or _("Video processing failed."))
 
-    raise RuntimeError("Video processing timed out.")
+    # Translators: Shown when video processing takes too long.
+    raise RuntimeError(_("Video processing timed out."))
 
 
 def _get_profile_record(client) -> dict:
@@ -2426,14 +2479,7 @@ def _get_profile_record(client) -> dict:
 
 def _put_profile_record(client, record: dict):
     record["$type"] = "app.bsky.actor.profile"
-    client.com.atproto.repo.put_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.actor.profile",
-            "rkey": "self",
-            "record": record,
-        }
-    )
+    _put_record(client, client.me.did, "app.bsky.actor.profile", record, "self")
 
 
 def update_profile_text(client, display_name: str, description: str):
@@ -2559,6 +2605,9 @@ def fetch_link_card(url: str) -> dict:
     image = _og("image")
     if image:
         image = urllib.parse.urljoin(url, image)
+        # A page must not be able to point the thumbnail download at file:/ftp: etc.
+        if urllib.parse.urlparse(image).scheme.lower() not in ("http", "https"):
+            image = None
 
     # Falls back to the domain, not the full raw URL, when og:title
     # can't be scraped (JS-rendered pages, unusual meta tag ordering,
@@ -2567,6 +2616,61 @@ def fetch_link_card(url: str) -> dict:
     # domain is at least a saner permanent fallback.
     fallbackTitle = urllib.parse.urlparse(url).netloc or url
     return {"uri": url, "title": title or fallbackTitle, "description": description or "", "image_url": image}
+
+
+def _strip_none_values(record: dict) -> dict:
+    """
+    The typed put_record()/create_record() this file used to go
+    through excluded None-valued fields automatically (exclude_none=
+    True) before serializing -- the raw invoke_procedure()+DotDict
+    bypass below has no such step, so a field genuinely absent from
+    the account (e.g. no avatar set) came through as a literal JSON
+    null and got rejected by the server's lexicon validation
+    ("Expected blob value type (got null)"). Shallow strip only --
+    every record dict built in this file nests optional sub-objects by
+    omitting the key entirely already, never by setting it to None.
+    """
+    return {k: v for k, v in record.items() if v is not None}
+
+
+def _create_record(client, repo: str, collection: str, record: dict, rkey: str = None):
+    """
+    Raw-JSON bypass for com.atproto.repo.createRecord -- same fix as
+    send_message/create_group elsewhere in this file. CONFIRMED
+    (0.0.72 regression): create_record() resolves a plain dict `record`
+    into a generated typed model INTERNALLY before serializing, even
+    when the caller already passes a dict or a manually-repaired model
+    instance -- so neither approach avoids the broken py_type field
+    construction that hits every record-family model (Record, embed
+    variants, reply refs...). Sidesteps typed model construction
+    entirely via invoke_procedure()+DotDict instead, the same non-
+    pydantic_core serialization path chat.bsky.convo.sendMessage
+    already relies on.
+    """
+    from atproto_client.models.dot_dict import DotDict
+
+    body = {"repo": repo, "collection": collection, "record": _strip_none_values(record)}
+    if rkey:
+        body["rkey"] = rkey
+    response = client.com.atproto.repo._client.invoke_procedure(
+        "com.atproto.repo.createRecord", data=DotDict(body),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    content = response.content if isinstance(response.content, dict) else {}
+    return _dict_to_ns(content)
+
+
+def _put_record(client, repo: str, collection: str, record: dict, rkey: str):
+    """Same fix as _create_record, for com.atproto.repo.putRecord."""
+    from atproto_client.models.dot_dict import DotDict
+
+    response = client.com.atproto.repo._client.invoke_procedure(
+        "com.atproto.repo.putRecord",
+        data=DotDict({"repo": repo, "collection": collection, "rkey": rkey, "record": _strip_none_values(record)}),
+        input_encoding="application/json", output_encoding="application/json",
+    )
+    content = response.content if isinstance(response.content, dict) else {}
+    return _dict_to_ns(content)
 
 
 # ---------------- posting ----------------
@@ -2652,9 +2756,7 @@ def create_post(client, text: str, attachments: list = None, reply_ref: dict = N
     if embed:
         record["embed"] = embed
 
-    resp = client.com.atproto.repo.create_record(
-        data={"repo": client.me.did, "collection": "app.bsky.feed.post", "record": record}
-    )
+    resp = _create_record(client, client.me.did, "app.bsky.feed.post", record)
     return {"uri": resp.uri, "cid": resp.cid, "created_at": record["createdAt"], "text": text}
 
 
@@ -2717,35 +2819,22 @@ def set_threadgate(client, post_uri: str, state: str, rules: set = None):
     else:
         raise ValueError(f"Unknown threadgate state: {state}")
 
-    client.com.atproto.repo.put_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.feed.threadgate",
-            "rkey": rkey,
-            "record": {
-                "$type": "app.bsky.feed.threadgate",
-                "post": post_uri,
-                "allow": allow,
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    _put_record(client, client.me.did, "app.bsky.feed.threadgate", {
+        "$type": "app.bsky.feed.threadgate",
+        "post": post_uri,
+        "allow": allow,
+        "createdAt": client.get_current_time_iso(),
+    }, rkey)
 
 def delete_post(client, post_uri: str):
     client.com.atproto.repo.delete_record(data=_parse_at_uri(post_uri))
 
 def repost_post(client, post_uri: str, post_cid: str) -> str:
-    resp = client.com.atproto.repo.create_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.feed.repost",
-            "record": {
-                "$type": "app.bsky.feed.repost",
-                "subject": {"uri": post_uri, "cid": post_cid},
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    resp = _create_record(client, client.me.did, "app.bsky.feed.repost", {
+        "$type": "app.bsky.feed.repost",
+        "subject": {"uri": post_uri, "cid": post_cid},
+        "createdAt": client.get_current_time_iso(),
+    })
     return resp.uri
 
 def unrepost_post(client, repost_uri: str):
@@ -2774,6 +2863,19 @@ def get_profile(client, did: str) -> dict:
         },
     }
 
+def _actor_dict(actor) -> dict:
+    """Plain dict for a ProfileView, with the viewer's relationship state."""
+    viewer = getattr(actor, "viewer", None)
+    return {
+        "did": actor.did, "handle": actor.handle,
+        "display_name": getattr(actor, "display_name", None),
+        "description": getattr(actor, "description", None),
+        "following_uri": getattr(viewer, "following", None) if viewer else None,
+        "muted": bool(getattr(viewer, "muted", False)) if viewer else False,
+        "blocking_uri": getattr(viewer, "blocking", None) if viewer else None,
+    }
+
+
 def get_followers(client, did: str, page_limit: int = 100, max_pages: int = 100) -> list:
     """
     Fetches the COMPLETE followers list, walking every page -- Show
@@ -2785,13 +2887,7 @@ def get_followers(client, did: str, page_limit: int = 100, max_pages: int = 100)
     cursor = None
     for _ in range(max_pages):
         resp = client.get_followers(did, limit=page_limit, cursor=cursor)
-        results.extend(
-            {
-                "did": f.did, "handle": f.handle, "display_name": getattr(f, "display_name", None),
-                "description": getattr(f, "description", None),
-            }
-            for f in resp.followers
-        )
+        results.extend(_actor_dict(f) for f in resp.followers)
         cursor = resp.cursor
         if not cursor:
             break
@@ -2804,13 +2900,7 @@ def get_follows(client, did: str, page_limit: int = 100, max_pages: int = 100) -
     cursor = None
     for _ in range(max_pages):
         resp = client.get_follows(did, limit=page_limit, cursor=cursor)
-        results.extend(
-            {
-                "did": f.did, "handle": f.handle, "display_name": getattr(f, "display_name", None),
-                "description": getattr(f, "description", None),
-            }
-            for f in resp.follows
-        )
+        results.extend(_actor_dict(f) for f in resp.follows)
         cursor = resp.cursor
         if not cursor:
             break
@@ -2820,23 +2910,14 @@ def get_follows(client, did: str, page_limit: int = 100, max_pages: int = 100) -
 def get_known_followers(client, did: str, page_limit: int = 100, max_pages: int = 100) -> list:
     """
     app.bsky.graph.getKnownFollowers -- people the ACTIVE account
-    follows who also follow `did` (mutual-followers-of-them, the
-    "Followed by X, Y, and 3 others" feature). LOW CONFIDENCE -- never
-    exercised against a real server in this project, field names
-    assumed to match the same ProfileView shape get_followers already
-    uses. Paste back the traceback if this errors.
+    follows who also follow `did` (bsky.app's "Followed by X, Y, and 3
+    others").
     """
     results = []
     cursor = None
     for _ in range(max_pages):
         resp = client.app.bsky.graph.get_known_followers(params={"actor": did, "limit": page_limit, "cursor": cursor})
-        results.extend(
-            {
-                "did": f.did, "handle": f.handle, "display_name": getattr(f, "display_name", None),
-                "description": getattr(f, "description", None),
-            }
-            for f in resp.followers
-        )
+        results.extend(_actor_dict(f) for f in resp.followers)
         cursor = resp.cursor
         if not cursor:
             break
@@ -2895,6 +2976,7 @@ def _post_view_to_dict(post) -> dict:
     else:
         text = getattr(record, "text", "") or ""
         reply = getattr(record, "reply", None)
+    text = expand_link_facets(text, _view_field(record, "facets"))
 
     reply_parent_uri = None
     reply_to_did = None
@@ -2939,24 +3021,6 @@ def _post_view_to_dict(post) -> dict:
         "viewer_bookmarked": viewer_bookmarked,
         "viewer_thread_muted": viewer_thread_muted,
     }
-
-def get_author_feed(client, did: str, page_limit: int = 50, max_pages: int = 2) -> list:
-    """
-    A user's own recent posts (most recent first). NOT persisted to the
-    cache DB -- kept only for callers that just want a quick read-only
-    snapshot. For a real cached/lazy-loadable view, use
-    sync_author_feed_page below instead (UserTimelineTabWindow).
-    """
-    results = []
-    cursor = None
-    for _ in range(max_pages):
-        resp = client.get_author_feed(actor=did, limit=page_limit, cursor=cursor)
-        results.extend(_post_view_to_dict(item.post) for item in resp.feed)
-        cursor = resp.cursor
-        if not cursor:
-            break
-    return results
-
 
 def sync_author_feed_page(client, account_id: int, did: str, cursor: str = None, limit: int = 50) -> str:
     """
@@ -3131,20 +3195,13 @@ def _put_postgate_record(client, post_uri: str, embedding_rules: list, detached_
             pass  # no postgate existed -- nothing to do
         return
 
-    client.com.atproto.repo.put_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.feed.postgate",
-            "rkey": rkey,
-            "record": {
-                "$type": "app.bsky.feed.postgate",
-                "post": post_uri,
-                "embeddingRules": embedding_rules,
-                "detachedEmbeddingUris": detached_uris,
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    _put_record(client, client.me.did, "app.bsky.feed.postgate", {
+        "$type": "app.bsky.feed.postgate",
+        "post": post_uri,
+        "embeddingRules": embedding_rules,
+        "detachedEmbeddingUris": detached_uris,
+        "createdAt": client.get_current_time_iso(),
+    }, rkey)
 
 
 def get_postgate_disables_quotes(client, post_uri: str) -> bool:
@@ -3254,17 +3311,11 @@ def get_post_quotes(client, post_uri: str, page_limit: int = 50, max_pages: int 
 # ---------------- post actions ----------------
 
 def like_post(client, post_uri: str, post_cid: str) -> str:
-    resp = client.com.atproto.repo.create_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.feed.like",
-            "record": {
-                "$type": "app.bsky.feed.like",
-                "subject": {"uri": post_uri, "cid": post_cid},
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    resp = _create_record(client, client.me.did, "app.bsky.feed.like", {
+        "$type": "app.bsky.feed.like",
+        "subject": {"uri": post_uri, "cid": post_cid},
+        "createdAt": client.get_current_time_iso(),
+    })
     return resp.uri
 
 
@@ -3281,12 +3332,26 @@ def unmute_thread(client, root_uri: str):
 
 
 def create_report(client, subject_uri: str, subject_cid: str, reason_type: str, reason: str = ""):
-    client.com.atproto.moderation.create_report(
-        data={
+    """
+    Raw-JSON bypass -- converted preemptively during the 0.0.72
+    migration alongside every repo.createRecord call site (see
+    _create_record's docstring). Different XRPC namespace
+    (moderation.createReport, not repo.createRecord), but the request
+    body still carries a nested $type discriminator (the strongRef
+    subject), which is exactly the shape that broke elsewhere. Not
+    independently confirmed broken here yet -- paste back the
+    traceback if reporting a post ever fails after this.
+    """
+    from atproto_client.models.dot_dict import DotDict
+
+    client.com.atproto.moderation._client.invoke_procedure(
+        "com.atproto.moderation.createReport",
+        data=DotDict({
             "reasonType": reason_type,
             "reason": reason,
             "subject": {"$type": "com.atproto.repo.strongRef", "uri": subject_uri, "cid": subject_cid},
-        }
+        }),
+        input_encoding="application/json", output_encoding="application/json",
     )
 
 
@@ -3315,17 +3380,11 @@ def create_actor_report(client, did: str, reason_type: str, reason: str = ""):
 # ---------------- user (actor) actions ----------------
 
 def follow_actor(client, subject_did: str) -> str:
-    resp = client.com.atproto.repo.create_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.graph.follow",
-            "record": {
-                "$type": "app.bsky.graph.follow",
-                "subject": subject_did,
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    resp = _create_record(client, client.me.did, "app.bsky.graph.follow", {
+        "$type": "app.bsky.graph.follow",
+        "subject": subject_did,
+        "createdAt": client.get_current_time_iso(),
+    })
     return resp.uri
 
 
@@ -3369,12 +3428,7 @@ def get_muted_actors(client, page_limit: int = 100, max_pages: int = 100) -> lis
     cursor = None
     for _ in range(max_pages):
         resp = client.app.bsky.graph.get_mutes(params={"limit": page_limit, "cursor": cursor})
-        for actor in resp.mutes:
-            results.append({
-                "did": actor.did, "handle": actor.handle,
-                "display_name": getattr(actor, "display_name", None),
-                "description": getattr(actor, "description", None),
-            })
+        results.extend(_actor_dict(a) for a in resp.mutes)
         cursor = resp.cursor
         if not cursor:
             break
@@ -3391,14 +3445,7 @@ def get_blocked_actors(client, page_limit: int = 100, max_pages: int = 100) -> l
     cursor = None
     for _ in range(max_pages):
         resp = client.app.bsky.graph.get_blocks(params={"limit": page_limit, "cursor": cursor})
-        for actor in resp.blocks:
-            viewer = getattr(actor, "viewer", None)
-            results.append({
-                "did": actor.did, "handle": actor.handle,
-                "display_name": getattr(actor, "display_name", None),
-                "description": getattr(actor, "description", None),
-                "blocking_uri": getattr(viewer, "blocking", None) if viewer else None,
-            })
+        results.extend(_actor_dict(a) for a in resp.blocks)
         cursor = resp.cursor
         if not cursor:
             break
@@ -3406,17 +3453,11 @@ def get_blocked_actors(client, page_limit: int = 100, max_pages: int = 100) -> l
 
 
 def block_actor(client, did: str) -> str:
-    resp = client.com.atproto.repo.create_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.graph.block",
-            "record": {
-                "$type": "app.bsky.graph.block",
-                "subject": did,
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    resp = _create_record(client, client.me.did, "app.bsky.graph.block", {
+        "$type": "app.bsky.graph.block",
+        "subject": did,
+        "createdAt": client.get_current_time_iso(),
+    })
     return resp.uri
 
 
@@ -3435,16 +3476,10 @@ def set_activity_subscription(client, did: str, subscribed: bool):
     send_message/create_group -- some field on this request model stays
     an unresolved FieldInfo default and model_dump_json() chokes on it.
     Raw-JSON bypass via DotDict, same fix as those two.
-
-    TEMPORARY: dumps the raw write response every call while this
-    endpoint is still being confirmed (list_activity_subscriptions
-    comes back empty after a write with no error, cause not yet
-    identified) -- check debug_dumps/activity_subscription_write_*.json
-    after triggering this from the UI. Safe to remove once confirmed.
     """
     from atproto_client.models.dot_dict import DotDict
 
-    resp = client.app.bsky.notification._client.invoke_procedure(
+    client.app.bsky.notification._client.invoke_procedure(
         "app.bsky.notification.putActivitySubscription",
         data=DotDict({
             "subject": did,
@@ -3482,10 +3517,14 @@ def get_activity_subscriptions(client, page_limit: int = 100, max_pages: int = 1
         )
         content = resp.content if isinstance(resp.content, dict) else {}
         for actor in content.get("subscriptions", []):
+            viewer = actor.get("viewer") or {}
             results.append({
                 "did": actor.get("did"), "handle": actor.get("handle"),
                 "display_name": actor.get("displayName"),
                 "description": actor.get("description"),
+                "following_uri": viewer.get("following"),
+                "muted": bool(viewer.get("muted")),
+                "blocking_uri": viewer.get("blocking"),
             })
         cursor = content.get("cursor")
         if not cursor:
@@ -3743,18 +3782,11 @@ def set_notification_category(client, current_prefs: dict, category: str, list_e
 LIST_PURPOSE_MOD = "app.bsky.graph.defs#modlist"
 LIST_PURPOSE_CURATE = "app.bsky.graph.defs#curatelist"
 
-LIST_URL_RE = re.compile(r"bsky\.app/profile/([^/]+)/lists/([a-zA-Z0-9]+)")
-
 
 def get_lists(client, did: str, page_limit: int = 100, max_pages: int = 20) -> list:
     """
-    Every list `did` created OR has subscribed to (mute/block) -- this
-    matches what bsky.app's own "My lists" page shows, since
-    getLists(actor=...) returns both kinds together. EXPERIMENTAL --
-    first use of the app.bsky.graph.* list endpoints in NVSky, field
-    names below were read off the atproto SDK's ListView model but not
-    yet confirmed against a live response -- paste back the traceback
-    if this errors.
+    Every list `did` created OR subscribed to (mute/block) -- what
+    bsky.app's "My lists" shows, since getLists(actor=...) returns both.
     """
     results = []
     cursor = None
@@ -3781,10 +3813,8 @@ def get_lists(client, did: str, page_limit: int = 100, max_pages: int = 20) -> l
 
 def get_list(client, list_uri: str, page_limit: int = 100, max_pages: int = 100) -> dict:
     """
-    Fetches list info plus the COMPLETE member roster (walks every
-    page, like get_followers) -- used for the modlist member view and
-    Manage members, both of which need the whole list, not a lazy
-    page. EXPERIMENTAL, see get_lists above.
+    List info plus the COMPLETE member roster (walks every page) -- the
+    modlist member view and Manage members both need the whole list.
     """
     info = None
     members = []
@@ -3822,11 +3852,9 @@ def get_list(client, list_uri: str, page_limit: int = 100, max_pages: int = 100)
 
 def sync_list_feed(client, account_id: int, list_uri: str, cursor: str = None, limit: int = 50) -> str:
     """
-    Same shape as sync_timeline -- feed_key is just the list's own
-    at:// uri, so FeedListMixin/get_feed_page/upsert_feed_item work
-    completely unchanged for a list's timeline. Only curatelists have
-    a feed here -- modlists raise a server error if you try, callers
-    must check purpose first. EXPERIMENTAL, see get_lists above.
+    Same shape as sync_timeline; feed_key is the list's own at:// uri.
+    Curation lists only -- modlists raise a server error, so callers
+    must check purpose first.
     """
     resp = client.app.bsky.feed.get_list_feed(params={"list": list_uri, "limit": limit, "cursor": cursor})
     for item in resp.feed:
@@ -3834,24 +3862,17 @@ def sync_list_feed(client, account_id: int, list_uri: str, cursor: str = None, l
             _store_feed_item(item, account_id, list_uri)
         except Exception as e:
             log.error(f"NVSky: failed to store a list feed item: {e}")
-            log.info(f"NVSky: raw item that failed = {item!r}")
     return resp.cursor
 
 
 def create_list(client, name: str, description: str, purpose: str) -> dict:
-    resp = client.com.atproto.repo.create_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.graph.list",
-            "record": {
-                "$type": "app.bsky.graph.list",
-                "name": name,
-                "description": description or "",
-                "purpose": purpose,
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    resp = _create_record(client, client.me.did, "app.bsky.graph.list", {
+        "$type": "app.bsky.graph.list",
+        "name": name,
+        "description": description or "",
+        "purpose": purpose,
+        "createdAt": client.get_current_time_iso(),
+    })
     return {"uri": resp.uri, "cid": resp.cid}
 
 
@@ -3860,18 +3881,12 @@ def delete_list(client, list_uri: str):
 
 
 def add_list_member(client, list_uri: str, subject_did: str) -> str:
-    resp = client.com.atproto.repo.create_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.graph.listitem",
-            "record": {
-                "$type": "app.bsky.graph.listitem",
-                "subject": subject_did,
-                "list": list_uri,
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    resp = _create_record(client, client.me.did, "app.bsky.graph.listitem", {
+        "$type": "app.bsky.graph.listitem",
+        "subject": subject_did,
+        "list": list_uri,
+        "createdAt": client.get_current_time_iso(),
+    })
     return resp.uri
 
 
@@ -3896,17 +3911,11 @@ def block_actor_list(client, list_uri: str) -> str:
     from memory of the lexicon, not confirmed against the installed
     SDK's model classes yet. Paste back the traceback if this errors.
     """
-    resp = client.com.atproto.repo.create_record(
-        data={
-            "repo": client.me.did,
-            "collection": "app.bsky.graph.listblock",
-            "record": {
-                "$type": "app.bsky.graph.listblock",
-                "subject": list_uri,
-                "createdAt": client.get_current_time_iso(),
-            },
-        }
-    )
+    resp = _create_record(client, client.me.did, "app.bsky.graph.listblock", {
+        "$type": "app.bsky.graph.listblock",
+        "subject": list_uri,
+        "createdAt": client.get_current_time_iso(),
+    })
     return resp.uri
 
 
@@ -3914,32 +3923,8 @@ def unblock_actor_list(client, listblock_uri: str):
     client.com.atproto.repo.delete_record(data=_parse_at_uri(listblock_uri))
 
 
-def resolve_list_uri(client, value: str) -> str:
-    """
-    Accepts either a raw at:// list uri or a bsky.app list link
-    (https://bsky.app/profile/<handle-or-did>/lists/<rkey>) -- pasting
-    a link is the only way to subscribe to someone else's list right
-    now, there's no list search endpoint in the API to browse them.
-    """
-    value = value.strip()
-    if value.startswith("at://"):
-        return value
-    match = LIST_URL_RE.search(value)
-    if not match:
-        raise ValueError("Doesn't look like a Bluesky list link or at:// list URI.")
-    actor, rkey = match.group(1), match.group(2)
-    did = actor if actor.startswith("did:") else client.com.atproto.identity.resolve_handle(params={"handle": actor}).did
-    return f"at://{did}/app.bsky.graph.list/{rkey}"
-
-
 def search_actors_typeahead(client, query: str, limit: int = 8) -> list:
-    """
-    Quick "who did you mean" suggestions as the user types a handle/
-    name -- used by Manage members' Add field, same behavior as
-    bsky.app's own search-while-typing. Also the natural building
-    block for a future @mention autocomplete in ComposeDialog.
-    EXPERIMENTAL, see get_lists above.
-    """
+    """Search-as-you-type suggestions (Manage members, New chat dialogs)."""
     if not query.strip():
         return []
     resp = client.app.bsky.actor.search_actors_typeahead(params={"q": query, "limit": limit})

@@ -1,13 +1,11 @@
 """
 Lists tab and related dialogs for NVSky.
 
-Split out of feedWindow.py (see plan-17.md). ListsWindow is a flat
-tree of every list the account created or subscribed to; ListTabWindow
-is a single curation list's timeline popped out into its own removable
-tab. The four dialogs here (AddListDialog, SubscribeListDialog,
-ManageMembersDialog, AddToListDialog) are all list-management UI used
-either from this tab or from UserActionMixin's "Add to list..."/
-"View their lists..." actions elsewhere in the add-on.
+ListsWindow is a flat tree of every list the account created or subscribed
+to; ListTabWindow is one curation list's timeline in a removable tab. The
+dialogs (AddListDialog, SubscribeListDialog, ManageMembersDialog,
+AddToListDialog) are used from this tab and from UserActionMixin's
+"Add to list..."/"View their lists..." actions.
 """
 import threading
 import wx
@@ -28,11 +26,6 @@ from .feedWindow import (
     UserActionMixin,
     EmbedViewMixin,
     _announce_now,
-    _describe_embed,
-    _message_text,
-    _format_post_time,
-    _visible_embed_text,
-    _visible_message_text,
 )
 
 
@@ -400,12 +393,7 @@ class ManageMembersDialog(wx.Dialog):
         if self._isOwner:
             self.memberList = gui.nvdaControls.CustomCheckListBox(self, choices=[])
             sizer.Add(self.memberList, proportion=1, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
-            # A CustomCheckListBox constructed/Set() with zero items
-            # still renders one blank-looking checkable row on Windows
-            # (confirmed by testing) -- hide the control entirely and
-            # show this plain label instead, same fix already used by
-            # SubscribeListDialog's listsCheckBox for the identical
-            # issue.
+            # An empty CustomCheckListBox shows a blank checkable row; show a label instead.
             # Translators: Shown in place of the member checklist when a list has no members yet.
             self.emptyMembersLabel = wx.StaticText(self, label=_("No members yet -- add one below."))
             sizer.Add(self.emptyMembersLabel, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
@@ -474,12 +462,7 @@ class ManageMembersDialog(wx.Dialog):
         gui.mainFrame.postPopup()
         parent = self.GetParent()
         self.Destroy()
-        # Manage members is opened from the list tree's context menu
-        # now, not a standing toolbar button -- return focus there
-        # instead of the now-hidden manageMembersButton (was never
-        # added to any sizer, a leftover widget that only still
-        # existed to be clicked -- previously left focus on a control
-        # the user could never see or reach any other way).
+        # Return focus to the list tree (Manage members opens from its context menu).
         if parent is not None and hasattr(parent, "listTree"):
             parent.listTree.SetFocus()
 
@@ -775,29 +758,21 @@ class AddToListDialog(wx.Dialog):
 
 
 class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
+    """
+    "My lists": a flat tree of every list this account created or subscribed
+    to (same set as bsky.app's "My lists"). A curation list shows its
+    timeline on the right (feed_key is the list's at:// uri, so
+    FeedListMixin works as in Home); a moderation list has no timeline, so
+    the right side shows its member roster. List management is in the tree's
+    context menu and the shared toolbar.
+    """
+
     TAB_KEY = "lists"
-    # Same content shape as Home, so it gets the full shortcut set too
-    # (see plan-09.md) -- Alt+number/Alt+U still branch on list purpose
-    # via the _onAltNumber/_onAltU overrides below, independent of
-    # these flags.
+    # Alt+number/Alt+U branch on list purpose (see _onAltNumber/_onAltU).
     SUPPORTS_NEW_POST = True
     SUPPORTS_FOCUS_NEXT_UNREAD = True
     SUPPORTS_SELECT_ALL = True
     SUPPORTS_JUMP_TO_USER = True
-
-    """
-    "My lists" -- a flat tree of every list this account created or
-    subscribed to (mute/block), same set bsky.app's "My lists" page
-    shows. Selecting a curation list shows its timeline on the right
-    (a normal post list -- Post action/User action apply unchanged,
-    feed_key is just the list's own at:// uri, so FeedListMixin/
-    get_feed_page/check-for-updates all work exactly like Home/Saved).
-    Selecting a moderation list has no timeline (modlists aren't a
-    feed), so the right side swaps to a member roster instead.
-    List-level management (create/delete, open in its own tab, edit
-    membership, subscribe to someone else's moderation list) lives in
-    this tab's own local toolbar, not the shared MainWindow one.
-    """
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -867,19 +842,11 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         for button in (self.addListButton, self.removeListButton, self.showInNewTabButton, self.manageMembersButton, self.subscribeButton):
             button.Hide()
             button.Disable()
-        #self.addListButton.Hide()
-        # Remove/Show in new tab/Manage members moved into the list
-        # tree's context menu (see onListContextMenu) -- mirrors Chat's
-        # conversation-tree menu. "Add list..." moved to the shared
-        # toolbar's New-post button (becomes "New list..." on this tab,
-        # see mainWindow.py's onNewPost) -- kept as a real widget
-        # (just hidden) rather than deleted so onAddList()'s existing
-        # focus-restore calls (parent.addListButton.SetFocus()-style,
-        # if any) don't need touching.
+        # Remove/Show in new tab/Manage members are in the tree's context menu,
+        # New list and Find lists are shared-toolbar buttons. These widgets
+        # stay (hidden) only because handlers and focus calls reference them.
         toolbarRow.Add(self.subscribeButton, flag=wx.RIGHT, border=5)
         sizer.Add(toolbarRow, flag=wx.ALL, border=10)
-
-# note: removeListButton/showInNewTabButton/manageMembersButton are intentionally left OUT of toolbarRow.Add() above -- only subscribeButton gets added now, the other three just aren't placed in a sizer (still constructed further down where .Bind() references them, but never shown).
 
         self.statusBar = wx.StatusBar(self)
         sizer.Add(self.statusBar, flag=wx.EXPAND)
@@ -916,18 +883,18 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
     def onTabActivated(self):
         # Translators: Announced when switching to this tab. {} is the tab name.
         nvdaUi.message(_("{} tab").format(self.TAB_NAME))
+        # A background sync may have updated the selected list's timeline while hidden.
+        if self._selectedList is not None and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
+            self._loadFromCache(reset=True)
+        self.listTree.SetFocus()
+
+    @uiutil.safe_ui_callback
+    def _focusWhenEmpty(self):
         self.listTree.SetFocus()
 
     def _restoreFocusPosition(self, moveFocus=True):
-        # Lists behaves like Chat: the tree is this tab's "home"
-        # control, not whichever list happens to be showing on the
-        # right -- MainWindow's addTab()/_focusPanel() call this
-        # expecting to land real focus somewhere sane on tab open, and
-        # for this tab that's always the tree. The per-list post-
-        # scroll-position restore (used when switching which list is
-        # selected, see _showSelectedList below) is a separate concern
-        # and calls FeedListMixin._restoreFocusPosition directly
-        # instead of going through this override.
+        # The tree is this tab's home control. Per-list scroll restore calls
+        # FeedListMixin._restoreFocusPosition directly (see _showSelectedList).
         if moveFocus:
             self.listTree.SetFocus()
 
@@ -964,33 +931,9 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             self.listTree.Thaw()
 
         self._updateListsStatusBar()
-        self._updateToolbarVisibility()
-        # Deliberately NOT auto-syncing from the server here anymore.
-        # This used to fire unconditionally on every __init__ (i.e.
-        # every MainWindow open), unlike the other 4 permanent tabs
-        # which only ever load from local cache at construction time
-        # -- this was Stage 2 of the original crash-hardening plan
-        # (plan-07.md), agreed on but never actually done; Stage 0's
-        # safe_ui_callback fix made the resulting race SAFE at the
-        # Python level (caught RuntimeError instead of a hard crash)
-        # but never removed the race itself. Confirmed by testing
-        # (see plan-09.md): every "quick close after opening
-        # MainWindow" crash report so far shows this exact background
-        # sync's completion handler as the immediately-preceding
-        # event, every time, regardless of which tab the user actually
-        # interacted with -- removing the automatic call here matches
-        # ListsWindow's behavior to the other 4 tabs (cache-only on
-        # open, sync only ever on explicit user action -- F5/Shift+F5/
-        # after add-list/remove-list/subscribe, which still call
-        # _syncListsFromServer() directly and are untouched by this).
-
-    def _updateToolbarVisibility(self):
-        # No-op now -- Remove/Show in new tab/Manage members live in
-        # the list tree's context menu (see onListContextMenu), which
-        # naturally only appears on an actual item, so there's nothing
-        # left to show/hide here. Kept as a callable stub since it's
-        # still called from a couple of places below.
-        pass
+        # No server sync here: like the other tabs, open is cache-only. An
+        # automatic sync on every MainWindow open raced a quick close and
+        # crashed NVDA. Sync runs on F5, Ctrl+F5, and after list changes.
 
     def onListContextMenu(self, evt):
         item = evt.GetItem()
@@ -1116,7 +1059,6 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         finally:
             self.listTree.Thaw()
         self._updateListsStatusBar()
-        self._updateToolbarVisibility()
 
     def _checkListTreeBoundaryBeforeKey(self, keyCode):
         # Same deterministic-boundary reasoning as chatWindow.py's
@@ -1138,6 +1080,9 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         keyCode = evt.GetKeyCode()
         if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers():
             self._checkListTreeBoundaryBeforeKey(keyCode)
+        if keyCode == wx.WXK_DELETE and not evt.HasAnyModifiers():
+            self.onRemoveList()
+            return
         evt.Skip()
 
     def _checkMemberListBoundaryBeforeKey(self, keyCode):
@@ -1158,12 +1103,22 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         evt.Skip()
 
     def onListSelected(self, evt):
-        item = evt.GetItem()
-        if item.IsOk() and item != self._listRoot:
-            listUri = self.listTree.GetItemData(item)
-            self._selectedList = next((l for l in self._lists if l["list_uri"] == listUri), None)
-            self._showSelectedList()
-        evt.Skip()
+        # Same defensive guard as ChatWindow.onConvoSelected -- tree
+        # can apparently get torn down from a path not yet pinned down
+        # (rapid create/add/remove list sequences), catch it as a
+        # no-op instead of crashing NVDA.
+        try:
+            if not getattr(self, "listTree", None):
+                return
+            item = evt.GetItem()
+            if item.IsOk() and item != self._listRoot:
+                listUri = self.listTree.GetItemData(item)
+                self._selectedList = next((l for l in self._lists if l["list_uri"] == listUri), None)
+                self._showSelectedList()
+        except (RuntimeError, AttributeError):
+            pass
+        finally:
+            evt.Skip()
 
     def _showSelectedList(self):
         if self._selectedList is None:
@@ -1198,12 +1153,6 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             # Translators: Announced when the post-action menu is invoked with no post focused.
             nvdaUi.message(_("No post selected."))
         return post
-
-    def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _visible_embed_text(post))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _visible_message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
@@ -1285,13 +1234,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
     # ---------------- toolbar actions ----------------
 
     def onNewPost(self, evt=None):
-        # SUPPORTS_NEW_POST=True routes Ctrl+N here via
-        # FeedListMixin.onCharHook -- without this override it fell
-        # through to FeedListMixin's own generic onNewPost (opens a
-        # post ComposeDialog), wrong for this tab. The toolbar's
-        # "New list..." button already worked (MainWindow.onNewPost
-        # has its own identity check calling onAddList directly) --
-        # only the keyboard path was missing this.
+        # Ctrl+N (SUPPORTS_NEW_POST) must create a list here, not a post.
         self.onAddList(evt)
 
     def onAddList(self, evt=None):
@@ -1379,30 +1322,44 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
 
         listUri = self._selectedList["list_uri"]
 
+        # Optimistic: drop the tree item now; the DB row stays until the
+        # server delete succeeds, so a failure just reloads from cache.
+        item, cookie = self.listTree.GetFirstChild(self._listRoot)
+        while item.IsOk():
+            if self.listTree.GetItemData(item) == listUri:
+                self.listTree.Delete(item)
+                break
+            item, cookie = self.listTree.GetNextChild(self._listRoot, cookie)
+        self._lists = [l for l in self._lists if l["list_uri"] != listUri]
+        self._selectedList = None
+        self._updateListsStatusBar()
+        soundpack.play("delete")
+        # Translators: Announced after removing a list.
+        nvdaUi.message(_("List removed."))
+
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
                 client.delete_list(atprotoClient, listUri)
+                db.delete_list(self._account["id"], listUri)
                 error = None
             except Exception as e:
                 error = str(e)
             wx.CallAfter(self._onRemoveListDone, listUri, error)
 
-        uiutil.start_worker(worker)
+        # Plain thread: start_worker would play the progress sound for an optimistic action.
+        threading.Thread(target=worker, daemon=True).start()
 
     @uiutil.safe_ui_callback
     def _onRemoveListDone(self, listUri, error):
-        if error:
-            soundpack.play("error")
-            # Translators: Announced when removing a list fails. {} is the error message.
-            nvdaUi.message(_("Could not remove list: {}").format(error))
+        if not error:
             return
-        soundpack.play("delete")
-        db.delete_list(self._account["id"], listUri)
-        # Translators: Announced after removing a list.
-        nvdaUi.message(_("List removed."))
-        self._selectedList = None
-        self._loadListsFromCache()
+        log.error(f"NVSky: remove list failed: {error}")
+        soundpack.play("error")
+        # Roll back -- the DB row was never actually deleted.
+        self._loadListsFromCache(select_uri=listUri)
+        # Translators: Announced when removing a list fails. {} is the error message.
+        nvdaUi.message(_("Could not remove list: {}").format(error))
 
     def onShowInNewTab(self, evt=None):
         if self._selectedList is None:
@@ -1602,19 +1559,9 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             self.onUserAction()
         
     def _syncForBulkCheck(self, atprotoClient):
-        # Was calling self._syncListsFromServer(), which spawns its OWN
-        # separate background thread and its OWN separate
-        # client.get_client_for_active_account() login -- called from
-        # INSIDE the bulk-check flow's already-shared background thread,
-        # this raced a second concurrent login against the one
-        # checkAllOpenTabs already holds, exactly the class of bug the
-        # shared-thread design was meant to avoid (see MainWindow.
-        # checkAllOpenTabs' own comment). Also fire-and-forget, so this
-        # method's return value never reflected whether anything
-        # actually changed -- confirmed as the cause of "Lists doesn't
-        # announce AND doesn't update" during Ctrl+F5. Do the list-sync
-        # work directly here instead, synchronously, on the SAME
-        # atprotoClient/thread the caller already established.
+        # Runs on checkAllOpenTabs' shared thread, so sync synchronously with
+        # the given client (_syncListsFromServer spawns its own thread and
+        # login, and returns nothing to report changes with).
         beforeSnapshot = {l["list_uri"]: l.get("muted") for l in self._lists}
         entries = client.get_lists(atprotoClient, self._account["did"])
         for entry in entries:
@@ -1641,11 +1588,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         return listsChanged or curateChanged
 
     def _reloadAfterBulkCheck(self, moveFocus=True):
-        # _syncForBulkCheck above already wrote fresh list metadata to
-        # the DB synchronously -- rebuild the tree from it here instead
-        # of leaving it stale until the next explicit F5 (which still
-        # goes through the async _syncListsFromServer/_onSyncListsDone
-        # path unchanged).
+        # _syncForBulkCheck already wrote fresh metadata; rebuild the tree from the DB.
         selectedUri = self._selectedList["list_uri"] if self._selectedList else None
         self._lists = db.get_lists(self._account["id"])
         self.listTree.Freeze()
@@ -1743,7 +1686,9 @@ class ListTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActio
         self._finishStandardFeedInit(sync_if_empty=True)
 
     def onTabActivated(self):
-        self._render()
+        # Re-reads from the DB -- see notificationsWindow.py's
+        # onTabActivated for why _render() alone isn't enough.
+        self._loadFromCache(reset=True)
         if self._account is not None:
             # Translators: Announced when switching to this tab. {} is the tab name.
             nvdaUi.message(_("{} tab").format(self.TAB_NAME))
@@ -1755,12 +1700,6 @@ class ListTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActio
             # Translators: Announced when the post-action menu is invoked with no post focused.
             nvdaUi.message(_("No post selected."))
         return post
-
-    def _insertRow(self, index: int, post: dict, mode: str):
-        self.postList.InsertItem(index, _visible_embed_text(post))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _visible_message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
@@ -1783,14 +1722,8 @@ class ListTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActio
         self.showUserActionMenu(post["author_did"], post.get("handle"), post.get("display_name"))
 
     def onTabRemoved(self):
-        # MainWindow.removeCurrentTab() calls this (if present) right
-        # before DeletePage() -- see the mainWindow.py edit -- so a
-        # temp tab the user closes with Ctrl+W doesn't come back next
-        # time NVSky opens. Scans for every wx.Timer instance rather
-        # than calling _stopTimeRefreshTimer() by name (see plan-09.md
-        # -- MainWindow.onClose had the identical gap: only knew about
-        # _timeRefreshTimer and missed _loadingTimer, the F5-in-progress
-        # beep, which this tab can also start via onCheckForUpdates).
+        # Called before DeletePage(): stop timers and forget this tab so it
+        # isn't restored next launch.
         for value in vars(self).values():
             if isinstance(value, wx.Timer):
                 value.Stop()
@@ -1799,12 +1732,7 @@ class ListTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActio
         self._jumpBackToOrigin()
 
     def onTabRenamed(self, newName):
-        # MainWindow.renameCurrentTab() calls this (if present) right
-        # after updating panel.TAB_NAME in memory -- persists the new
-        # name into this tab's existing db.get_open_temp_tabs() entry
-        # so it survives past this session (previously session-only).
-        # Overrides RemovableTabMixin's no-op stub -- ListTabWindow IS
-        # user-renameable, unlike the other RemovableTabMixin hosts.
+        # Persists the rename (overrides RemovableTabMixin's no-op; this tab is renameable).
         if self._account is not None:
             db.set_temp_tab_custom_name(self._account["id"], "list", self._feedKey, newName)
     
