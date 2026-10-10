@@ -369,20 +369,22 @@ The kinds of tab that can open on demand are:
 
 ## Real-time updates (Jetstream)
 
-Normally NVSky checks for new content on a schedule (see Settings > General). You can instead turn on **Enable real-time Home feed updates (Jetstream)** in **Settings > General**. NVSky then keeps a live connection open to Bluesky's public Jetstream stream, and new content appears within moments of being posted, with the same sound and announcement as a background check.
+Normally NVSky checks for new content on a schedule (see Settings > General). You can also turn on **Enable real-time Home feed updates (Jetstream)** in **Settings > General**. NVSky then keeps a live connection open to Bluesky's public Jetstream stream, and new content appears within moments of being posted, with the same sound and announcement as a background check.
 
 What it covers:
 
 - **Home (Following feed):** new posts and reposts from people you follow, and your own.
 - **Lists:** new posts from the members of your curation lists, including any list open in its own tab. Reposts are not included, the same as in Bluesky's own list timelines.
 
-While it is on, Jetstream replaces the scheduled checks for Home and Lists, and their interval fields are hidden in Settings. It starts by itself when NVDA starts, reconnects by itself after a network drop or after your computer sleeps, and catches up on what you missed. A burst of catch-up content is announced once, not once per post.
+The scheduled checks for Home and Lists keep running as a backup. If you set their intervals to 0 to rely on real-time updates alone, and Jetstream can't start (see below), Home and Lists only update when you press F5. Jetstream starts by itself when NVDA starts, reconnects by itself after a network drop or after your computer sleeps, and catches up on what you missed. A burst of catch-up content is announced once, not once per post.
 
 Things you should know:
 
 - The people you follow and the members of your lists are read **once, when Jetstream starts**. If you follow or unfollow someone, or change list members, turn Jetstream off and on again in Settings (or restart NVDA) so it notices.
 - It does **not** cover Notifications, Chat, Discover, custom feeds, or saved searches. Those keep using scheduled checks and F5.
 - It keeps a connection open and handles a steady stream of events, so it uses a little extra network and processor time for as long as NVSky is running.
+- Bluesky's real-time service refuses requests that name a very long list of accounts. In our tests it accepted 300 accounts and refused 1,000. When the accounts you follow plus the members of your lists add up to roughly 250 or more, real-time updates do not start. NVSky tells you so and keeps using the scheduled checks. Bluesky's older real-time service has another way to take a long list, but in our test it ignored the list and sent everything, so NVSky does not use it that way.
+- Real-time updates have only been tried with real accounts that follow a few dozen people. Longer lists were tested with made-up account IDs only. If real-time updates never start or stop working, turn off Jetstream in Settings > General.
 
 ## Settings
 
@@ -405,7 +407,7 @@ These actions take effect immediately and don't wait for OK. Switching accounts 
 - **Enter key action on a post:** what pressing Enter does on a post. Choices are View thread (the default), Reply, Quote post, Repost / Undo repost, Like / Unlike, and Toggle read/unread.
 - **Speak when background sync finds new content in:** a checklist of categories. For each one you check, NVSky speaks a short announcement when a background check finds something new. All are checked by default. A sound still plays if the sound is enabled for it.
 - **Background sync intervals:** how often, in minutes, each category is checked while you aren't looking at it. Setting it to 0 turns that category off. The categories are Home, Notifications, Saved / Likes, Chat, Lists, Search / feed previews, Profile / people & post lists, and Thread. Saved / Likes is off by default.
-- **Enable real-time Home feed updates (Jetstream):** see [Real-time updates](#real-time-updates-jetstream). While this is on, the Home and Lists interval fields are hidden.
+- **Enable real-time Home feed updates (Jetstream):** see [Real-time updates](#real-time-updates-jetstream). The Home and Lists scheduled checks keep running as a backup.
 - **Clear all cache:** deletes every saved post, notification, chat message, and list for the active account. You stay logged in. Every tab is empty until the next check. This asks you to confirm.
 
 ### Display
@@ -515,6 +517,8 @@ If you use NVSky on more than one computer, log in separately on each. This is e
 - If Bluesky limits how fast your account can make requests, NVSky tells you roughly how long to wait instead of showing a raw error. Background checks resume by themselves afterwards.
 - Occasionally, while you read through a feed, the status bar may show the wrong text instead of the unread count. Switching to another tab and back fixes it.
 - NVSky has only been tested with a small number of accounts. Setting up a brand new account, and accounts with a very large number of followers, lists, or conversations, have not been verified.
+- Real-time updates (Jetstream) are not available when you follow, and list, roughly 250 accounts or more. See [Real-time updates](#real-time-updates-jetstream).
+- If you use more than one account, a post that two of your accounts have both seen shares some saved state, such as whether you liked or reposted it. After you switch accounts, press F5 so NVSky refreshes it. Until then, Like, Repost, or Save on such a post may report an error.
 - Because the notification area icon is removed and added again when its count changes, NVDA's focus may jump to another icon if you are on the NVSky icon at that moment. NVSky tries to bring focus back, but you may need to move back yourself. See [Notification area icon](#notification-area-icon).
 
 ## Additional information
