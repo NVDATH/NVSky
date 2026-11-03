@@ -7,7 +7,7 @@ dialogs (AddListDialog, SubscribeListDialog, ManageMembersDialog,
 AddToListDialog) are used from this tab and from UserActionMixin's
 "Add to list..."/"View their lists..." actions.
 """
-import threading
+
 import wx
 
 import gui
@@ -19,12 +19,14 @@ from . import db
 from . import client
 from . import uiutil
 from . import soundpack
+from . import keymap
 from .feedWindow import (
     RemovableTabMixin,
     FeedListMixin,
     ItemActionMixin,
     UserActionMixin,
     EmbedViewMixin,
+    _VirtualPostList,
     _announce_now,
 )
 
@@ -192,12 +194,9 @@ class SubscribeListDialog(wx.Dialog):
         gui.mainFrame.postPopup()
         parent = self.GetParent()
         self.Destroy()
-        # subscribeButton only exists when this dialog was opened from
-        # ListsWindow's toolbar -- the preselected-user flow (View their
-        # lists...) can be opened from any UserActionMixin host, which
-        # has no such button.
-        if parent is not None and hasattr(parent, "subscribeButton"):
-            parent.subscribeButton.SetFocus()
+        # Only the Lists tab has a list tree to return to; other hosts keep their own focus.
+        if parent is not None and hasattr(parent, "listTree"):
+            parent.listTree.SetFocus()
 
     def onUserSearchChanged(self, evt):
         wx.CallLater(400, self._runUserSearch, self.userSearchText.GetValue())
@@ -220,7 +219,7 @@ class SubscribeListDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onUserSearchDone, results, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onUserSearchDone(self, results, error):
@@ -564,7 +563,7 @@ class ManageMembersDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onSearchDone, results, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onSearchDone(self, results, error):
@@ -773,6 +772,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
     SUPPORTS_FOCUS_NEXT_UNREAD = True
     SUPPORTS_SELECT_ALL = True
     SUPPORTS_JUMP_TO_USER = True
+    VIRTUAL_LIST = True
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -796,7 +796,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         self._listRoot = self.listTree.AddRoot(_("Lists"))
         splitRow.Add(self.listTree, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
 
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
+        self.postList = _VirtualPostList(self, self._cellAt)
         self._buildFeedListColumns()
         splitRow.Add(self.postList, proportion=2, flag=wx.EXPAND)
 
@@ -811,10 +811,10 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         sizer.Add(splitRow, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to open the Post action menu. Shows the Alt+A shortcut.
-        self.postActionButton = wx.Button(self, label=_("&Post action... (Alt+A)"))
-        # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
-        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
+        # Translators: Button to open the Post action menu. The current shortcut is appended automatically.
+        self.postActionButton = wx.Button(self, label=_("&Post action...") + keymap.hint("post_action"))
+        # Translators: Button to open the User action menu. The current shortcut is appended automatically.
+        self.userActionButton = wx.Button(self, label=_("&User action...") + keymap.hint("user_action"))
         actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.userActionButton)
         sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
@@ -828,36 +828,11 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         self.userActionButton.Hide()
         self.userActionButton.Disable()
 
-        toolbarRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to create a new list. (Hidden -- kept as a real widget for onAddList()'s focus-restore calls; the shared toolbar's New-post button becomes "New list..." on this tab instead.)
-        self.addListButton = wx.Button(self, label=_("Add list..."))
-        # Translators: Button to remove the selected list. (Hidden -- moved into the list tree's context menu.)
-        self.removeListButton = wx.Button(self, label=_("Remove list"))
-        # Translators: Button to open the selected list in its own tab. (Hidden -- moved into the list tree's context menu.)
-        self.showInNewTabButton = wx.Button(self, label=_("Show in new tab"))
-        # Translators: Button to manage the selected list's members. (Hidden -- moved into the list tree's context menu.)
-        self.manageMembersButton = wx.Button(self, label=_("Manage members..."))
-        # Translators: Button to find and subscribe to lists by another user.
-        self.subscribeButton = wx.Button(self, label=_("&Find lists by user..."))
-        for button in (self.addListButton, self.removeListButton, self.showInNewTabButton, self.manageMembersButton, self.subscribeButton):
-            button.Hide()
-            button.Disable()
-        # Remove/Show in new tab/Manage members are in the tree's context menu,
-        # New list and Find lists are shared-toolbar buttons. These widgets
-        # stay (hidden) only because handlers and focus calls reference them.
-        toolbarRow.Add(self.subscribeButton, flag=wx.RIGHT, border=5)
-        sizer.Add(toolbarRow, flag=wx.ALL, border=10)
-
         self.statusBar = wx.StatusBar(self)
         sizer.Add(self.statusBar, flag=wx.EXPAND)
 
         self.SetSizer(sizer)
 
-        self.addListButton.Bind(wx.EVT_BUTTON, self.onAddList)
-        self.removeListButton.Bind(wx.EVT_BUTTON, self.onRemoveList)
-        self.showInNewTabButton.Bind(wx.EVT_BUTTON, self.onShowInNewTab)
-        self.manageMembersButton.Bind(wx.EVT_BUTTON, self.onManageMembers)
-        self.subscribeButton.Bind(wx.EVT_BUTTON, self.onSubscribeViaLink)
         self.listTree.Bind(wx.EVT_TREE_SEL_CHANGED, self.onListSelected)
         self.listTree.Bind(wx.EVT_TREE_ITEM_MENU, self.onListContextMenu)
         self.listTree.Bind(wx.EVT_CHAR_HOOK, self.onListTreeCharHook)
@@ -1080,7 +1055,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         keyCode = evt.GetKeyCode()
         if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers():
             self._checkListTreeBoundaryBeforeKey(keyCode)
-        if keyCode == wx.WXK_DELETE and not evt.HasAnyModifiers():
+        if keymap.matches(evt, "remove_list"):
             self.onRemoveList()
             return
         evt.Skip()
@@ -1126,11 +1101,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         if self._selectedList["purpose"] == client.LIST_PURPOSE_MOD:
             self.postList.Hide()
             self.memberList.Show()
-            # Disable() too, not just Hide() -- CONFIRMED bug pattern
-            # elsewhere (ChatWindow's Accept button): a hidden-but-
-            # enabled button still fires its own mnemonic. Alt+U here
-            # collides with _onAltU's own list-purpose branching in
-            # this same class.
+            # Disable() too, not just Hide(): a hidden but enabled button still fires its mnemonic.
             self.postActionButton.Hide()
             self.postActionButton.Disable()
             self.userActionButton.Hide()
@@ -1248,7 +1219,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         name, description, purpose = dlg.getValues()
         dlg.Destroy()
         gui.mainFrame.postPopup()
-        self.addListButton.SetFocus()
+        self.listTree.SetFocus()
         if result != wx.ID_OK:
             return
         if not name:
@@ -1348,7 +1319,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             wx.CallAfter(self._onRemoveListDone, listUri, error)
 
         # Plain thread: start_worker would play the progress sound for an optimistic action.
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onRemoveListDone(self, listUri, error):
@@ -1415,7 +1386,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 error = str(e)
             wx.CallAfter(self._onToggleListMutedDone, lst, wasMuted, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onToggleListMutedDone(self, lst, previousMuted, error):
@@ -1456,7 +1427,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
                 error = str(e)
             wx.CallAfter(self._onToggleListBlockedDone, lst, previousBlockedUri, newUri, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onToggleListBlockedDone(self, lst, previousBlockedUri, newUri, error):
@@ -1525,7 +1496,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             except Exception as e:
                 log.error(f"NVSky: background list-members refresh failed: {e}")
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onManageMembersInfoReady(self, info, error):
@@ -1668,6 +1639,8 @@ class ListTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, UserActio
     so it can stay open and be checked for updates independently of
     the main Lists tab.
     """
+
+    VIRTUAL_LIST = True
 
     def __init__(self, parent, list_uri: str, list_name: str, origin_key: str = None):
         super().__init__(parent)

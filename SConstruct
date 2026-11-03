@@ -149,6 +149,11 @@ for dir_name in unwanted_dirs:
         shutil.rmtree(dir_path)
 
 # ---------- Add-on builder ----------
+def isExcludedFromBundle(pathInBundle):
+    import fnmatch
+    normalized = pathInBundle.replace(os.sep, "/")
+    return any(fnmatch.fnmatch(normalized, pattern) for pattern in buildVars.excludedFiles)
+
 def createAddonBundleFromPath(path, dest):
     basedir = os.path.abspath(path)
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
@@ -157,7 +162,7 @@ def createAddonBundleFromPath(path, dest):
             for filename in filenames:
                 pathInBundle = os.path.join(relativePath, filename)
                 absPath = os.path.join(dir, filename)
-                if pathInBundle not in buildVars.excludedFiles:
+                if not isExcludedFromBundle(pathInBundle):
                     z.write(absPath, pathInBundle)
     return dest
 

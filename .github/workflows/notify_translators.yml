@@ -66,12 +66,17 @@ jobs:
             // Testing for now with just the maintainer's own account.
             const assignees = [
               "NVDATH",
+              "ninhhoang205",
+              "ana-giselle-ar86",
+              "George-br",
+              "EdilbertoFonseca",
             ];
             const mentions = assignees.map(u => `@${u}`).join(" ");
             const repo = context.repo;
             const runUrl = `https://github.com/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`;
             const potRawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${context.ref.replace('refs/heads/','')}/NVSky.pot`;
             const changelogRawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${context.ref.replace('refs/heads/','')}/changelog.md`;
+            const readmeRawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${context.ref.replace('refs/heads/','')}/readme.md`;
 
             const body = [
               mentions,
@@ -80,9 +85,10 @@ jobs:
               "",
               `- Latest .pot file: ${potRawUrl}`,
               `- Latest changelog.md: ${changelogRawUrl}`,
-              `- Workflow run: ${runUrl}`,
+              `- Latest readme.md: ${readmeRawUrl}`,
               "",
               "How to update a translation: open your language's .po file in Poedit, press \"Update from POT\" and point it at the .pot file above, translate the new strings, then send the .po file back as a Pull Request.",
+              "The readme is translated as a file, not through the .po file: copy readme.md to addon/doc/<language code>/readme.md, translate it, and send it in the same Pull Request.",
             ].join("\n");
 
             await github.rest.issues.create({

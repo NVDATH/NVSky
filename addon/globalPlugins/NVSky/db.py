@@ -1,7 +1,16 @@
 """
-SQLite persistence layer for NVSky. See init_db() for schema.
-The database file lives under NVDA's user config directory, NOT inside the
-add-on folder (the add-on folder gets overwritten on every update).
+SQLite persistence layer for NVSky.
+
+One central database (nvsky.db) holds the account list and the settings shared by every
+account (the keymap). Each account has its own database file (nvsky_<account id>.db) with
+its posts, notifications, chats, lists and settings, so accounts never share cached state.
+All files live under NVDA's user config directory, NOT inside the add-on folder (the
+add-on folder gets overwritten on every update), and share one encryption key.
+
+Which account's file a call uses: the account_id argument when the function takes one,
+else the thread's account (account_context), else the active account. A background worker
+for an account that isn't the active one runs inside account_context, and then
+get_active_account() answers with that account for the whole thread.
 
 Uses sqlcipher3 (not plain sqlite3) for full database encryption. Its
 compiled extension bundles SQLCipher+OpenSSL statically, so no
@@ -10,8 +19,8 @@ let other add-ons' sqlite3.dll collide with ours).
 
 The DB encryption master key is a random 32-byte value, generated once and
 stored -- encrypted via the same DPAPI helpers as the App Password
-(crypto.py) -- in a small file next to the database. It can't live inside
-the database itself (can't read the key from the db you need the key to
+(crypto.py) -- in a small file next to the databases. It can't live inside
+a database itself (can't read the key from the db you need the key to
 open).
 """
 
@@ -31,8 +40,22 @@ from logHandler import log
 from . import crypto
 
 DB_DIR = os.path.join(globalVars.appArgs.configPath, "NVSky")
-DB_PATH = os.path.join(DB_DIR, "nvsky.db")
+DB_PATH = os.path.join(DB_DIR, "nvsky.db")  # the central database
 DB_KEY_PATH = os.path.join(DB_DIR, "db.key")
+
+_DB_FILE_RE = re.compile(r"^nvsky(?:_(\d+))?\.db(?:-wal|-shm)?$")
+
+# ui_state keys stored in the central database; every other key belongs to an account.
+SHARED_UI_KEYS = frozenset({"keymap"})
+SHARED_UI_PREFIXES = ("bg_enabled:",)
+
+
+class AccountRemovedError(Exception):
+    """A database was asked for an account that no longer exists."""
+
+
+def _account_db_path(account_id: int) -> str:
+    return os.path.join(DB_DIR, f"nvsky_{account_id}.db")
 
 
 def _get_or_create_db_key() -> str:
@@ -49,8 +72,14 @@ def _get_or_create_db_key() -> str:
     return key_hex
 
 
-_local = threading.local()
+_local = threading.local()  # .conns: database path -> this thread's connection
+_context = threading.local()  # .account_id: the account this thread works for
 _reset_lock = threading.Lock()
+_schema_lock = threading.Lock()
+_schema_ready = set()
+_active_lock = threading.Lock()
+_active_id = None
+_active_loaded = False
 
 
 def _is_unreadable_storage_error(e) -> bool:
@@ -58,18 +87,29 @@ def _is_unreadable_storage_error(e) -> bool:
     return "CryptUnprotectData" in text or "not a database" in text
 
 
-def _backup_unreadable_storage():
+def _db_files(path: str) -> list:
+    return [path, path + "-wal", path + "-shm"]
+
+
+def _backup_unreadable_storage(path: str, keyUnreadable: bool):
+    # An unreadable key loses every database with it; otherwise only the broken file goes.
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    for path in (DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm", DB_KEY_PATH):
-        if os.path.exists(path):
+    if keyUnreadable:
+        files = [os.path.join(DB_DIR, n) for n in os.listdir(DB_DIR) if _DB_FILE_RE.match(n)]
+        files.append(DB_KEY_PATH)
+    else:
+        files = _db_files(path)
+    for file in files:
+        _schema_ready.discard(file)
+        if os.path.exists(file):
             try:
-                os.replace(path, f"{path}.{stamp}.bak")
+                os.replace(file, f"{file}.{stamp}.bak")
             except OSError as e:
-                log.error(f"NVSky: could not back up {path}: {e}")
+                log.error(f"NVSky: could not back up {file}: {e}")
 
 
-def _open_connection():
-    conn = sqlite3.connect(DB_PATH)
+def _open_connection(path: str):
+    conn = sqlite3.connect(path)
     try:
         dbKey = _get_or_create_db_key()
         conn.execute(f"PRAGMA key = \"x'{dbKey}'\"")
@@ -83,33 +123,90 @@ def _open_connection():
     return conn
 
 
-def _get_connection():
-    # One connection per OS thread, reused for that thread's lifetime:
+def _get_connection(path: str):
+    # One connection per OS thread and database file, reused for that thread's lifetime:
     # reopening per query (SQLCipher key unlock) caused the MainWindow-open
     # freeze. No lock needed: connections are check_same_thread=True and
     # threading.local() never shares them.
-    conn = getattr(_local, "conn", None)
+    conns = getattr(_local, "conns", None)
+    if conns is None:
+        conns = _local.conns = {}
+    conn = conns.get(path)
     if conn is not None:
         return conn
     os.makedirs(DB_DIR, exist_ok=True)
+    if path != DB_PATH and not os.path.exists(path):
+        _require_account_for(path)
     try:
-        conn = _open_connection()
+        conn = _open_connection(path)
     except Exception as e:
         if not _is_unreadable_storage_error(e):
             raise
         with _reset_lock:
             log.error(f"NVSky: database/key unreadable, starting fresh: {e}")
-            _backup_unreadable_storage()
-            conn = _open_connection()
-    _local.conn = conn
+            _backup_unreadable_storage(path, "CryptUnprotectData" in str(e))
+            conn = _open_connection(path)
+    _ensure_schema(conn, path)
+    conns[path] = conn
     return conn
 
 
+def _require_account_for(path: str):
+    # A missing account file is only created for an account that exists: a worker finishing
+    # after its account was removed must not bring back an empty file.
+    match = _DB_FILE_RE.match(os.path.basename(path))
+    if match and match.group(1) and not account_exists(int(match.group(1))):
+        raise AccountRemovedError(f"account {match.group(1)} was removed")
+
+
+def _path_for(account_id) -> str:
+    if account_id is None:
+        account_id = current_account_id()
+    return DB_PATH if account_id is None else _account_db_path(account_id)
+
+
 @contextmanager
-def _connect():
+def _connect(account_id=None):
     # Context manager kept for `with _connect() as conn:` call sites; it
     # doesn't close the connection (see _get_connection). Writers commit explicitly.
-    yield _get_connection()
+    # With no account at all this is the central file, which also holds empty copies of
+    # the account tables so a call made before the first login doesn't fail.
+    yield _get_connection(_path_for(account_id))
+
+
+@contextmanager
+def _central():
+    yield _get_connection(DB_PATH)
+
+
+@contextmanager
+def account_context(account_id):
+    """Makes this thread work for `account_id` (its database, and get_active_account())."""
+    previous = getattr(_context, "account_id", None)
+    _context.account_id = account_id
+    try:
+        yield
+    finally:
+        _context.account_id = previous
+
+
+def current_account_id():
+    """The account this thread works for: its account_context, else the active account."""
+    override = getattr(_context, "account_id", None)
+    if override is not None:
+        return override
+    if not _active_loaded:
+        _refresh_active_id()
+    return _active_id
+
+
+def _refresh_active_id():
+    global _active_id, _active_loaded
+    with _central() as conn:
+        row = conn.execute("SELECT id FROM accounts WHERE is_active = 1").fetchone()
+    with _active_lock:
+        _active_id = row["id"] if row else None
+        _active_loaded = True
 
 
 def _addon_version_number() -> int:
@@ -124,153 +221,163 @@ def _addon_version_number() -> int:
         return 0
 
 
-def init_db():
-    with _connect() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY,
-                handle TEXT NOT NULL,
-                did TEXT NOT NULL UNIQUE,
-                encrypted_password BLOB NOT NULL,
-                is_active INTEGER DEFAULT 0,
-                chat_supported INTEGER DEFAULT 1
-            );
+_CENTRAL_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY,
+        handle TEXT NOT NULL,
+        did TEXT NOT NULL UNIQUE,
+        encrypted_password BLOB NOT NULL,
+        is_active INTEGER DEFAULT 0,
+        chat_supported INTEGER DEFAULT 1
+    );
+"""
 
-            CREATE TABLE IF NOT EXISTS authors (
-                did TEXT PRIMARY KEY,
-                handle TEXT,
-                display_name TEXT,
-                avatar_url TEXT,
-                viewer_following TEXT,
-                viewer_muted INTEGER DEFAULT 0,
-                viewer_blocking TEXT,
-                viewer_activity_subscription INTEGER DEFAULT 0
-            );
+_ACCOUNT_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS authors (
+        did TEXT PRIMARY KEY,
+        handle TEXT,
+        display_name TEXT,
+        avatar_url TEXT,
+        viewer_following TEXT,
+        viewer_muted INTEGER DEFAULT 0,
+        viewer_blocking TEXT,
+        viewer_activity_subscription INTEGER DEFAULT 0,
+        viewer_known INTEGER DEFAULT 1
+    );
 
-            CREATE TABLE IF NOT EXISTS posts (
-                uri TEXT PRIMARY KEY,
-                cid TEXT NOT NULL,
-                account_id INTEGER,
-                author_did TEXT,
-                text TEXT,
-                created_at TEXT,
-                indexed_at TEXT,
-                like_count INTEGER DEFAULT 0,
-                repost_count INTEGER DEFAULT 0,
-                reply_count INTEGER DEFAULT 0,
-                reply_parent_uri TEXT,
-                reply_to_did TEXT,
-                reply_to_handle TEXT,
-                is_repost INTEGER DEFAULT 0,
-                reposted_by_did TEXT,
-                reposted_by_handle TEXT,
-                reposted_by_display_name TEXT,
-                embed_json TEXT,
-                facets_json TEXT,
-                quoted_text TEXT,
-                quoted_author_handle TEXT,
-                is_read INTEGER DEFAULT 0,
-                is_hidden INTEGER DEFAULT 0,
-                viewer_like_uri TEXT,
-                viewer_repost_uri TEXT,
-                viewer_bookmarked INTEGER DEFAULT 0,
-                viewer_thread_muted INTEGER DEFAULT 0,
-                labels_json TEXT,
-                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                FOREIGN KEY (author_did) REFERENCES authors(did)
-            );
+    CREATE TABLE IF NOT EXISTS posts (
+        uri TEXT PRIMARY KEY,
+        cid TEXT NOT NULL,
+        account_id INTEGER,
+        author_did TEXT,
+        text TEXT,
+        created_at TEXT,
+        indexed_at TEXT,
+        like_count INTEGER DEFAULT 0,
+        repost_count INTEGER DEFAULT 0,
+        reply_count INTEGER DEFAULT 0,
+        reply_parent_uri TEXT,
+        reply_to_did TEXT,
+        reply_to_handle TEXT,
+        is_repost INTEGER DEFAULT 0,
+        reposted_by_did TEXT,
+        reposted_by_handle TEXT,
+        reposted_by_display_name TEXT,
+        embed_json TEXT,
+        facets_json TEXT,
+        quoted_text TEXT,
+        quoted_author_handle TEXT,
+        is_read INTEGER DEFAULT 0,
+        is_hidden INTEGER DEFAULT 0,
+        viewer_like_uri TEXT,
+        viewer_repost_uri TEXT,
+        viewer_bookmarked INTEGER DEFAULT 0,
+        viewer_thread_muted INTEGER DEFAULT 0,
+        labels_json TEXT,
+        FOREIGN KEY (author_did) REFERENCES authors(did)
+    );
 
-            CREATE INDEX IF NOT EXISTS idx_posts_indexed_at ON posts(indexed_at);
+    CREATE INDEX IF NOT EXISTS idx_posts_indexed_at ON posts(indexed_at);
 
-            CREATE TABLE IF NOT EXISTS feed_items (
-                account_id INTEGER,
-                feed_key TEXT,
-                uri TEXT,
-                indexed_at TEXT,
-                PRIMARY KEY (account_id, feed_key, uri),
-                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                FOREIGN KEY (uri) REFERENCES posts(uri) ON DELETE CASCADE
-            );
+    CREATE TABLE IF NOT EXISTS feed_items (
+        account_id INTEGER,
+        feed_key TEXT,
+        uri TEXT,
+        indexed_at TEXT,
+        PRIMARY KEY (account_id, feed_key, uri),
+        FOREIGN KEY (uri) REFERENCES posts(uri) ON DELETE CASCADE
+    );
 
-            CREATE INDEX IF NOT EXISTS idx_feed_items_lookup ON feed_items(account_id, feed_key, indexed_at);
+    CREATE INDEX IF NOT EXISTS idx_feed_items_lookup ON feed_items(account_id, feed_key, indexed_at);
 
-            CREATE TABLE IF NOT EXISTS notifications (
-                account_id INTEGER,
-                uri TEXT,
-                cid TEXT,
-                reason TEXT,
-                reason_subject TEXT,
-                subject_uri TEXT,
-                author_did TEXT,
-                indexed_at TEXT,
-                is_read INTEGER DEFAULT 0,
-                subject_text TEXT,
-                subject_author_handle TEXT,
-                PRIMARY KEY (account_id, uri)
-            );
+    CREATE TABLE IF NOT EXISTS notifications (
+        account_id INTEGER,
+        uri TEXT,
+        cid TEXT,
+        reason TEXT,
+        reason_subject TEXT,
+        subject_uri TEXT,
+        author_did TEXT,
+        indexed_at TEXT,
+        is_read INTEGER DEFAULT 0,
+        subject_text TEXT,
+        subject_author_handle TEXT,
+        PRIMARY KEY (account_id, uri)
+    );
 
-            CREATE INDEX IF NOT EXISTS idx_notifications_indexed_at ON notifications(account_id, indexed_at);
+    CREATE INDEX IF NOT EXISTS idx_notifications_indexed_at ON notifications(account_id, indexed_at);
 
-            CREATE TABLE IF NOT EXISTS convos (
-                account_id INTEGER NOT NULL,
-                convo_id TEXT NOT NULL,
-                is_group INTEGER DEFAULT 0,
-                group_name TEXT,
-                locked INTEGER DEFAULT 0,
-                is_admin INTEGER DEFAULT 0,
-                last_message_text TEXT,
-                last_message_sent_at TEXT,
-                unread_count INTEGER DEFAULT 0,
-                muted INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'accepted',
-                unread_join_request_count INTEGER DEFAULT 0,
-                PRIMARY KEY (account_id, convo_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_convos_last_message ON convos(account_id, last_message_sent_at);
+    CREATE TABLE IF NOT EXISTS convos (
+        account_id INTEGER NOT NULL,
+        convo_id TEXT NOT NULL,
+        is_group INTEGER DEFAULT 0,
+        group_name TEXT,
+        locked INTEGER DEFAULT 0,
+        is_admin INTEGER DEFAULT 0,
+        last_message_text TEXT,
+        last_message_sent_at TEXT,
+        unread_count INTEGER DEFAULT 0,
+        muted INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'accepted',
+        unread_join_request_count INTEGER DEFAULT 0,
+        PRIMARY KEY (account_id, convo_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_convos_last_message ON convos(account_id, last_message_sent_at);
 
-            CREATE TABLE IF NOT EXISTS convo_members (
-                account_id INTEGER NOT NULL,
-                convo_id TEXT NOT NULL,
-                did TEXT NOT NULL,
-                handle TEXT,
-                display_name TEXT,
-                PRIMARY KEY (account_id, convo_id, did)
-            );
+    CREATE TABLE IF NOT EXISTS convo_members (
+        account_id INTEGER NOT NULL,
+        convo_id TEXT NOT NULL,
+        did TEXT NOT NULL,
+        handle TEXT,
+        display_name TEXT,
+        PRIMARY KEY (account_id, convo_id, did)
+    );
 
-            CREATE TABLE IF NOT EXISTS messages (
-                account_id INTEGER NOT NULL,
-                convo_id TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                sender_did TEXT,
-                text TEXT,
-                sent_at TEXT,
-                reply_to_message_id TEXT,
-                reply_to_text TEXT,
-                is_read INTEGER DEFAULT 0,
-                reactions_json TEXT,
-                embed_json TEXT,
-                PRIMARY KEY (account_id, convo_id, message_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(account_id, convo_id, sent_at);
-            CREATE TABLE IF NOT EXISTS lists (
-                account_id INTEGER NOT NULL,
-                list_uri TEXT NOT NULL,
-                cid TEXT,
-                name TEXT,
-                description TEXT,
-                purpose TEXT,
-                creator_did TEXT,
-                creator_handle TEXT,
-                muted INTEGER DEFAULT 0,
-                blocked_uri TEXT,
-                PRIMARY KEY (account_id, list_uri)
-            );
+    CREATE TABLE IF NOT EXISTS messages (
+        account_id INTEGER NOT NULL,
+        convo_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        sender_did TEXT,
+        text TEXT,
+        sent_at TEXT,
+        reply_to_message_id TEXT,
+        reply_to_text TEXT,
+        is_read INTEGER DEFAULT 0,
+        reactions_json TEXT,
+        embed_json TEXT,
+        PRIMARY KEY (account_id, convo_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(account_id, convo_id, sent_at);
+    CREATE TABLE IF NOT EXISTS lists (
+        account_id INTEGER NOT NULL,
+        list_uri TEXT NOT NULL,
+        cid TEXT,
+        name TEXT,
+        description TEXT,
+        purpose TEXT,
+        creator_did TEXT,
+        creator_handle TEXT,
+        muted INTEGER DEFAULT 0,
+        blocked_uri TEXT,
+        PRIMARY KEY (account_id, list_uri)
+    );
 
-            CREATE TABLE IF NOT EXISTS ui_state (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
+    CREATE TABLE IF NOT EXISTS ui_state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+"""
+
+
+def _ensure_schema(conn, path: str):
+    if path in _schema_ready:
+        return
+    with _schema_lock:
+        if path in _schema_ready:
+            return
+        if path == DB_PATH:
+            conn.executescript(_CENTRAL_SCHEMA)
+        conn.executescript(_ACCOUNT_SCHEMA)
         # Steps are keyed by the release that introduced them (1.2.0 -> 10200)
         # and must be idempotent, e.g. "if stored < 10200: ALTER TABLE ...".
         stored = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -278,13 +385,59 @@ def init_db():
         if current > stored:
             conn.execute(f"PRAGMA user_version = {current}")
         conn.commit()
+        _schema_ready.add(path)
+
+
+def init_db():
+    with _central():
+        pass  # opens the central file and creates its schema
+    _refresh_active_id()
+    _remove_orphan_files()
     log.info(f"NVSky: database ready at {DB_PATH}")
+
+
+def _remove_orphan_files():
+    # Account files left behind by a failed delete or a reset central database.
+    known = {a["id"] for a in get_all_accounts()}
+    try:
+        names = os.listdir(DB_DIR)
+    except OSError:
+        return
+    for name in names:
+        match = _DB_FILE_RE.match(name)
+        if match and match.group(1) and int(match.group(1)) not in known:
+            try:
+                os.remove(os.path.join(DB_DIR, name))
+            except OSError:
+                pass
+
+
+def _delete_account_files(account_id: int):
+    path = _account_db_path(account_id)
+    _schema_ready.discard(path)
+    for file in _db_files(path):
+        if os.path.exists(file):
+            try:
+                os.remove(file)
+            except OSError as e:
+                log.error(f"NVSky: could not delete {file}: {e}")
+
+
+def _close_connection_for(path: str):
+    conns = getattr(_local, "conns", None)
+    conn = conns.pop(path, None) if conns else None
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception as e:
+            log.error(f"NVSky: closing DB connection failed: {e}")
 
 
 # ---------------- accounts ----------------
 
 def upsert_account(handle: str, did: str, encrypted_password: bytes) -> int:
-    with _connect() as conn:
+    with _central() as conn:
+        existing = conn.execute("SELECT id FROM accounts WHERE did = ?", (did,)).fetchone()
         conn.execute(
             """INSERT INTO accounts (handle, did, encrypted_password)
                VALUES (?, ?, ?)
@@ -294,46 +447,61 @@ def upsert_account(handle: str, did: str, encrypted_password: bytes) -> int:
             (handle, did, encrypted_password),
         )
         conn.commit()
-        row = conn.execute("SELECT id FROM accounts WHERE did = ?", (did,)).fetchone()
-        return row["id"]
+        accountId = conn.execute("SELECT id FROM accounts WHERE did = ?", (did,)).fetchone()["id"]
+    if existing is None:
+        # A new account must never inherit a file left by an earlier account with the same id.
+        _delete_account_files(accountId)
+    return accountId
 
 
 def set_active_account(account_id: int):
-    with _connect() as conn:
+    global _active_id, _active_loaded
+    with _central() as conn:
         conn.execute("UPDATE accounts SET is_active = 0")
         conn.execute("UPDATE accounts SET is_active = 1 WHERE id = ?", (account_id,))
         conn.commit()
+    with _active_lock:
+        _active_id = account_id
+        _active_loaded = True
 
 
 def get_active_account():
-    with _connect() as conn:
-        row = conn.execute("SELECT * FROM accounts WHERE is_active = 1").fetchone()
+    """The account this thread works for (see account_context), else the active account."""
+    override = getattr(_context, "account_id", None)
+    with _central() as conn:
+        if override is not None:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (override,)).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM accounts WHERE is_active = 1").fetchone()
         return dict(row) if row else None
 
 
+def account_exists(account_id: int) -> bool:
+    with _central() as conn:
+        return conn.execute("SELECT 1 FROM accounts WHERE id = ?", (account_id,)).fetchone() is not None
+
+
 def get_all_accounts():
-    with _connect() as conn:
-        rows = conn.execute("SELECT id, handle, did, is_active FROM accounts").fetchall()
+    with _central() as conn:
+        rows = conn.execute("SELECT id, handle, did, is_active FROM accounts ORDER BY id").fetchall()
         return [dict(r) for r in rows]
 
 
 def remove_account(account_id: int):
-    with _connect() as conn:
+    with _central() as conn:
         conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        # Only posts has a cascading FK to accounts; delete the rest explicitly.
-        conn.execute("DELETE FROM convos WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM messages WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM convo_members WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM notifications WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM lists WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"%:{account_id}",))
-        conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"user_list_cache:{account_id}:%",))
+        conn.execute("DELETE FROM ui_state WHERE key = ?", (f"bg_enabled:{account_id}",))
+        # Removing the active account must not leave NVSky with none while others remain.
+        if conn.execute("SELECT 1 FROM accounts WHERE is_active = 1").fetchone() is None:
+            conn.execute("UPDATE accounts SET is_active = 1 WHERE id = (SELECT MIN(id) FROM accounts)")
         conn.commit()
-        conn.execute("VACUUM")
+    _refresh_active_id()
+    _close_connection_for(_account_db_path(account_id))
+    _delete_account_files(account_id)  # another thread's open handle makes this fail; the next start sweeps it
 
 
 def set_chat_supported(account_id: int, supported: bool):
-    with _connect() as conn:
+    with _central() as conn:
         conn.execute(
             "UPDATE accounts SET chat_supported = ? WHERE id = ?",
             (int(supported), account_id),
@@ -343,42 +511,42 @@ def set_chat_supported(account_id: int, supported: bool):
 
 def close_all_connections():
     """
-    Checkpoints the WAL and closes the CURRENT thread's connection. Called
+    Checkpoints the WAL and closes the CURRENT thread's connections. Called
     from terminate() (main thread) and at the end of background workers.
     Other threads' connections can't be closed from here
     (check_same_thread), so a sync mid-flight at shutdown keeps its file
     handle until the process exits; disable the add-on before copying the
     NVDA profile.
     """
-    conn = getattr(_local, "conn", None)
-    if conn is None:
+    conns = getattr(_local, "conns", None)
+    if not conns:
         return
-    try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.commit()
-    except Exception as e:
-        log.error(f"NVSky: WAL checkpoint on shutdown failed: {e}")
-    try:
-        conn.close()
-    except Exception as e:
-        log.error(f"NVSky: closing DB connection on shutdown failed: {e}")
-    _local.conn = None
+    for conn in list(conns.values()):
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.commit()
+        except Exception as e:
+            log.error(f"NVSky: WAL checkpoint on shutdown failed: {e}")
+        try:
+            conn.close()
+        except Exception as e:
+            log.error(f"NVSky: closing DB connection on shutdown failed: {e}")
+    conns.clear()
 
 
 def clear_all_cache(account_id: int):
     """
-    Settings > General "Clear all cache": like remove_account but keeps
-    the accounts row (stays logged in).
+    Settings > General "Clear all cache": empties the account's cached data but
+    keeps its login and its settings (stays logged in).
     """
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         # posts cascades into feed_items via its FK.
-        conn.execute("DELETE FROM posts WHERE account_id = ?", (account_id,))
-        # These have no FK to accounts; delete explicitly.
-        conn.execute("DELETE FROM notifications WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM convos WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM messages WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM convo_members WHERE account_id = ?", (account_id,))
-        conn.execute("DELETE FROM lists WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM posts")
+        conn.execute("DELETE FROM notifications")
+        conn.execute("DELETE FROM convos")
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM convo_members")
+        conn.execute("DELETE FROM lists")
         # ui_state has no account_id column; per-account keys end with
         # ":<id>", except "user_list_cache:<id>:<key>".
         conn.execute("DELETE FROM ui_state WHERE key LIKE ?", (f"%:{account_id}",))
@@ -391,11 +559,12 @@ def clear_all_cache(account_id: int):
 
 def upsert_author(did: str, handle: str, display_name: str, avatar_url: str,
                    viewer_following=None, viewer_muted=False, viewer_blocking=None,
-                   viewer_activity_subscription=False):
+                   viewer_activity_subscription=False, viewer_known=True):
+    # viewer_known=False: the viewer_* columns are placeholders, so menus must re-check the server.
     with _connect() as conn:
         conn.execute(
-            """INSERT INTO authors (did, handle, display_name, avatar_url, viewer_following, viewer_muted, viewer_blocking, viewer_activity_subscription)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO authors (did, handle, display_name, avatar_url, viewer_following, viewer_muted, viewer_blocking, viewer_activity_subscription, viewer_known)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(did) DO UPDATE SET
                    handle=excluded.handle,
                    display_name=excluded.display_name,
@@ -403,9 +572,10 @@ def upsert_author(did: str, handle: str, display_name: str, avatar_url: str,
                    viewer_following=excluded.viewer_following,
                    viewer_muted=excluded.viewer_muted,
                    viewer_blocking=excluded.viewer_blocking,
-                   viewer_activity_subscription=excluded.viewer_activity_subscription""",
+                   viewer_activity_subscription=excluded.viewer_activity_subscription,
+                   viewer_known=excluded.viewer_known""",
             (did, handle, display_name, avatar_url, viewer_following, int(bool(viewer_muted)), viewer_blocking,
-             int(bool(viewer_activity_subscription))),
+             int(bool(viewer_activity_subscription)), int(bool(viewer_known))),
         )
         conn.commit()
 
@@ -466,7 +636,7 @@ def cache_relationship_authors(users: list, kind: str):
 
 def upsert_post(post: dict):
     """is_read/is_hidden stay out of ON CONFLICT SET -- local state, never overwritten by re-sync."""
-    with _connect() as conn:
+    with _connect(post.get("account_id")) as conn:
         conn.execute(
             """INSERT INTO posts
                (uri, cid, account_id, author_did, text, created_at, indexed_at,
@@ -512,7 +682,7 @@ def upsert_feed_item(account_id: int, feed_key: str, uri: str, indexed_at: str):
     position `indexed_at`. Separate from upsert_post so the same post
     can independently belong to several feeds (Home, a custom Feed, a
     List, ...) without the feeds colliding on the post's own PK."""
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             """INSERT INTO feed_items (account_id, feed_key, uri, indexed_at)
                VALUES (?, ?, ?, ?)
@@ -528,7 +698,7 @@ def clear_feed_key_cache(account_id: int, feed_key: str):
     Removes every feed_items row for one feed_key (Ctrl+Delete in a tab).
     Leaves the shared posts table alone; other feeds may reference those rows.
     """
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "DELETE FROM feed_items WHERE account_id = ? AND feed_key = ?",
             (account_id, feed_key),
@@ -539,7 +709,7 @@ def clear_feed_key_cache(account_id: int, feed_key: str):
 def delete_feed_item(account_id: int, feed_key: str, uri: str):
     """Reverse of upsert_feed_item. Needed where items can disappear
     (e.g. Saved after unbookmarking): a sync only adds/updates rows."""
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "DELETE FROM feed_items WHERE account_id = ? AND feed_key = ? AND uri = ?",
             (account_id, feed_key, uri),
@@ -561,7 +731,7 @@ def get_feed_page(account_id: int, feed_key: str, before_indexed_at: str = None,
         query += " LIMIT ?"
         params.append(limit)
 
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
@@ -582,7 +752,7 @@ def get_post(uri: str):
 
 def upsert_convo(convo: dict):
     # Plain overwrite of every field: client._store_convo derives them reliably each sync.
-    with _connect() as conn:
+    with _connect(convo.get("account_id")) as conn:
         conn.execute(
             """INSERT INTO convos
                (account_id, convo_id, is_group, group_name, locked, is_admin,
@@ -614,7 +784,7 @@ def replace_convo_members(account_id: int, convo_id: str, members: list):
     membership lists are small. Called every time a convo is stored
     (client._store_convo, i.e. every sync_convos/sync_convo_messages).
     """
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "DELETE FROM convo_members WHERE account_id = ? AND convo_id = ?",
             (account_id, convo_id),
@@ -629,7 +799,7 @@ def replace_convo_members(account_id: int, convo_id: str, members: list):
 
 
 def get_convo_members(account_id: int, convo_id: str):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         rows = conn.execute(
             "SELECT did, handle, display_name FROM convo_members WHERE account_id = ? AND convo_id = ?",
             (account_id, convo_id),
@@ -659,7 +829,7 @@ def describe_convo_from_members(convo: dict, members: list) -> str:
 def get_convos(account_id: int):
     # NULL last_message_sent_at (e.g. a new group with no messages) sorts
     # lowest under DESC; the CASE puts those convos first instead.
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         rows = conn.execute(
             """SELECT * FROM convos WHERE account_id = ?
                ORDER BY CASE WHEN last_message_sent_at IS NULL THEN 0 ELSE 1 END,
@@ -670,7 +840,7 @@ def get_convos(account_id: int):
 
 
 def get_convo(account_id: int, convo_id: str):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         row = conn.execute(
             "SELECT * FROM convos WHERE account_id = ? AND convo_id = ?",
             (account_id, convo_id),
@@ -679,7 +849,7 @@ def get_convo(account_id: int, convo_id: str):
 
 
 def mark_convo_read_local(account_id: int, convo_id: str):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE convos SET unread_count = 0 WHERE account_id = ? AND convo_id = ?",
             (account_id, convo_id),
@@ -689,15 +859,11 @@ def mark_convo_read_local(account_id: int, convo_id: str):
 
 def set_convo_unread_count(account_id: int, convo_id: str, unread_count: int):
     """
-    Keeps the cached convos.unread_count column in sync with local read
-    progress pushed to the server one message at a time (see
-    chatWindow.py's _pushMessageReadToServer). Without this,
-    reconcile_message_read_state() on the NEXT sync re-derives every
-    message's is_read from a STALE, too-high unread_count still sitting
-    in this column -- confirmed as the cause of "read locally, but a
-    refresh brings the unread count back."
+    Keeps convos.unread_count in step with local read progress pushed to the server (see
+    chatWindow's _pushMessageReadToServer); otherwise reconcile_message_read_state() on the next
+    sync re-derives is_read from a stale, too-high count.
     """
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE convos SET unread_count = ? WHERE account_id = ? AND convo_id = ?",
             (unread_count, account_id, convo_id),
@@ -706,7 +872,7 @@ def set_convo_unread_count(account_id: int, convo_id: str, unread_count: int):
 
 
 def delete_convo(account_id: int, convo_id: str):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute("DELETE FROM convos WHERE account_id = ? AND convo_id = ?", (account_id, convo_id))
         conn.execute("DELETE FROM messages WHERE account_id = ? AND convo_id = ?", (account_id, convo_id))
         conn.execute("DELETE FROM convo_members WHERE account_id = ? AND convo_id = ?", (account_id, convo_id))
@@ -714,7 +880,7 @@ def delete_convo(account_id: int, convo_id: str):
 
 
 def set_convo_group_name(account_id: int, convo_id: str, name: str):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE convos SET group_name = ? WHERE account_id = ? AND convo_id = ?",
             (name, account_id, convo_id),
@@ -727,7 +893,7 @@ def set_convo_locked(account_id: int, convo_id: str, locked: bool):
     # -- the authoritative value still comes from the server via the
     # normal convo-sync path, this just lets the UI reflect the
     # requested state immediately instead of waiting on it.
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE convos SET locked = ? WHERE account_id = ? AND convo_id = ?",
             (int(locked), account_id, convo_id),
@@ -737,7 +903,7 @@ def set_convo_locked(account_id: int, convo_id: str, locked: bool):
 
 def set_convo_muted(account_id: int, convo_id: str, muted: bool):
     # Local-first write for ChatWindow._toggleMuteConvo's optimistic UI.
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE convos SET muted = ? WHERE account_id = ? AND convo_id = ?",
             (int(muted), account_id, convo_id),
@@ -747,7 +913,7 @@ def set_convo_muted(account_id: int, convo_id: str, muted: bool):
 
 def set_convo_status(account_id: int, convo_id: str, status: str):
     # Local-first write for ChatWindow._acceptConvo's optimistic UI.
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE convos SET status = ? WHERE account_id = ? AND convo_id = ?",
             (status, account_id, convo_id),
@@ -756,7 +922,7 @@ def set_convo_status(account_id: int, convo_id: str, status: str):
 
 
 def upsert_list(list_row: dict):
-    with _connect() as conn:
+    with _connect(list_row.get("account_id")) as conn:
         conn.execute(
             """INSERT INTO lists
                (account_id, list_uri, cid, name, description, purpose,
@@ -778,7 +944,7 @@ def upsert_list(list_row: dict):
 
 
 def set_list_muted(account_id: int, list_uri: str, muted: bool):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE lists SET muted = ? WHERE account_id = ? AND list_uri = ?",
             (1 if muted else 0, account_id, list_uri),
@@ -787,7 +953,7 @@ def set_list_muted(account_id: int, list_uri: str, muted: bool):
 
 
 def set_list_blocked_uri(account_id: int, list_uri: str, blocked_uri):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE lists SET blocked_uri = ? WHERE account_id = ? AND list_uri = ?",
             (blocked_uri, account_id, list_uri),
@@ -796,7 +962,7 @@ def set_list_blocked_uri(account_id: int, list_uri: str, blocked_uri):
 
 
 def get_lists(account_id: int):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         rows = conn.execute(
             "SELECT * FROM lists WHERE account_id = ? ORDER BY name COLLATE NOCASE ASC",
             (account_id,),
@@ -805,7 +971,7 @@ def get_lists(account_id: int):
 
 
 def delete_list(account_id: int, list_uri: str):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute("DELETE FROM lists WHERE account_id = ? AND list_uri = ?", (account_id, list_uri))
         conn.execute("DELETE FROM feed_items WHERE account_id = ? AND feed_key = ?", (account_id, list_uri))
         conn.commit()
@@ -815,7 +981,7 @@ def upsert_message(message: dict):
     """is_read is never set here (new rows get DEFAULT 0; see
     reconcile_message_read_state/mark_message_read). reactions_json IS
     refreshed on every resync, since it's server-side data."""
-    with _connect() as conn:
+    with _connect(message.get("account_id")) as conn:
         conn.execute(
             """INSERT INTO messages
                (account_id, convo_id, message_id, sender_did, text, sent_at,
@@ -833,7 +999,7 @@ def upsert_message(message: dict):
         )
         conn.commit()
 def get_messages_for_convo(account_id: int, convo_id: str):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         rows = conn.execute(
             "SELECT * FROM messages WHERE account_id = ? AND convo_id = ? ORDER BY sent_at ASC",
             (account_id, convo_id),
@@ -845,7 +1011,7 @@ def mark_message_read(account_id: int, convo_id: str, message_id: str):
     # Scoped by the full (account_id, convo_id, message_id) key -- unlike
     # posts' mark_post_read(uri), a message_id alone isn't guaranteed
     # globally unique (see the messages table's actual PRIMARY KEY above).
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE messages SET is_read = 1 WHERE account_id = ? AND convo_id = ? AND message_id = ?",
             (account_id, convo_id, message_id),
@@ -854,7 +1020,7 @@ def mark_message_read(account_id: int, convo_id: str, message_id: str):
 
 
 def delete_message(account_id: int, convo_id: str, message_id: str):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "DELETE FROM messages WHERE account_id = ? AND convo_id = ? AND message_id = ?",
             (account_id, convo_id, message_id),
@@ -864,7 +1030,7 @@ def delete_message(account_id: int, convo_id: str, message_id: str):
 
 def set_message_reactions(account_id: int, convo_id: str, message_id: str, reactions_json: str):
     # Optimistic local write; the next sync overwrites it with the server's value.
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE messages SET reactions_json = ? WHERE account_id = ? AND convo_id = ? AND message_id = ?",
             (reactions_json, account_id, convo_id, message_id),
@@ -873,10 +1039,19 @@ def set_message_reactions(account_id: int, convo_id: str, message_id: str, react
 
 
 def get_unread_message_count(account_id: int, convo_id: str) -> int:
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         row = conn.execute(
             "SELECT COUNT(*) as c FROM messages WHERE account_id = ? AND convo_id = ? AND is_read = 0",
             (account_id, convo_id),
+        ).fetchone()
+        return row["c"] if row else 0
+
+
+def get_total_unread_message_count(account_id: int) -> int:
+    with _connect(account_id) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as c FROM messages WHERE account_id = ? AND is_read = 0",
+            (account_id,),
         ).fetchone()
         return row["c"] if row else 0
 
@@ -893,7 +1068,7 @@ def reconcile_message_read_state(account_id: int, convo_id: str, unread_count: i
     -- this is the reconciliation half of that two-way sync. Safe to
     re-run any time; always a full recompute, never incremental.
     """
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE messages SET is_read = 1 WHERE account_id = ? AND convo_id = ?",
             (account_id, convo_id),
@@ -915,7 +1090,7 @@ def mark_all_messages_read(account_id: int, convo_id: str):
     # separate from reconcile_message_read_state above since this one
     # is an unconditional "everything in this convo is read now",
     # not a resync-driven recompute.
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute(
             "UPDATE messages SET is_read = 1 WHERE account_id = ? AND convo_id = ?",
             (account_id, convo_id),
@@ -969,7 +1144,7 @@ def set_post_thread_muted(uri: str, muted: bool):
         conn.commit()
 
 def get_unread_count(account_id: int, feed_key: str) -> int:
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         row = conn.execute(
             """SELECT COUNT(*) as c FROM feed_items f
                JOIN posts p ON p.uri = f.uri
@@ -982,7 +1157,7 @@ def get_unread_count(account_id: int, feed_key: str) -> int:
 # ---------------- notifications ----------------
 
 def upsert_notification(notif: dict):
-    with _connect() as conn:
+    with _connect(notif.get("account_id")) as conn:
         conn.execute(
             """INSERT INTO notifications
                (account_id, uri, cid, reason, reason_subject, subject_uri, author_did, indexed_at,
@@ -1016,13 +1191,13 @@ def get_notification_page(account_id: int, before_indexed_at: str = None, limit:
         query += " LIMIT ?"
         params.append(limit)
 
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
 
 def get_unread_notification_count(account_id: int) -> int:
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         row = conn.execute(
             "SELECT COUNT(*) as c FROM notifications WHERE account_id = ? AND is_read = 0",
             (account_id,),
@@ -1043,7 +1218,7 @@ def mark_notification_unread(uri: str):
 
 
 def clear_notifications_cache(account_id: int):
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         conn.execute("DELETE FROM notifications WHERE account_id = ?", (account_id,))
         # Without this, the next sync stops at the old resume point and stores nothing.
         conn.execute("DELETE FROM ui_state WHERE key = ?", (f"notification_sync_cursor:{account_id}",))
@@ -1053,8 +1228,14 @@ def clear_notifications_cache(account_id: int):
 
 # ---------------- ui_state ----------------
 
-def set_ui_state(key: str, value: str):
-    with _connect() as conn:
+def _ui_connect(key: str, account_id):
+    if key in SHARED_UI_KEYS or key.startswith(SHARED_UI_PREFIXES):
+        return _central()
+    return _connect(account_id)
+
+
+def set_ui_state(key: str, value: str, account_id=None):
+    with _ui_connect(key, account_id) as conn:
         conn.execute(
             """INSERT INTO ui_state (key, value) VALUES (?, ?)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
@@ -1063,14 +1244,14 @@ def set_ui_state(key: str, value: str):
         conn.commit()
 
 
-def get_ui_state(key: str):
-    with _connect() as conn:
+def get_ui_state(key: str, account_id=None):
+    with _ui_connect(key, account_id) as conn:
         row = conn.execute("SELECT value FROM ui_state WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
 
-def delete_ui_state(key: str):
-    with _connect() as conn:
+def delete_ui_state(key: str, account_id=None):
+    with _ui_connect(key, account_id) as conn:
         conn.execute("DELETE FROM ui_state WHERE key = ?", (key,))
         conn.commit()
 
@@ -1081,11 +1262,11 @@ def delete_ui_state(key: str):
 # a getPreferences + getFeedGenerators round trip on every Settings open.
 
 def set_saved_feeds_cache(account_id: int, feeds: list):
-    set_ui_state(f"saved_feeds_cache:{account_id}", json.dumps(feeds))
+    set_ui_state(f"saved_feeds_cache:{account_id}", json.dumps(feeds), account_id)
 
 
 def get_saved_feeds_cache(account_id: int) -> list:
-    raw = get_ui_state(f"saved_feeds_cache:{account_id}")
+    raw = get_ui_state(f"saved_feeds_cache:{account_id}", account_id)
     if not raw:
         return []
     try:
@@ -1101,7 +1282,7 @@ def get_saved_feeds_cache(account_id: int) -> list:
 # callers fall back to client.CONTENT_LABEL_DEFAULT_VISIBILITY.
 
 def get_content_label_prefs_cache(account_id: int) -> dict:
-    raw = get_ui_state(f"content_label_prefs_cache:{account_id}")
+    raw = get_ui_state(f"content_label_prefs_cache:{account_id}", account_id)
     if not raw:
         return {}
     try:
@@ -1111,7 +1292,7 @@ def get_content_label_prefs_cache(account_id: int) -> dict:
 
 
 def set_content_label_prefs_cache(account_id: int, prefs: dict):
-    set_ui_state(f"content_label_prefs_cache:{account_id}", json.dumps(prefs))
+    set_ui_state(f"content_label_prefs_cache:{account_id}", json.dumps(prefs), account_id)
 
 
 # ---------------- user list cache (followers/following/people-search tabs) ----------------
@@ -1125,7 +1306,7 @@ def get_user_list_cache(account_id: int, list_key: str):
     # Returns None (not []) when nothing has been cached yet, so
     # callers can tell that apart from a real, confirmed-empty list
     # (e.g. an account with zero followers).
-    raw = get_ui_state(f"user_list_cache:{account_id}:{list_key}")
+    raw = get_ui_state(f"user_list_cache:{account_id}:{list_key}", account_id)
     if raw is None:
         return None
     try:
@@ -1135,11 +1316,11 @@ def get_user_list_cache(account_id: int, list_key: str):
 
 
 def set_user_list_cache(account_id: int, list_key: str, users: list):
-    set_ui_state(f"user_list_cache:{account_id}:{list_key}", json.dumps(users))
+    set_ui_state(f"user_list_cache:{account_id}:{list_key}", json.dumps(users), account_id)
 
 
 def delete_user_list_cache(account_id: int, list_key: str):
-    delete_ui_state(f"user_list_cache:{account_id}:{list_key}")
+    delete_ui_state(f"user_list_cache:{account_id}:{list_key}", account_id)
 
 
 # ---------------- background sync scheduler ----------------
@@ -1187,29 +1368,29 @@ def set_bg_sync_announce_categories(categories: set):
 def get_bg_sync_last(account_id: int, category: str):
     """ISO timestamp string of the last successful background sync for
     this category, or None if it's never run yet."""
-    return get_ui_state(f"bg_sync_last:{category}:{account_id}")
+    return get_ui_state(f"bg_sync_last:{category}:{account_id}", account_id)
 
 
 def set_bg_sync_last(account_id: int, category: str, iso_timestamp: str):
-    set_ui_state(f"bg_sync_last:{category}:{account_id}", iso_timestamp)
+    set_ui_state(f"bg_sync_last:{category}:{account_id}", iso_timestamp, account_id)
 
 
 def get_chat_log_cursor(account_id: int):
     """chat.bsky.convo.getLog cursor for background delta-sync (see
     client.sync_chat_delta) -- None means never synced this way yet,
     triggers a one-time full bootstrap sync."""
-    return get_ui_state(f"chat_log_cursor:{account_id}")
+    return get_ui_state(f"chat_log_cursor:{account_id}", account_id)
 
 
 def set_chat_log_cursor(account_id: int, cursor: str):
-    set_ui_state(f"chat_log_cursor:{account_id}", cursor)
+    set_ui_state(f"chat_log_cursor:{account_id}", cursor, account_id)
 
 
 def get_jetstream_cursor(account_id: int):
     """Jetstream time_us cursor (see jetstream.JetstreamClient) --
     None means never connected before, starts from "now" (no cursor
     param sent)."""
-    raw = get_ui_state(f"jetstream_cursor:{account_id}")
+    raw = get_ui_state(f"jetstream_cursor:{account_id}", account_id)
     if raw is None:
         return None
     try:
@@ -1219,7 +1400,7 @@ def get_jetstream_cursor(account_id: int):
 
 
 def set_jetstream_cursor(account_id: int, time_us: int):
-    set_ui_state(f"jetstream_cursor:{account_id}", str(time_us))
+    set_ui_state(f"jetstream_cursor:{account_id}", str(time_us), account_id)
 
 
 def get_jetstream_enabled() -> bool:
@@ -1265,12 +1446,42 @@ def set_tray_per_tab(per_tab: bool) -> None:
     set_ui_state("tray_per_tab", "1" if per_tab else "0")
 
 
+def get_autoread_delay() -> int:
+    """Seconds to wait between rows in auto read (1 to 10)."""
+    try:
+        return max(1, min(10, int(get_ui_state("autoread_delay"))))
+    except (TypeError, ValueError):
+        return 2
+
+
+def set_autoread_delay(seconds: int) -> None:
+    set_ui_state("autoread_delay", str(max(1, min(10, int(seconds)))))
+
+
+def get_autoread_profile() -> str:
+    """Name of the NVDA profile whose voice auto read uses ("" = none)."""
+    return get_ui_state("autoread_profile") or ""
+
+
+def set_autoread_profile(name: str) -> None:
+    set_ui_state("autoread_profile", name or "")
+
+
+def get_bg_enabled(account_id: int) -> bool:
+    """Whether background sync checks this account (on unless turned off; kept in the central database)."""
+    return get_ui_state(f"bg_enabled:{account_id}", account_id) != "0"
+
+
+def set_bg_enabled(account_id: int, enabled: bool) -> None:
+    set_ui_state(f"bg_enabled:{account_id}", "1" if enabled else "0", account_id)
+
+
 def get_feed_item_indexed_at(account_id: int, feed_key: str, uri: str):
     """Existing sort-position timestamp for one feed_items row, or
     None if not cached yet -- used by client._store_feed_item to keep
     a self-repost's position from sinking when a subsequent sync
     doesn't frame it as a repost (see that function's own comment)."""
-    with _connect() as conn:
+    with _connect(account_id) as conn:
         row = conn.execute(
             "SELECT indexed_at FROM feed_items WHERE account_id = ? AND feed_key = ? AND uri = ?",
             (account_id, feed_key, uri),
@@ -1299,11 +1510,11 @@ def get_notification_sync_cursor(account_id: int):
     re-fetching only the newest 50, which silently dropped anything
     past that if more than 50 notifications arrived between syncs
     (e.g. the add-on left closed for a while, or a popular account)."""
-    return get_ui_state(f"notification_sync_cursor:{account_id}")
+    return get_ui_state(f"notification_sync_cursor:{account_id}", account_id)
 
 
 def set_notification_sync_cursor(account_id: int, cursor: str):
-    set_ui_state(f"notification_sync_cursor:{account_id}", cursor)
+    set_ui_state(f"notification_sync_cursor:{account_id}", cursor, account_id)
 
 
 def get_home_active_filter(account_id: int) -> str:
@@ -1312,11 +1523,11 @@ def get_home_active_filter(account_id: int) -> str:
     FeedWindow.onFilterChanged so background sync (which may run while
     MainWindow is closed) knows which feed the user actually cares
     about right now, instead of always assuming plain "home"."""
-    return get_ui_state(f"home_active_filter:{account_id}") or "home"
+    return get_ui_state(f"home_active_filter:{account_id}", account_id) or "home"
 
 
 def set_home_active_filter(account_id: int, feed_key: str):
-    set_ui_state(f"home_active_filter:{account_id}", feed_key)
+    set_ui_state(f"home_active_filter:{account_id}", feed_key, account_id)
 
 
 DEFAULT_ENABLED_TABS = {"notifications", "explore", "chat", "lists", "people"}
@@ -1382,7 +1593,7 @@ def get_open_temp_tabs(account_id: int) -> list:
     timeline, conversation, ...), restored on the next MainWindow build.
     One JSON list per account.
     """
-    raw = get_ui_state(f"open_temp_tabs:{account_id}")
+    raw = get_ui_state(f"open_temp_tabs:{account_id}", account_id)
     if not raw:
         return []
     try:
@@ -1395,13 +1606,13 @@ def add_open_temp_tab(account_id: int, entry: dict):
     tabs = get_open_temp_tabs(account_id)
     tabs = [t for t in tabs if not (t.get("type") == entry.get("type") and t.get("key") == entry.get("key"))]
     tabs.append(entry)
-    set_ui_state(f"open_temp_tabs:{account_id}", json.dumps(tabs))
+    set_ui_state(f"open_temp_tabs:{account_id}", json.dumps(tabs), account_id)
 
 
 def remove_open_temp_tab(account_id: int, tab_type: str, key: str):
     tabs = get_open_temp_tabs(account_id)
     tabs = [t for t in tabs if not (t.get("type") == tab_type and t.get("key") == key)]
-    set_ui_state(f"open_temp_tabs:{account_id}", json.dumps(tabs))
+    set_ui_state(f"open_temp_tabs:{account_id}", json.dumps(tabs), account_id)
 
 
 def set_temp_tab_custom_name(account_id: int, tab_type: str, key: str, name: str):
@@ -1418,7 +1629,7 @@ def set_temp_tab_custom_name(account_id: int, tab_type: str, key: str, name: str
         if t.get("type") == tab_type and t.get("key") == key:
             t["custom_name"] = name
             break
-    set_ui_state(f"open_temp_tabs:{account_id}", json.dumps(tabs))
+    set_ui_state(f"open_temp_tabs:{account_id}", json.dumps(tabs), account_id)
 
 
 def get_tab_order(account_id: int) -> list:
@@ -1426,7 +1637,7 @@ def get_tab_order(account_id: int) -> list:
     One interleaved order for EVERY tab (permanent and temp) as
     [kind, key] pairs; empty list if never saved.
     """
-    raw = get_ui_state(f"tab_order:{account_id}")
+    raw = get_ui_state(f"tab_order:{account_id}", account_id)
     if not raw:
         return []
     try:
@@ -1436,4 +1647,5 @@ def get_tab_order(account_id: int) -> list:
 
 
 def set_tab_order(account_id: int, order: list):
-    set_ui_state(f"tab_order:{account_id}", json.dumps(order))
+    set_ui_state(f"tab_order:{account_id}", json.dumps(order), account_id)
+

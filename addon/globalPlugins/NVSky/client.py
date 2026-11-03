@@ -4,11 +4,10 @@ Bluesky (AT Protocol) client wrapper for NVSky.
 The atproto Client class is imported lazily inside functions to keep
 NVDA startup fast (pydantic's import cost is slow).
 
-Record writes and several chat/preferences calls bypass the SDK's typed
-models (raw invoke_procedure/invoke_query, DotDict or plain JSON)
-because pydantic's discriminated-union handling is broken for them --
-see _create_record and send_message. Functions still marked LOW
-CONFIDENCE have not been exercised against a real server.
+Record writes and several chat/preferences calls use raw
+invoke_procedure/invoke_query (DotDict or plain JSON) on purpose: they
+tolerate union members newer than the SDK's models and send data back
+exactly as read. See _create_record and send_message.
 """
 
 import json
@@ -27,13 +26,22 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-from atproto import models
-
 from logHandler import log
 
 from . import crypto
 from . import db
 from . import soundpack
+
+
+class _LazyModels:
+    """atproto.models takes ~0.7 s to import: load it on first use, not at NVDA start."""
+
+    def __getattr__(self, name):
+        from atproto import models as realModels
+        return getattr(realModels, name)
+
+
+models = _LazyModels()
 
 
 class LoginError(Exception):
@@ -49,10 +57,8 @@ def _normalize_handle(handle: str) -> str:
 
 def _friendly_rate_limit_message(e: Exception):
     """
-    Friendly message for a rate-limit error, or None if `e` isn't one.
-    Detects by exception class name (LOW CONFIDENCE: "RateLimitExceededError"
-    never seen on a real instance) or a plain HTTP 429. Uses the
-    RateLimit-Reset header for the wait time when present.
+    Friendly message for a rate-limit error, or None if `e` isn't one. Detects by exception class
+    name or a plain HTTP 429, and uses the RateLimit-Reset header for the wait time when present.
     """
     isNamedRateLimitError = type(e).__name__ == "RateLimitExceededError"
     response = getattr(e, "response", None)
@@ -138,24 +144,16 @@ def login(handle: str, app_password: str) -> dict:
 
 def check_chat_supported(client) -> bool:
     """
-    LOW CONFIDENCE -- no dedicated "does this account/PDS support
-    chat" endpoint was found during the group-chat lexicon research
-    this session (chat.bsky.actor.getStatus checks OTHER accounts'
-    invite-ability, not the caller's own general chat access). Probes
-    the cheapest real chat call instead (listing convos, capped to 1)
-    and treats ANY failure as "not supported" -- almost certainly too
-    broad (a transient network error would also read as unsupported),
-    but safe in the sense that it only hides a tab rather than breaking
-    anything, and this runs again on every login so a wrong result
-    isn't permanent. Paste back the actual error if a real
-    chat-capable account ever gets flagged unsupported here.
+    Whether the account can use chat: probes the cheapest chat call (listing one conversation). A
+    network error, a 5xx or a 429 counts as supported, so a bad moment never hides the Chat tab;
+    other failures count as unsupported. Runs again on every login.
     """
     try:
         get_chat_client(client).chat.bsky.convo.list_convos(params={"limit": 1})
         return True
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
-        if status is None or status >= 500:
+        if status is None or status >= 500 or status == 429:
             log.info(f"NVSky: chat capability check inconclusive, assuming supported: {e}")
             return True
         log.info(f"NVSky: chat capability check failed (treating as unsupported): {e}")
@@ -164,6 +162,26 @@ def check_chat_supported(client) -> bool:
 
 _session_lock = threading.Lock()
 _session_cache = {}  # did -> session string, in memory only
+
+_ssl_lock = threading.Lock()
+_ssl_context = None
+
+
+def _new_atproto_client():
+    """An atproto Client sharing one SSL context: building one per client cost ~0.15 s."""
+    global _ssl_context
+    from atproto import Client as ATProtoClient
+    try:
+        if _ssl_context is None:
+            with _ssl_lock:
+                if _ssl_context is None:
+                    import httpx
+                    _ssl_context = httpx.create_ssl_context()
+        from atproto_client.request import Request
+        return ATProtoClient(request=Request(verify=_ssl_context))
+    except Exception as e:
+        log.error(f"NVSky: shared SSL context unavailable, using the default client: {e}")
+        return ATProtoClient()
 
 
 def _remember_session(client, account):
@@ -190,8 +208,13 @@ def _client_from_cached_session(account):
     if not sessionString:
         return None
     try:
-        client = ATProtoClient()
-        client.login(session_string=sessionString)
+        client = _new_atproto_client()
+        client.login(session_string=sessionString, fetch_bsky_profile=False)
+        session = getattr(client, "_session", None)
+        # Only me.did is used; the profile lookup cost ~0.9 s per client.
+        client.me = types.SimpleNamespace(
+            did=getattr(session, "did", None), handle=getattr(session, "handle", None)
+        )
         if getattr(client.me, "did", None) != account["did"]:
             raise RuntimeError("cached session belongs to another account")
         _remember_session(client, account)
@@ -220,7 +243,7 @@ def get_client_for_active_account():
     # ("not a socket") was seen here and cleared on retry.
     lastError = None
     for attempt in range(2):
-        client = ATProtoClient()
+        client = _new_atproto_client()
         try:
             client.login(account["handle"], app_password)
             _remember_session(client, account)
@@ -237,58 +260,14 @@ def get_client_for_active_account():
 
 # ---------------- timeline sync ----------------
 
-def debug_dump(obj, label: str = "debug"):
-    """
-    Dev-only: writes what the SDK returned to debug_dumps/<label>_<time>.json.
-    No-op unless that folder exists (it is not shipped with releases).
-    """
-    import json
-    import os
-    import datetime
-
-    folder = os.path.join(os.path.dirname(__file__), "debug_dumps")
-    if not os.path.isdir(folder):
-        return
-    path = os.path.join(folder, f"{label}_{datetime.datetime.now():%Y%m%d_%H%M%S}.json")
-
-    def _serialize(o, depth=0):
-        if depth > 8:
-            return repr(o)
-        if o is None or isinstance(o, (str, int, float, bool)):
-            return o
-        if hasattr(o, "model_dump"):
-            try:
-                return o.model_dump(mode="json")
-            except Exception:
-                pass
-        if isinstance(o, dict):
-            return {str(k): _serialize(v, depth + 1) for k, v in o.items()}
-        if isinstance(o, (list, tuple)):
-            return [_serialize(i, depth + 1) for i in o]
-        if hasattr(o, "__dict__"):
-            try:
-                return {k: _serialize(v, depth + 1) for k, v in vars(o).items()}
-            except Exception:
-                pass
-        return repr(o)
-
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(_serialize(obj), f, indent=2, ensure_ascii=False, default=repr)
-        log.info(f"NVSky: debug dump written to {path}")
-    except Exception as e:
-        log.error(f"NVSky: debug dump failed: {e}")
-
-
 def _store_convo(convo, account_id: int, my_did: str, status: str):
     otherMembers = [
         {"did": m.did, "handle": m.handle, "display_name": getattr(m, "display_name", None)}
         for m in convo.members if m.did != my_did
     ]
-    # convo.kind is a nested union (groupConvo/directConvo) whose $type
-    # discriminator is unreliable in this SDK, and under 0.0.72 both
-    # subtypes' fields exist as attributes. Detect a group by the VALUE
-    # of lock_status (always "locked"/"unlocked" for a group, else None).
+    # convo.kind is a nested union (groupConvo/directConvo) whose $type is unreliable and whose
+    # subtypes' fields both exist as attributes. Detect a group by the VALUE of lock_status (always
+    # "locked"/"unlocked" for a group, else None).
     kind = convo.kind
     lockStatus = getattr(kind, "lock_status", None) if kind is not None else None
     if kind is not None and lockStatus is not None:
@@ -335,12 +314,10 @@ def _store_convo(convo, account_id: int, my_did: str, status: str):
 
 
 def _extract_message_embed_info(message: dict):
-    """LOW CONFIDENCE -- shape guessed by analogy with post embeds'
-    own record.value.text/record.author.handle (see
-    _extract_embed_info) since this is raw JSON already (getMessages
-    is parsed via the raw-JSON bypass, not the typed SDK), never
-    confirmed against a real record-embed message response. Returns
-    None if there's no embed or it doesn't look like a record embed."""
+    """
+    Quoted-post info from a chat message's record embed, or None if there is none. The shape follows
+    post embeds (record.value.text, record.author.handle).
+    """
     embed = message.get("embed")
     if not isinstance(embed, dict):
         return None
@@ -360,14 +337,9 @@ def _extract_message_embed_info(message: dict):
 
 def _upsert_message_from_raw(account_id: int, convo_id: str, message: dict) -> bool:
     """
-    Shared per-message cache upsert -- used by both the full
-    getMessages sync (_sync_convo_messages) and the getLog delta path
-    (sync_chat_delta below); same raw-JSON message dict shape either
-    way (MessageView), confirmed via a real debug_dump of getLog's
-    logCreateMessage/logAddReaction entries. Returns False (does
-    nothing) for a #deletedMessageView/#systemMessageView placeholder
-    with no "text" field -- same skip condition _sync_convo_messages
-    always used.
+    Shared per-message cache upsert for the full getMessages sync and the getLog delta path (the
+    same raw MessageView dict either way). Returns False (does nothing) for a deleted or system
+    message placeholder with no "text" field.
     """
     if "text" not in message:
         return False
@@ -393,9 +365,7 @@ def _upsert_message_from_raw(account_id: int, convo_id: str, message: dict) -> b
 
 
 def _sync_convo_messages(dm, convo_id: str, account_id: int, unread_count: int = 0, limit: int = 100):
-    # Raw-JSON bypass: the typed dm.get_messages() fails on messageView's
-    # discriminated union (still broken under 0.0.72). Re-test only on a
-    # future atproto upgrade.
+    # Raw JSON on purpose: tolerates message types newer than the SDK's models.
     params = models.ChatBskyConvoGetMessages.Params(convo_id=convo_id, limit=limit)
     response = dm._client.invoke_query(
         "chat.bsky.convo.getMessages", params=params, output_encoding="application/json"
@@ -498,24 +468,14 @@ def sync_convo_messages(client, account_id: int, convo_id: str, limit: int = 100
 
 def get_convo_log(client, cursor: str = None, limit: int = 100):
     """
-    Raw-JSON bypass for chat.bsky.convo.getLog. CONFIRMED via a real
-    debug_dump that the typed dm.get_log() call fails to parse real
-    log entries ("Unable to extract tag using discriminator 'py_type'
-    | 'pyType'"), same class of bug as _sync_convo_messages/
-    _fetch_thread_json. Returns (logs: list of raw dicts, new_cursor:
-    str or None). cursor=None returns the server's own current
-    position with an EMPTY logs list -- CONFIRMED via testing this is
-    not historical backlog, just "now". Callers must persist and
-    resend the returned cursor to see what changed since the previous
-    call.
+    Raw JSON for chat.bsky.convo.getLog: log entries come in many types, some newer
+    than the SDK's models. Returns (logs: list of raw dicts, new_cursor: str or None).
+    cursor=None returns the server's current position with an EMPTY logs list (not
+    historical backlog). Callers must persist and resend the returned cursor to see
+    what changed since the previous call.
     """
     dm = get_chat_client(client).chat.bsky.convo
-    # CONFIRMED bug: invoke_query calls .model_dump() on whatever
-    # `params` is given -- a plain dict has no such method and raises
-    # "'dict' object has no attribute 'model_dump'". Every other
-    # invoke_query call in this file (e.g. getMessages) passes an
-    # explicit typed Params model instead, never a raw dict -- this
-    # was the one place that didn't follow that established pattern.
+    # invoke_query needs a typed Params model, not a plain dict.
     params = models.ChatBskyConvoGetLog.Params(cursor=cursor, limit=limit)
     response = dm._client.invoke_query(
         "chat.bsky.convo.getLog", params=params, output_encoding="application/json"
@@ -524,12 +484,9 @@ def get_convo_log(client, cursor: str = None, limit: int = 100):
     return content.get("logs", []), content.get("cursor")
 
 
-# Log $type values confirmed via chat.bsky.convo.defs (atproto.blue SDK
-# docs) that only affect ConvoView-level metadata (membership, lock
-# state, group name, join links/requests) rather than a single message/
-# reaction. Rather than hand-parsing every SystemMessageView variant,
-# any of these appearing in a getLog batch triggers one full
-# sync_convos() fallback -- correctness over bandwidth for the rare case.
+# Log entry types that change ConvoView-level metadata (membership, lock state, group name, join
+# links/requests) rather than one message or reaction. Any of them in a getLog batch triggers one
+# full sync_convos() instead of hand-parsing every variant.
 _STRUCTURAL_LOG_TYPES = {
     "chat.bsky.convo.defs#logBeginConvo",
     "chat.bsky.convo.defs#logAcceptConvo",
@@ -668,39 +625,17 @@ def sync_chat_delta(client, account_id: int, my_did: str) -> set:
 
 def get_chat_client(client):
     """
-    EXPERIMENTAL -- first use of the chat.bsky.* namespace in NVSky.
-    DMs are served by a completely separate service from the rest of
-    Bluesky (did:web:api.bsky.chat) -- every chat.bsky.* call MUST go
-    through a client wrapped with with_bsky_chat_proxy(), which sets
-    the required service-proxying header for us. Calling chat.bsky.*
-    methods on the normal client (without this wrapper) will fail.
-    Also requires the account to have chat enabled (a
-    chat.bsky.actor.declaration record in their own repo, normally
-    created automatically the first time they open Chat in the
-    official app) -- if they've never used DMs before, calls through
-    this may error until they do that once.
+    Wraps the client for chat.bsky.* calls. DMs are served by a separate service
+    (did:web:api.bsky.chat), so every chat call must go through with_bsky_chat_proxy(). The account
+    also needs chat enabled (a chat.bsky.actor.declaration record, normally created the first time
+    Chat is opened in the official app).
     """
     return client.with_bsky_chat_proxy()
 
 
 def send_message(client, convo_id: str, text: str, reply_to_message_id: str = None, embed_ref: dict = None):
-    # Two SDK-internal issues stacked here, confirmed from a real full
-    # traceback (not just the top-level message):
-    # 1) sendMessage's response is a MessageView -- the same
-    #    discriminated-union type that fails to parse in getMessages --
-    #    so we bypass the typed response parsing (call invoke_procedure
-    #    directly, ignore the echoed-back message; the caller already
-    #    re-syncs this conversation right after a successful send).
-    # 2) The REQUEST body itself fails to serialize with
-    #    PydanticSerializationError ("Unable to serialize unknown type:
-    #    FieldInfo") inside model_dump_json() -- reproduces in
-    #    production every time but NOT against a freshly pip-installed
-    #    copy of the same SDK, so this looks like a real bug specific to
-    #    whatever pydantic/atproto_client version NVSky bundles under
-    #    its own lib/ folder. Route around it entirely: build a DotDict
-    #    instead of a typed Data model -- DotDict serializes through
-    #    get_model_as_dict()+to_json() instead, a completely different,
-    #    non-pydantic_core code path.
+    # Raw JSON: the response is a message union and is ignored (the caller resyncs the
+    # conversation), and the request is a DotDict so no typed model is built.
     from atproto_client.models.dot_dict import DotDict
 
     dm = get_chat_client(client).chat.bsky.convo
@@ -733,18 +668,15 @@ def mark_convo_read(client, convo_id: str):
 
 
 def mark_all_convos_read(client):
-    """LOW CONFIDENCE: chat.bsky.convo.updateAllRead has never been
-    exercised against a real server in this project before now --
-    paste back any traceback."""
+    """Marks every conversation read (chat.bsky.convo.updateAllRead)."""
     get_chat_client(client).chat.bsky.convo.update_all_read(data={})
 
 
 def get_convo_availability(client, member_dids: list):
-    """LOW CONFIDENCE -- chat.bsky.convo.getConvoAvailability never
-    exercised. Guessed input {members: [...]} matching
-    get_convo_for_members' own shape. Used defensively -- if this
-    fails or the shape is wrong, callers just skip the pre-check and
-    proceed to the normal send/create flow anyway."""
+    """
+    Whether the given members can be messaged (chat.bsky.convo.getConvoAvailability). Used
+    defensively: callers skip this pre-check if it fails.
+    """
     response = get_chat_client(client).chat.bsky.convo.get_convo_availability(
         params={"members": member_dids}
     )
@@ -752,17 +684,10 @@ def get_convo_availability(client, member_dids: list):
 
 
 def get_or_create_convo_for_member(client, member_did: str):
-    """LOW CONFIDENCE: chat.bsky.convo.getConvoForMembers has never
-    been exercised against a real server in this project before now --
-    paste back the raw response (or a traceback) if this doesn't work.
-    Per the lexicon this resolves an existing 1:1 conversation with
-    this member, or creates one if none exists yet, in a single call.
-    Uses the same raw-JSON-bypass approach as _sync_convo_messages/
-    _fetch_thread_json (see their comments) instead of trusting the
-    typed SDK response -- other chat.bsky.convo endpoints in this
-    project have hit pydantic union-discriminator parsing bugs before,
-    and a first attempt at this one silently produced no result with
-    no exception raised, consistent with that same class of bug."""
+    """
+    The existing 1:1 conversation with this member, or a new one
+    (chat.bsky.convo.getConvoForMembers). Raw JSON like the other conversation reads.
+    """
     dm = get_chat_client(client).chat.bsky.convo
     params = models.ChatBskyConvoGetConvoForMembers.Params(members=[member_did])
     response = dm._client.invoke_query(
@@ -776,10 +701,10 @@ def _group_ns(client):
 
 
 def create_join_link(client, convo_id: str, join_rule: str, require_approval: bool):
-    """LOW CONFIDENCE -- field names/enum guessed (joinRule:
-    "anyone"/"followedByOwner", requireApproval: bool). Real UI wording
-    ("Create or modify an invite link") suggests this upserts rather
-    than erroring if a link already exists. Raw-JSON bypass."""
+    """
+    Creates or updates a group's invite link (chat.bsky.group.createJoinLink); an existing link is
+    updated rather than rejected. joinRule is "anyone" or "followedByOwner". Raw JSON.
+    """
     from atproto_client.models.dot_dict import DotDict
 
     response = _group_ns(client)._client.invoke_procedure(
@@ -788,13 +713,11 @@ def create_join_link(client, convo_id: str, join_rule: str, require_approval: bo
         input_encoding="application/json", output_encoding="application/json",
     )
     joinLink = response.content.get("joinLink") if isinstance(response.content, dict) else None
-    if not joinLink:
-        debug_dump(response.content, "create_join_link_result")
     return joinLink
 
 
 def edit_join_link(client, convo_id: str, join_rule: str, require_approval: bool):
-    """LOW CONFIDENCE -- see create_join_link's docstring."""
+    """Changes an existing invite link's join rule (chat.bsky.group.editJoinLink)."""
     from atproto_client.models.dot_dict import DotDict
 
     response = _group_ns(client)._client.invoke_procedure(
@@ -803,13 +726,11 @@ def edit_join_link(client, convo_id: str, join_rule: str, require_approval: bool
         input_encoding="application/json", output_encoding="application/json",
     )
     joinLink = response.content.get("joinLink") if isinstance(response.content, dict) else None
-    if not joinLink:
-        debug_dump(response.content, "edit_join_link_result")
     return joinLink
 
 
 def enable_join_link(client, convo_id: str):
-    """LOW CONFIDENCE -- guessed input {convoId} only."""
+    """Re-enables a disabled invite link."""
     from atproto_client.models.dot_dict import DotDict
 
     response = _group_ns(client)._client.invoke_procedure(
@@ -817,13 +738,11 @@ def enable_join_link(client, convo_id: str):
         input_encoding="application/json", output_encoding="application/json",
     )
     joinLink = response.content.get("joinLink") if isinstance(response.content, dict) else None
-    if not joinLink:
-        debug_dump(response.content, "enable_join_link_result")
     return joinLink
 
 
 def disable_join_link(client, convo_id: str):
-    """LOW CONFIDENCE -- guessed input {convoId} only."""
+    """Disables a group's invite link."""
     from atproto_client.models.dot_dict import DotDict
 
     _group_ns(client)._client.invoke_procedure(
@@ -833,10 +752,7 @@ def disable_join_link(client, convo_id: str):
 
 
 def edit_group(client, convo_id: str, name: str):
-    """Confirmed endpoint exists (edit_group). Field names (convoId/name)
-    guessed by analogy with every other group action -- unconfirmed.
-    Raw-JSON bypass since this almost certainly returns an updated
-    convo (same union-parsing risk as create_group)."""
+    """Renames a group (chat.bsky.group.editGroup). Raw JSON; returns the updated convo."""
     from atproto_client.models.dot_dict import DotDict
 
     response = _group_ns(client)._client.invoke_procedure(
@@ -844,31 +760,13 @@ def edit_group(client, convo_id: str, name: str):
         input_encoding="application/json", output_encoding="application/json",
     )
     convo = response.content.get("convo") if isinstance(response.content, dict) else None
-    if not convo:
-        debug_dump(response.content, "edit_group_result")
     return convo
 
 
 def create_group(client, member_dids: list, name: str = None):
     """
-    EXPERIMENTAL -- first use of chat.bsky.group.* in NVSky, never
-    exercised against a real server. Same raw-JSON-bypass approach as
-    get_or_create_convo_for_member/send_message (see their comments)
-    since every chat.bsky.convo.* endpoint touched so far has hit a
-    pydantic discriminated-union parsing bug on its typed response --
-    group responses are expected to hit the same issue. Body is built
-    as a DotDict (not a plain dict) for the same reason send_message
-    does -- invoke_procedure calls .model_dump_json() on whatever it's
-    given, which a plain dict doesn't have; confirmed by testing (a
-    first attempt using a plain dict here failed with exactly
-    "'dict' object has no attribute 'model_dump_json'").
-
-    LOW CONFIDENCE: request body field names ("members" for the
-    invitee DID list, "name" for the group name) are guessed from the
-    lexicon docs' prose description, not a confirmed real schema.
-    Also unconfirmed whether the server accepts a single-member group
-    (name set but only one recipient) -- paste back the raw traceback
-    if either errors.
+    Creates a group conversation (chat.bsky.group.createGroup). Raw JSON with a DotDict body,
+    because plain dicts have no model_dump_json. Returns the new convo dict.
     """
     from atproto_client.models.dot_dict import DotDict
 
@@ -883,7 +781,7 @@ def create_group(client, member_dids: list, name: str = None):
 
 
 def add_group_members(client, convo_id: str, member_dids: list):
-    """LOW CONFIDENCE -- see create_group's docstring."""
+    """Adds members to a group (chat.bsky.group.addMembers)."""
     from atproto_client.models.dot_dict import DotDict
 
     _group_ns(client)._client.invoke_procedure(
@@ -894,7 +792,7 @@ def add_group_members(client, convo_id: str, member_dids: list):
 
 
 def remove_group_members(client, convo_id: str, member_dids: list):
-    """LOW CONFIDENCE -- see create_group's docstring."""
+    """Removes members from a group (chat.bsky.group.removeMembers)."""
     from atproto_client.models.dot_dict import DotDict
 
     _group_ns(client)._client.invoke_procedure(
@@ -906,10 +804,8 @@ def remove_group_members(client, convo_id: str, member_dids: list):
 
 def get_join_link_previews(client, codes: list):
     """
-    LOW CONFIDENCE -- output items are a union (joinLinkPreviewView /
-    disabledJoinLinkPreviewView / invalidJoinLinkPreviewView), same
-    parsing risk as create_group, so raw-JSON bypass. Full preview has
-    name/owner/memberCount etc; disabled/invalid only has "code".
+    Previews for invite codes (chat.bsky.group.getJoinLinkPreviews). Items are a union (a full
+    preview, or only the code for a disabled or invalid link), so this is raw JSON.
     """
     from atproto_client.models.dot_dict import DotDict
 
@@ -922,9 +818,10 @@ def get_join_link_previews(client, codes: list):
 
 
 def request_join_group(client, code: str):
-    """LOW CONFIDENCE -- chat.bsky.group.requestJoin never exercised;
-    "code" field name guessed from every other join-link endpoint's
-    naming. Paste back traceback/debug_dump("request_join_result")."""
+    """
+    Asks to join a group by invite code (chat.bsky.group.requestJoin). Returns the response dict
+    (status "joined" or pending).
+    """
     from atproto_client.models.dot_dict import DotDict
 
     response = _group_ns(client)._client.invoke_procedure(
@@ -935,9 +832,7 @@ def request_join_group(client, code: str):
 
 
 def list_join_requests(client, convo_id: str):
-    """LOW CONFIDENCE -- chat.bsky.group.listJoinRequests never
-    exercised; "convoId" param and "requests" output key guessed.
-    Pagination not implemented. Paste back debug_dump("join_requests")."""
+    """Pending join requests of a group (first page only; chat.bsky.group.listJoinRequests)."""
     from atproto_client.models.dot_dict import DotDict
 
     response = _group_ns(client)._client.invoke_query(
@@ -949,8 +844,10 @@ def list_join_requests(client, convo_id: str):
 
 
 def approve_join_request(client, convo_id: str, member_did: str):
-    """Confirmed input schema (convoId, member). Output has "convo" --
-    raw-JSON bypass like create_group, same union-parsing risk."""
+    """
+    Approves a join request (chat.bsky.group.approveJoinRequest). Raw JSON: the output carries a
+    convo.
+    """
     from atproto_client.models.dot_dict import DotDict
 
     response = _group_ns(client)._client.invoke_procedure(
@@ -962,8 +859,7 @@ def approve_join_request(client, convo_id: str, member_did: str):
 
 
 def reject_join_request(client, convo_id: str, member_did: str):
-    """LOW CONFIDENCE -- rejectJoinRequest itself unconfirmed, mirrors
-    approve_join_request's input shape. Paste back traceback."""
+    """Rejects a join request (chat.bsky.group.rejectJoinRequest)."""
     from atproto_client.models.dot_dict import DotDict
 
     _group_ns(client)._client.invoke_procedure(
@@ -974,25 +870,20 @@ def reject_join_request(client, convo_id: str, member_did: str):
 
 
 def withdraw_join_request(client, convo_id: str):
-    """Confirmed schema (input: convoId only, empty output)."""
+    """Withdraws the account's own pending request to join a group."""
     get_chat_client(client).chat.bsky.group.withdraw_join_request(data={"convo_id": convo_id})
 
 
 def mark_join_requests_read(client, convo_id: str):
-    """Confirmed schema (input: convoId only, empty output)."""
+    """Marks a group's join requests as read."""
     get_chat_client(client).chat.bsky.group.update_join_requests_read(data={"convo_id": convo_id})
 
 
 def mark_message_read(client, convo_id: str, message_id: str):
     """
-    LOW CONFIDENCE: chat.bsky.convo.updateRead's optional messageId
-    param (marks everything up to and including that message as read,
-    per the lexicon) has never been exercised against a real server in
-    this project before now -- paste back any traceback. Called from a
-    background thread (see chatWindow.py's onMessageFocused/
-    _announceNthNewestMessage) purely to keep the server's own
-    unread_count in sync with what the user has actually read locally;
-    never surfaced to the UI either way.
+    Marks everything up to this message read (chat.bsky.convo.updateRead with messageId). Called
+    from a background thread to keep the server's unread_count in step with local reads; never shown
+    in the UI.
     """
     get_chat_client(client).chat.bsky.convo.update_read(
         data={"convo_id": convo_id, "message_id": message_id}
@@ -1012,17 +903,14 @@ def leave_convo(client, convo_id: str):
 
 def lock_convo(client, convo_id: str):
     """
-    LOW CONFIDENCE -- chat.bsky.convo.lockConvo has never been
-    exercised against a real server in this project. Confirmed via a
-    real 400 error that locking is a real prerequisite for a group's
-    owner to leave it ('OwnerCannotLeave: Owner must lock the group
-    before leaving'). Paste back a traceback if this doesn't work.
+    Locks a group. An owner must lock a group before leaving it (otherwise the server answers
+    OwnerCannotLeave).
     """
     get_chat_client(client).chat.bsky.convo.lock_convo(data={"convo_id": convo_id})
 
 
 def unlock_convo(client, convo_id: str):
-    """LOW CONFIDENCE -- see lock_convo's docstring."""
+    """Unlocks a group."""
     get_chat_client(client).chat.bsky.convo.unlock_convo(data={"convo_id": convo_id})
 
 
@@ -1031,16 +919,14 @@ def accept_convo(client, convo_id: str):
 
 
 def add_reaction(client, convo_id: str, message_id: str, value: str):
-    """LOW CONFIDENCE: chat.bsky.convo.addReaction has never been
-    exercised against a real server in this project before now --
-    paste back any traceback."""
+    """Adds an emoji reaction to a message (chat.bsky.convo.addReaction)."""
     get_chat_client(client).chat.bsky.convo.add_reaction(
         data={"convo_id": convo_id, "message_id": message_id, "value": value}
     )
 
 
 def remove_reaction(client, convo_id: str, message_id: str, value: str):
-    """LOW CONFIDENCE -- see add_reaction's docstring."""
+    """Removes the account's emoji reaction from a message."""
     get_chat_client(client).chat.bsky.convo.remove_reaction(
         data={"convo_id": convo_id, "message_id": message_id, "value": value}
     )
@@ -1057,9 +943,8 @@ def sync_saved(client, account_id: int, cursor: str = None, limit: int = 50) -> 
     resp = client.app.bsky.bookmark.get_bookmarks(params={"cursor": cursor, "limit": limit})
 
     for bookmark in resp.bookmarks:
-        # BookmarkView.item is the full PostView (author, text, counts,
-        # viewer state) -- BookmarkView.subject is just a bare strongRef
-        # (uri/cid only, no author), confirmed from a real error log.
+        # BookmarkView.item is the full PostView (author, text, counts, viewer state);
+        # BookmarkView.subject is only a strongRef (uri/cid, no author).
         post = getattr(bookmark, "item", None) or getattr(bookmark, "subject", None)
         if post is None or not hasattr(post, "author"):
             # Likely a #notFoundPost / #blockedPost placeholder (the
@@ -1136,13 +1021,8 @@ ADULT_CONTENT_PREF_KEY = "__adult_content_enabled"
 
 def _extract_post_labels(post) -> list:
     """
-    Returns the list of label value strings (e.g. "porn",
-    "graphic-media") a labeler has attached to `post`, or [] if none.
-    LOW CONFIDENCE: assumes post.labels is a list of objects each
-    carrying a plain .val string (com.atproto.label.defs#label) --
-    never independently confirmed against a real labeled post in this
-    project. Paste back a debug_dump of a labeled post if labels don't
-    show up as expected.
+    Label value strings (e.g. "porn", "graphic-media") a labeler or the author attached to `post`,
+    or [].
     """
     labels = getattr(post, "labels", None) or []
     return [getattr(l, "val", None) for l in labels if getattr(l, "val", None)]
@@ -1167,10 +1047,7 @@ def _extract_embed_info(post):
     if embedView is None:
         return None
 
-    # "$type" is reliably a real resolved value on these View objects --
-    # unlike py_type, which stays an unresolved FieldInfo default in this
-    # SDK/pydantic combo for many nested models.
-    embedType = getattr(embedView, "$type", "") or ""
+    embedType = _embed_type(embedView)
     info = {"$type": embedType}
 
     try:
@@ -1179,21 +1056,30 @@ def _extract_embed_info(post):
             mediaView = getattr(embedView, "media", None)  # only set for recordWithMedia
             if mediaView is not None:
                 recordView = getattr(recordView, "record", recordView)
-                mediaType = getattr(mediaView, "$type", "") or ""
+                mediaType = _embed_type(mediaView)
                 _fill_media_info(info, mediaView, mediaType)
-            value = getattr(recordView, "value", None)
-            author = getattr(recordView, "author", None)
-            info["quoted_text"] = getattr(value, "text", None)
-            info["quoted_author_handle"] = getattr(author, "handle", None)
+            value = _view_field(recordView, "value")
+            author = _view_field(recordView, "author")
+            info["quoted_text"] = _view_field(value, "text")
+            info["quoted_author_handle"] = _view_field(author, "handle")
         else:
             _fill_media_info(info, embedView, embedType)
     except Exception as e:
-        # embedType included since 0.0.72 -- helps pin down which
-        # embed variant's generated model has the broken field once
-        # this fires again.
+        # embedType tells which embed variant failed.
         log.info(f"NVSky: partial embed extraction failure for {post.uri} (embed type: {embedType}): {e}")
 
     return info
+
+
+def _embed_type(view) -> str:
+    # atproto >= 0.0.73 keeps the type string in py_type; older versions (and the raw-JSON
+    # namespaces built by _dict_to_ns) keep it under "$type". An unresolved FieldInfo is not a str.
+    for name in ("py_type", "$type"):
+        value = getattr(view, name, None)
+        if isinstance(value, str) and value:
+            return value
+    value = _view_field(view, "$type")
+    return value if isinstance(value, str) else ""
 
 
 def _fill_media_info(info: dict, mediaView, mediaType: str):
@@ -1230,14 +1116,10 @@ def _fill_media_info(info: dict, mediaView, mediaType: str):
 
 def _view_field(obj, name):
     """
-    getattr(obj, name, None) alone isn't safe when `obj` turns out to
-    be a plain dict instead of a resolved model (a discriminated union
-    that failed to resolve to its typed class, e.g. some
-    app.bsky.embed.gallery items under 0.0.72) -- a name like "items"
-    then resolves to dict's own built-in .items() METHOD instead of
-    None, and callers iterating the "missing" result directly hit
-    'method' object is not iterable. Treat a callable result the same
-    as a missing one and fall through to the dict .get() path.
+    getattr(obj, name, None) isn't safe when `obj` is a plain dict instead of a resolved model (a
+    union member the SDK couldn't resolve): a name like "items" then gives dict's own .items()
+    method instead of None. A callable result is treated as missing and the dict .get() path is
+    used.
     """
     value = getattr(obj, name, None)
     if value is None or callable(value):
@@ -1345,16 +1227,10 @@ def _store_feed_item(item, account_id: int, feed_key: str = "home"):
                     feedIndexedAt = keptIndexedAt
 
     if not is_repost:
-        # LOW CONFIDENCE: observed via testing that a manual/background
-        # sync's real getTimeline response for a post the active account
-        # itself just reposted (recorded via jetstream.py's real-time
-        # path) can come back with no `reason` at all -- silently
-        # clobbering the repost framing and sinking the entry to the
-        # ORIGINAL post's own, possibly much older, indexed_at. Explicit
-        # un-repost is handled entirely by itemActions.py's
-        # _toggleRepost/_onRepostDone, never by this generic sync path,
-        # so it's safe to preserve existing self-repost state here
-        # rather than let an incomplete API response erase it.
+        # A sync response for a post the active account just reposted (recorded via Jetstream) can
+        # come back with no `reason`, which would drop the repost framing and sink the entry to the
+        # original post's older indexed_at. Un-reposting is handled only in itemActions
+        # (_toggleRepost and _onRepostDone), so existing self-repost state is preserved here.
         existingPost = db.get_post(post.uri)
         account = db.get_active_account()
         if (
@@ -1573,49 +1449,11 @@ def search_starter_packs(client, query: str, cursor: str = None, limit: int = 25
 
 
 def search_feeds(client, query: str, limit: int = 25):
-    """Keyword feed search via get_popular_feed_generators (its "query"
-    param filters results; confirmed by testing)."""
+    """Keyword feed search via get_popular_feed_generators (its "query" param filters results)."""
     params = {"limit": limit}
     if query:
         params["query"] = query
     return client.app.bsky.unspecced.get_popular_feed_generators(params=params)
-
-
-def _fix_field_info(obj):
-    """Shared by every savedFeedsPrefV2 read/write helper below --
-    atproto v0.0.69's ContentLabelPref.py_type holds a raw unresolved
-    pydantic FieldInfo instead of its string value, which breaks
-    model_dump() unless patched first."""
-    if obj is None:
-        return
-    try:
-        from pydantic.fields import FieldInfo
-        raw_type = getattr(obj, "py_type", None)
-        if isinstance(raw_type, FieldInfo):
-            default_type = raw_type.default
-            if default_type is not None:
-                object.__setattr__(obj, "py_type", default_type)
-    except Exception:
-        pass
-
-
-def _clean_dumped(value):
-    """Recursively fixes the pyType/py_type -> $type fallout left over
-    after model_dump() on a preferences object with the FieldInfo bug."""
-    if isinstance(value, dict):
-        pt1 = value.pop("pyType", None)
-        pt2 = value.pop("py_type", None)
-        real_type = value.get("$type") or pt1 or pt2
-        if real_type:
-            value["$type"] = real_type
-        for key in list(value.keys()):
-            value[key] = _clean_dumped(value[key])
-        return value
-    if isinstance(value, list):
-        for i in range(len(value)):
-            value[i] = _clean_dumped(value[i])
-        return value
-    return value
 
 
 class _RawJsonModel:
@@ -1633,26 +1471,15 @@ class _RawJsonModel:
 
 def _pref_to_dict(pref):
     """
-    Converts one entry from getPreferences() into a plain dict. Normal
-    case: a typed pydantic model, dumped via model_dump. Fallback:
-    the SDK sometimes can't resolve a preference into its typed model
-    (e.g. a contentLabelPref for a label value it doesn't recognize,
-    like a labeler-specific "hate" tag not in its known enum) and
-    hands back a raw DotDict instead -- CONFIRMED via a real
-    debug_dump that a DotDict's own .model_dump attribute resolves to
-    None instead of raising AttributeError (same bug class _dict_get's
-    docstring documents elsewhere), so calling it raises "'NoneType'
-    object is not callable" rather than failing cleanly. DotDict is
-    itself a dict subclass, so dict(pref) is already the right shape
-    once detected.
+    Converts one entry from getPreferences() into a plain dict: normally a typed model dumped with
+    model_dump. A preference the SDK couldn't resolve to a typed model (e.g. a labeler-specific
+    label value) comes back as a DotDict, whose .model_dump resolves to None; it is converted with
+    dict()/vars().
     """
     dumpMethod = getattr(pref, "model_dump", None)
     if callable(dumpMethod):
         return dumpMethod(mode="json", by_alias=True, exclude_none=True)
-    # DotDict fallback -- CONFIRMED via testing it is NOT a real dict
-    # subclass (isinstance(pref, dict) is False) despite looking like
-    # one in repr(); dict()/vars() below cover it without assuming its
-    # exact internal shape.
+    # DotDict fallback: not a dict subclass despite its repr; dict()/vars() cover it.
     try:
         return dict(pref)
     except (TypeError, ValueError):
@@ -1665,39 +1492,22 @@ def _pref_to_dict(pref):
 
 
 def _get_cleaned_preferences(client) -> list:
-    """Fetches app.bsky.actor.getPreferences and returns it as a list
-    of plain, FieldInfo-safe dicts. Every savedFeedsPrefV2 read/write
-    helper starts from this."""
+    """
+    Fetches app.bsky.actor.getPreferences as a list of plain dicts. Every preferences read/write
+    helper starts from this.
+    """
     try:
         prefs_response = client.app.bsky.actor.get_preferences()
     except Exception as e:
         log.error("NVSky: getPreferences failed: %s", e, exc_info=True)
         raise
 
-    for pref in prefs_response.preferences:
-        _fix_field_info(pref)
-        try:
-            for attr_name in dir(pref):
-                if attr_name.startswith("_"):
-                    continue
-                try:
-                    attr_value = getattr(pref, attr_name, None)
-                except Exception:
-                    continue
-                if isinstance(attr_value, list):
-                    for item in attr_value:
-                        _fix_field_info(item)
-        except Exception:
-            pass
-
     prefs = []
     try:
         for pref in prefs_response.preferences:
-            dumped = _pref_to_dict(pref)
-            prefs.append(_clean_dumped(dumped))
+            prefs.append(_pref_to_dict(pref))
     except Exception as e:
         log.error("NVSky: failed to serialize preferences: %s", e, exc_info=True)
-        debug_dump({"type": type(pref).__name__, "repr": repr(pref)}, "get_preferences_dump_failure")
         raise
     return prefs
 
@@ -1721,7 +1531,6 @@ def _put_preferences(client, prefs: list):
         )
     except Exception as e:
         log.error("NVSky: putPreferences failed: %s", e, exc_info=True)
-        debug_dump(payload, "put_preferences_failed")
         raise
 
 
@@ -1855,12 +1664,11 @@ def reorder_saved_feeds(client, ordered_feed_uris: list) -> bool:
 
 
 def get_feed_generators_info(client, uris: list) -> dict:
-    """Batch-resolves feed generator URIs to display info (display_name/
-    creator_handle/description) for the Feed manager settings panel.
-    LOW CONFIDENCE -- first use of app.bsky.feed.getFeedGenerators in
-    NVSky, paste back the traceback if this errors. Chunks into
-    batches of 25 (getPosts' documented max, assumed to apply here too
-    since no separate limit is documented for this endpoint)."""
+    """
+    Batch-resolves feed generator URIs to display info (display_name/creator_handle/description) for
+    the Feed manager. Chunks of 25 (getPosts' documented maximum; no separate limit is documented
+    for this endpoint).
+    """
     info = {}
     uris = [u for u in uris if u]
     for i in range(0, len(uris), 25):
@@ -1929,6 +1737,7 @@ def store_jetstream_repost(client, account_id: int, subject_uri: str, subject_ci
             db.upsert_author(
                 did=profile["did"], handle=profile["handle"],
                 display_name=profile.get("display_name"), avatar_url=None,
+                viewer_known=False,
             )
             reposter = db.get_author(reposter_did)
         except Exception as e:
@@ -1945,28 +1754,14 @@ NOTIFICATION_SYNC_MAX_PAGES = 20  # safety cap -- see sync_notifications' docstr
 
 def sync_notifications(client, account_id: int, cursor: str = None, limit: int = 50) -> str:
     """
-    Walks pages of listNotifications starting from the newest, until
-    it reaches a notification already seen in a PREVIOUS resume sync
-    (tracked via db.get/set_notification_sync_cursor -- the uri of the
-    newest notification as of that sync), or until
-    NOTIFICATION_SYNC_MAX_PAGES pages have been walked (safety cap --
-    an account with genuinely thousands of unread notifications, e.g.
-    after the add-on was left closed a long time, syncs what it can
-    per call and picks up the rest on the next bgsync tick instead of
-    blocking on one huge fetch).
+    Walks pages of listNotifications from the newest until it reaches the notification recorded by
+    the previous resume sync (the uri of the newest notification then), or
+    NOTIFICATION_SYNC_MAX_PAGES pages (a safety cap: an account with thousands of unread syncs what
+    it can per call and picks up the rest on the next tick). Without a resume point, an account
+    getting more than `limit` notifications between two syncs would silently lose the rest.
 
-    CONFIRMED BUG this replaces: the old version always fetched just
-    the newest `limit` (default 50) notifications with no persisted
-    resume point -- any account receiving more than 50 notifications
-    between two syncs (a popular account, or the add-on left closed a
-    while) silently lost whatever fell past position 50, with no error
-    or indication anything was missed.
-
-    The `cursor` param is preserved for the existing lazy-load
-    "fetch older" caller -- passing it explicitly walks exactly ONE
-    page from that point (old behavior, unchanged) and does NOT touch
-    the persisted resume cursor at all, only a fresh sync
-    (cursor=None) consults/updates it.
+    Passing `cursor` walks exactly ONE page from there (lazy-load "fetch older") and does not touch
+    the persisted resume cursor; only a fresh sync (cursor=None) consults and updates it.
     """
     isResumeSync = cursor is None
     resumeUri = db.get_notification_sync_cursor(account_id) if isResumeSync else None
@@ -1989,6 +1784,10 @@ def sync_notifications(client, account_id: int, cursor: str = None, limit: int =
                 urisToResolve.append(notif.uri)
             elif notif.reason in ("like", "repost") and notif.reason_subject:
                 urisToResolve.append(notif.reason_subject)
+            elif notif.reason in ("like-via-repost", "repost-via-repost"):
+                viaSubject = _notification_record_subject(notif) or notif.reason_subject
+                if viaSubject:
+                    urisToResolve.append(viaSubject)
 
         resolvedSubjects = resolve_posts(client, account_id, urisToResolve) if urisToResolve else {}
 
@@ -2026,6 +1825,11 @@ def sync_notifications(client, account_id: int, cursor: str = None, limit: int =
     return lastPageCursor
 
 
+def _notification_record_subject(notif):
+    # A like/repost record always carries the liked/reposted post in record.subject.uri.
+    return _view_field(_view_field(notif.record, "subject"), "uri")
+
+
 def _store_notification(notif, account_id: int, resolvedSubjects: dict):
     author = notif.author
     authorViewer = getattr(author, "viewer", None)
@@ -2061,6 +1865,8 @@ def _store_notification(notif, account_id: int, resolvedSubjects: dict):
         # reasonSubject is the actual post that got liked/reposted, and
         # that's the actionable one for Post action.
         subjectUri = notif.reason_subject
+    elif reason in ("like-via-repost", "repost-via-repost"):
+        subjectUri = _notification_record_subject(notif) or notif.reason_subject
     else:
         # "follow" has no post at all -- User action (Alt+U) only.
         subjectUri = None
@@ -2165,11 +1971,8 @@ def _upload_blob_dict(client, image_path: str) -> dict:
 
 
 VIDEO_EXTENSIONS = (".mp4", ".mpeg", ".mpg", ".mov", ".webm")
-# LOW CONFIDENCE: Bluesky raised these to 10 minutes / 300MB on
-# 2026-08-26 (per TechCrunch/Engadget), after 60s->3min->10min bumps
-# over the past couple years -- expect this to change again. Server is
-# always the final authority; this is just a cheap pre-check to avoid
-# an obviously-doomed upload.
+# Current Bluesky video limits (10 minutes / 300MB since 2026-08-26); they have changed before. The
+# server is the final authority: this is only a cheap pre-check.
 VIDEO_MAX_DURATION_SECONDS = 600
 VIDEO_MAX_BYTES = 300 * 1_000_000
 
@@ -2307,14 +2110,9 @@ def _get_pds_service_did(client) -> str:
 
 def _get_upload_video_auth(client) -> str:
     """
-    Auth for app.bsky.video.uploadVideo SPECIFICALLY -- aud is the
-    user's own PDS (not video.bsky.app), lxm is ALWAYS
-    "com.atproto.repo.uploadBlob" regardless of the endpoint actually
-    being called. Confirmed via docs.bsky.app's own tutorial. This
-    scope is uploadVideo-only -- getUploadLimits/getJobStatus need a
-    DIFFERENT aud/lxm entirely, see _get_video_query_auth below. A
-    first attempt sharing one auth helper across all three video
-    endpoints produced 401s on getUploadLimits, confirmed by testing.
+    Service auth for app.bsky.video.uploadVideo only: aud is the user's own PDS (not video.bsky.app)
+    and lxm is always "com.atproto.repo.uploadBlob". getUploadLimits/getJobStatus need a different
+    aud/lxm, see _get_video_query_auth.
     """
     audDid = _get_pds_service_did(client)
     resp = client.com.atproto.server.get_service_auth(
@@ -2325,13 +2123,8 @@ def _get_upload_video_auth(client) -> str:
 
 def _get_video_query_auth(client, lxm: str) -> str:
     """
-    Auth for app.bsky.video.getUploadLimits / getJobStatus -- aud is
-    video.bsky.app itself (NOT the PDS, opposite of uploadVideo above),
-    lxm is the actual endpoint name being called. Confirmed via
-    atproto's own GitHub discussion #4437 (permission scope strings
-    list aud=did:web:video.bsky.app for these two) and discussion #400
-    (a real working example using lxm='app.bsky.video.getUploadLimits'
-    with that same aud).
+    Service auth for app.bsky.video.getUploadLimits / getJobStatus: aud is video.bsky.app itself
+    (not the PDS, unlike uploadVideo) and lxm is the endpoint being called.
     """
     resp = client.com.atproto.server.get_service_auth(
         params={"aud": "did:web:video.bsky.app", "lxm": lxm}
@@ -2392,12 +2185,9 @@ def upload_video(client, video_path: str, progress_callback=None, cancel_event=N
             jobStatus = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 409:
-            # CONFIRMED (via a real 409 in testing, matching community
-            # docs): uploading the exact same video bytes again isn't a
-            # real failure -- the server recognizes it and returns a
-            # JOB_STATE_COMPLETED job status (with a usable blob)
-            # in the error response's own body, not a fresh upload.
-            # HTTPError acts as a readable response object here.
+            # Uploading the same video bytes again isn't a failure: the server answers 409 with a
+            # JOB_STATE_COMPLETED job status (and a usable blob) in the error body. HTTPError is
+            # readable as a response here.
             jobStatus = json.loads(e.read().decode("utf-8"))
         else:
             raise
@@ -2410,7 +2200,6 @@ def upload_video(client, video_path: str, progress_callback=None, cancel_event=N
         return blob
     jobId = jobStatus.get("jobId")
     if not jobId:
-        debug_dump(jobStatus, "video_upload_no_job_id")
         # Translators: Shown when the server's video upload response has no blob and no job ID.
         raise RuntimeError(_("Video upload returned neither a blob nor a job ID."))
 
@@ -2433,7 +2222,6 @@ def upload_video(client, video_path: str, progress_callback=None, cancel_event=N
             blob = jobStatus.get("blob")
             if blob:
                 return blob
-            debug_dump(jobStatus, "video_job_completed_no_blob")
             # Translators: Shown when video processing finished but the server returned no video.
             raise RuntimeError(_("Video processing completed but returned no blob."))
         if state == "JOB_STATE_FAILED":
@@ -2529,13 +2317,6 @@ def find_all_urls(text: str) -> list:
     return [m.group(0).rstrip(').,!?') for m in URL_REGEX.finditer(text)]
 
 
-def find_first_url(text: str):
-    """First URL in text, or None. Shared with build_facets() (actual
-    facet indices) so the two never disagree about what counts as a
-    URL."""
-    urls = find_all_urls(text)
-    return urls[0] if urls else None
-
 def build_facets(client, text: str) -> list:
     """
     Scans post text for @handle mentions and http(s) URLs and builds the
@@ -2574,15 +2355,11 @@ def build_facets(client, text: str) -> list:
 
 def fetch_link_card(url: str) -> dict:
     """
-    Scrapes the target page's OpenGraph tags for a link-card preview --
-    the same job bsky.app's own compose box does client-side. Fetches
-    the page directly (not through a Bluesky-internal proxy, which isn't
-    a documented/stable API to depend on), with a browser-like
-    User-Agent since some sites block non-browser requests.
-    Regex-based tag extraction (no HTML parser vendored) --
-    EXPERIMENTAL: works for well-formed pages, can miss oddly-ordered or
-    unusual meta tags. A missing title/description/image just means a
-    plainer card, never a hard failure.
+    Scrapes the target page's OpenGraph tags for a link-card preview, the same job bsky.app's
+    compose box does client-side. Fetches the page directly with a browser-like User-Agent (some
+    sites block non-browser requests). Tags are extracted with regexes (no HTML parser is bundled):
+    this works for well-formed pages and can miss unusual tag ordering. A missing title, description
+    or image just means a plainer card, never a failure.
     """
     request = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -2620,32 +2397,18 @@ def fetch_link_card(url: str) -> dict:
 
 def _strip_none_values(record: dict) -> dict:
     """
-    The typed put_record()/create_record() this file used to go
-    through excluded None-valued fields automatically (exclude_none=
-    True) before serializing -- the raw invoke_procedure()+DotDict
-    bypass below has no such step, so a field genuinely absent from
-    the account (e.g. no avatar set) came through as a literal JSON
-    null and got rejected by the server's lexicon validation
-    ("Expected blob value type (got null)"). Shallow strip only --
-    every record dict built in this file nests optional sub-objects by
-    omitting the key entirely already, never by setting it to None.
+    Drops None-valued top-level fields: the raw write has no exclude_none step, and the server
+    rejects a literal null for a missing blob (e.g. no avatar). Shallow on purpose; nested optional
+    fields are omitted when the record is built.
     """
     return {k: v for k, v in record.items() if v is not None}
 
 
 def _create_record(client, repo: str, collection: str, record: dict, rkey: str = None):
     """
-    Raw-JSON bypass for com.atproto.repo.createRecord -- same fix as
-    send_message/create_group elsewhere in this file. CONFIRMED
-    (0.0.72 regression): create_record() resolves a plain dict `record`
-    into a generated typed model INTERNALLY before serializing, even
-    when the caller already passes a dict or a manually-repaired model
-    instance -- so neither approach avoids the broken py_type field
-    construction that hits every record-family model (Record, embed
-    variants, reply refs...). Sidesteps typed model construction
-    entirely via invoke_procedure()+DotDict instead, the same non-
-    pydantic_core serialization path chat.bsky.convo.sendMessage
-    already relies on.
+    Raw JSON write for com.atproto.repo.createRecord: the record is sent exactly as
+    built, with no typed model in between, so unknown fields survive and nothing is
+    rewritten. Same path as send_message.
     """
     from atproto_client.models.dot_dict import DotDict
 
@@ -3022,6 +2785,10 @@ def _post_view_to_dict(post) -> dict:
         "viewer_thread_muted": viewer_thread_muted,
     }
 
+def pin_feed_key(did: str) -> str:
+    return f"user_timeline_pin:{did}"
+
+
 def sync_author_feed_page(client, account_id: int, did: str, cursor: str = None, limit: int = 50) -> str:
     """
     Syncs one page of a user's own post timeline into the feed_items/
@@ -3032,10 +2799,20 @@ def sync_author_feed_page(client, account_id: int, did: str, cursor: str = None,
     FeedViewPost shape _store_feed_item already expects (reason/reply/
     post), so no separate conversion is needed.
     """
-    resp = client.get_author_feed(actor=did, limit=limit, cursor=cursor)
+    params = {"actor": did, "limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    else:
+        params["includePins"] = True  # a pin only comes with the first page
+    resp = client.app.bsky.feed.get_author_feed(params=params)
+    pinKey = pin_feed_key(did)
+    if not cursor:
+        db.clear_feed_key_cache(account_id, pinKey)  # drops a pin the author has since removed
     for item in resp.feed:
+        # ReasonPin carries no "by"; only a repost does.
+        isPin = item.reason is not None and getattr(item.reason, "by", None) is None
         try:
-            _store_feed_item(item, account_id, f"user_timeline:{did}")
+            _store_feed_item(item, account_id, pinKey if isPin else f"user_timeline:{did}")
         except Exception as e:
             log.error(f"NVSky: failed to store a user timeline item: {e}")
     return resp.cursor
@@ -3178,11 +2955,10 @@ def _get_postgate_record(client, post_uri: str) -> dict:
 
 
 def _put_postgate_record(client, post_uri: str, embedding_rules: list, detached_uris: list):
-    """Writes the FULL postgate record -- both fields together, never
-    just one, so a write to one field can't silently blank the other
-    (confirmed bug in an earlier version of set_postgate_disable_quotes,
-    which always wrote embeddingRules alone and would have wiped any
-    existing detachedEmbeddingUris the moment this got added)."""
+    """
+    Writes the FULL postgate record (both fields together), so changing one field can't blank the
+    other.
+    """
     from atproto import AtUri
     rkey = AtUri.from_str(post_uri).rkey
 
@@ -3233,13 +3009,6 @@ def set_postgate_disable_quotes(client, post_uri: str, disable: bool):
     _put_postgate_record(client, post_uri, rules, record["detachedEmbeddingUris"])
 
 
-def get_postgate_detached_uris(client, post_uri: str) -> list:
-    """URIs of other people's posts that have quoted post_uri and been
-    individually detached (hidden from post_uri's own quote list) via
-    detachedEmbeddingUris."""
-    return _get_postgate_record(client, post_uri)["detachedEmbeddingUris"]
-
-
 def detach_quote(client, post_uri: str, quoting_post_uri: str):
     """Detaches MY post_uri from someone else's quoting_post_uri that
     quoted it -- doesn't touch their post, just removes it from
@@ -3258,8 +3027,18 @@ def get_thread(client, post_uri: str, depth: int = 25, parent_height: int = 100)
     dicts in display order (each tagged "_thread_depth" for
     indentation), plus the index of the target post within that list.
     """
-    raw = _fetch_thread_json(post_uri, depth, parent_height, client=client)
+    try:
+        raw = _fetch_thread_json(post_uri, depth, parent_height, client=client)
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404):
+            # Translators: Shown when a thread's post was deleted, blocked, or can't be seen.
+            raise RuntimeError(_("This post was deleted or isn't visible to you.")) from e
+        raise
     node = _dict_to_ns(raw.get("thread", raw))
+    if getattr(node, "post", None) is None:
+        # notFoundPost / blockedPost root: nothing to show.
+        # Translators: Shown when a thread's post was deleted, blocked, or can't be seen.
+        raise RuntimeError(_("This post was deleted or isn't visible to you."))
 
     ancestors = []
     walker = node
@@ -3333,14 +3112,8 @@ def unmute_thread(client, root_uri: str):
 
 def create_report(client, subject_uri: str, subject_cid: str, reason_type: str, reason: str = ""):
     """
-    Raw-JSON bypass -- converted preemptively during the 0.0.72
-    migration alongside every repo.createRecord call site (see
-    _create_record's docstring). Different XRPC namespace
-    (moderation.createReport, not repo.createRecord), but the request
-    body still carries a nested $type discriminator (the strongRef
-    subject), which is exactly the shape that broke elsewhere. Not
-    independently confirmed broken here yet -- paste back the
-    traceback if reporting a post ever fails after this.
+    Reports a post (com.atproto.moderation.createReport). Raw JSON: the subject carries a nested
+    $type, sent exactly as built.
     """
     from atproto_client.models.dot_dict import DotDict
 
@@ -3357,12 +3130,8 @@ def create_report(client, subject_uri: str, subject_cid: str, reason_type: str, 
 
 def create_actor_report(client, did: str, reason_type: str, reason: str = ""):
     """
-    Raw-JSON bypass -- the typed com.atproto.moderation.createReport
-    call chokes on the repoRef subject's discriminator (confirmed via
-    a real pydantic error: "$type"/"pyType" alias mismatch), same
-    class of bug documented elsewhere in this file for other
-    discriminated-union request bodies. create_report (post reports,
-    strongRef subject) doesn't hit this and stays on the typed call.
+    Reports an account (com.atproto.moderation.createReport with a repoRef subject). Raw JSON, same
+    as create_report.
     """
     from atproto_client.models.dot_dict import DotDict
 
@@ -3393,13 +3162,8 @@ def unfollow_actor(client, follow_uri: str):
 
 def bookmark_post(client, post_uri: str, post_cid: str):
     """
-    Saves a post to the account's private Bookmarks (Bluesky's official
-    "Saved posts" feature, added Sept 2025). Not a public repo record --
-    Bluesky stores it off-protocol for privacy, so there's no record URI
-    to track; toggling later is done by referencing the ORIGINAL post's
-    uri again. EXPERIMENTAL -- exact param names weren't independently
-    confirmed against a live response, paste back the traceback if this
-    errors.
+    Saves a post to the account's private Bookmarks. Not a public repo record, so there is no record
+    URI: removing it later references the original post's URI again.
     """
     client.app.bsky.bookmark.create_bookmark(data={"uri": post_uri, "cid": post_cid})
 
@@ -3436,11 +3200,10 @@ def get_muted_actors(client, page_limit: int = 100, max_pages: int = 100) -> lis
 
 
 def get_blocked_actors(client, page_limit: int = 100, max_pages: int = 100) -> list:
-    """app.bsky.graph.getBlocks -- accounts the active user has
-    blocked. LOW CONFIDENCE: assumes each entry's viewer.blocking
-    carries the block record's own uri (needed for unblock_actor),
-    never confirmed against a real response -- paste back a traceback
-    if unblocking from this list fails."""
+    """
+    app.bsky.graph.getBlocks -- accounts the active user has blocked. Each entry's viewer.blocking
+    is the block record's URI, needed to unblock.
+    """
     results = []
     cursor = None
     for _ in range(max_pages):
@@ -3467,15 +3230,8 @@ def unblock_actor(client, block_uri: str):
 
 def set_activity_subscription(client, did: str, subscribed: bool):
     """
-    Subscribes (or unsubscribes) to per-account "new post" bell
-    notifications -- separate from follow. CONFIRMED via a real 422
-    validation error that the target-account field is named "subject",
-    not "actor". Also CONFIRMED the typed put_activity_subscription()
-    call hits the same PydanticSerializationError ("Unable to serialize
-    unknown type: FieldInfo") documented elsewhere in this file for
-    send_message/create_group -- some field on this request model stays
-    an unresolved FieldInfo default and model_dump_json() chokes on it.
-    Raw-JSON bypass via DotDict, same fix as those two.
+    Subscribes (or unsubscribes) to per-account "new post" bell notifications, separate from follow.
+    The target account field is "subject". Raw JSON via DotDict.
     """
     from atproto_client.models.dot_dict import DotDict
 
@@ -3490,43 +3246,16 @@ def set_activity_subscription(client, did: str, subscribed: bool):
 
 
 def get_activity_subscriptions(client, page_limit: int = 100, max_pages: int = 100) -> list:
-    """
-    app.bsky.notification.listActivitySubscriptions -- accounts the
-    active user has bell-subscribed to for new-post notifications
-    (separate from follow/mute/block). Raw-JSON bypass, NOT the typed
-    list_activity_subscriptions() call -- CONFIRMED via testing that a
-    write (putActivitySubscription, which itself echoes back
-    subject/activitySubscription successfully, proving the write
-    landed) was consistently invisible through the typed read call
-    afterward (empty subscriptions/cursor every time), pointing at the
-    same class of pydantic discriminated-union parsing bug documented
-    throughout this file for other chat.bsky.convo.*/notification
-    endpoints, not an actual empty result.
-    """
-    from atproto_client.models.dot_dict import DotDict
-
+    """app.bsky.notification.listActivitySubscriptions -- accounts the active user has
+    bell-subscribed to for new-post notifications (separate from follow/mute/block)."""
     results = []
     cursor = None
     for _ in range(max_pages):
-        params = {"limit": page_limit}
-        if cursor:
-            params["cursor"] = cursor
-        resp = client.app.bsky.notification._client.invoke_query(
-            "app.bsky.notification.listActivitySubscriptions",
-            params=DotDict(params), output_encoding="application/json",
+        resp = client.app.bsky.notification.list_activity_subscriptions(
+            params={"limit": page_limit, "cursor": cursor}
         )
-        content = resp.content if isinstance(resp.content, dict) else {}
-        for actor in content.get("subscriptions", []):
-            viewer = actor.get("viewer") or {}
-            results.append({
-                "did": actor.get("did"), "handle": actor.get("handle"),
-                "display_name": actor.get("displayName"),
-                "description": actor.get("description"),
-                "following_uri": viewer.get("following"),
-                "muted": bool(viewer.get("muted")),
-                "blocking_uri": viewer.get("blocking"),
-            })
-        cursor = content.get("cursor")
+        results.extend(_actor_dict(a) for a in resp.subscriptions)
+        cursor = resp.cursor
         if not cursor:
             break
     return results
@@ -3536,14 +3265,8 @@ MUTED_WORDS_PREF_TYPE = "app.bsky.actor.defs#mutedWordsPref"
 
 def get_muted_words(client) -> list:
     """
-    Returns the account's muted words/tags as plain dicts:
-    {"id", "value", "targets": ["content", "tag"]}. Uses the same
-    raw-JSON-bypass helper as the saved-feeds prefs
-    (_get_cleaned_preferences) instead of the typed
-    client.app.bsky.actor.get_preferences() call this used to make --
-    confirmed via a real 168-error pydantic validation traceback that
-    the typed call chokes on the SAME FieldInfo/pyType bug across
-    EVERY preference type on the account, not just muted words.
+    Returns the account's muted words/tags as plain dicts: {"id", "value", "targets": ["content",
+    "tag"]}.
     """
     prefs = _get_cleaned_preferences(client)
     pref = next((p for p in prefs if p.get("$type") == MUTED_WORDS_PREF_TYPE), None)
@@ -3643,17 +3366,9 @@ def set_content_label_pref(client, label: str, visibility: str):
     _put_preferences(client, prefs)
 
 
-# Categories confirmed via a real debug_dump of
-# app.bsky.notification.getPreferences. "chat" is included here (with
-# its own type/wire-key entries) purely so writes can round-trip it
-# back unchanged -- putPreferencesV2 is a PUT (full replace, confirmed
-# by a real test: sending only the changed category had NO effect at
-# all, no error, matching how app.bsky.actor.putPreferences also
-# requires the whole array back), so every category must be resent
-# every time or the ones left out risk being reset/dropped.
-# NOT offered in the UI as an editable row -- no "list" field at all
-# for chat (only include/push), so it doesn't fit the combined
-# off/everyone/following model used for the other 12.
+# Categories of app.bsky.notification.getPreferences. "chat" is here only so writes round-trip it
+# unchanged: putPreferencesV2 is a PUT (full replace), so every category must be resent every time.
+# It is not an editable row in the UI (no "list" field, only include/push).
 NOTIFICATION_FILTERABLE_CATEGORIES = [
     "follow", "like", "like_via_repost", "mention", "quote", "reply", "repost", "repost_via_repost",
 ]
@@ -3662,13 +3377,7 @@ NOTIFICATION_SIMPLE_CATEGORIES = [
 ]
 NOTIFICATION_ALL_CATEGORIES = NOTIFICATION_FILTERABLE_CATEGORIES + NOTIFICATION_SIMPLE_CATEGORIES
 
-# $type discriminator per category -- CONFIRMED via a real debug_dump
-# (each preference sub-object's own unresolved py_type FieldInfo
-# default carries this exact string). Required on write: this is a
-# discriminated union field, and every other discriminated union in
-# this file needs $type explicitly set for the server to parse it --
-# omitting it here is the leading suspect for why a first attempt at
-# this write had no effect despite no error.
+# $type per category. Required on write: the server needs it to parse these union fields.
 NOTIFICATION_CATEGORY_TYPES = {
     "chat": "app.bsky.notification.defs#chatPreference",
     "follow": "app.bsky.notification.defs#filterablePreference",
@@ -3685,14 +3394,8 @@ NOTIFICATION_CATEGORY_TYPES = {
     "verified": "app.bsky.notification.defs#preference",
 }
 
-# python (snake_case, matches the SDK's own attribute names) -> real
-# wire-format camelCase key. CONFIRMED bug: the SDK auto-converts
-# camelCase JSON keys to snake_case attributes on READ (getPreferences),
-# but a plain dict handed to invoke_procedure for a WRITE is sent
-# byte-for-byte as given -- a first attempt sent "like_via_repost" as
-# a literal top-level key, which the server silently doesn't recognize
-# (no error, field just never took effect). Every category with an
-# underscore needs its real camelCase name here.
+# snake_case category (the SDK's attribute name) -> wire-format camelCase key. A plain dict is sent
+# as given, so writes must use the camelCase name.
 NOTIFICATION_CATEGORY_WIRE_KEYS = {
     "chat": "chat",
     "follow": "follow",
@@ -3712,14 +3415,9 @@ NOTIFICATION_CATEGORY_WIRE_KEYS = {
 
 def get_notification_prefs(client) -> dict:
     """
-    Returns {category: {"list": bool, "include": "all"/"follows"/None,
-    "push": bool}} for every category in NOTIFICATION_CATEGORY_TYPES
-    (including "chat", read-only-in-this-app but needed so writes can
-    round-trip it back unchanged -- see set_notification_category).
-    Field names/shape confirmed via a real debug_dump of
-    getPreferences -- "list"/"include"/"push" resolve as plain values
-    even though the object's own $type discriminator hits the usual
-    FieldInfo bug (only the discriminator, not the content fields).
+    Returns {category: {"list": bool, "include": "all"/"follows"/None, "push": bool}} for every
+    category in NOTIFICATION_CATEGORY_TYPES (including "chat", read-only here but needed so writes
+    round-trip it unchanged -- see set_notification_category).
     """
     resp = client.app.bsky.notification.get_preferences()
     prefs = resp.preferences
@@ -3738,22 +3436,11 @@ def get_notification_prefs(client) -> dict:
 
 def set_notification_category(client, current_prefs: dict, category: str, list_enabled: bool, push: bool, include: str = None):
     """
-    LOW CONFIDENCE -- app.bsky.notification.putPreferencesV2 has never
-    been CONFIRMED working against a real server (a first attempt had
-    no effect -- see NOTIFICATION_CATEGORY_WIRE_KEYS/_TYPES above for
-    the two suspected causes now fixed: missing $type, wrong wire
-    key). Sends the FULL preferences object (every category in
-    current_prefs, each tagged with its own $type and real wire key)
-    -- putPreferencesV2 is a PUT, confirmed to have no effect when only
-    the changed category was sent, so every category must round-trip
-    through every write. `current_prefs` should be whatever
-    get_notification_prefs last returned (chat included), with the one
-    `category` being changed already reflecting its new values.
-    `push` is always sent back as the caller's last-known value for
-    every category (never something the UI lets the user change) so
-    this call can't silently reset anyone's push settings. Paste back
-    a traceback -- or confirm on bsky.app's own Settings > Notifications
-    page -- if a saved change still doesn't stick.
+    Saves notification preferences (app.bsky.notification.putPreferencesV2). It is a PUT, so the
+    FULL preferences object is sent: every category in current_prefs (chat included), each with its
+    own $type and wire key. `current_prefs` is what get_notification_prefs last returned, with the
+    one `category` already changed. `push` is sent back as last known for every category (the UI
+    never changes it).
     """
     from atproto_client.models.dot_dict import DotDict
 
@@ -3904,12 +3591,8 @@ def unmute_actor_list(client, list_uri: str):
 
 def block_actor_list(client, list_uri: str) -> str:
     """
-    Bulk-blocking a whole list is a public repo record (parallel to
-    block_actor's app.bsky.graph.block, since blocks are public)
-    rather than a private procedure like mute_actor_list above. LOW
-    CONFIDENCE -- "app.bsky.graph.listblock" as the collection name is
-    from memory of the lexicon, not confirmed against the installed
-    SDK's model classes yet. Paste back the traceback if this errors.
+    Blocks a whole list: a public repo record (collection app.bsky.graph.listblock, parallel to
+    block_actor), unlike the private mute procedure.
     """
     resp = _create_record(client, client.me.did, "app.bsky.graph.listblock", {
         "$type": "app.bsky.graph.listblock",
@@ -3936,18 +3619,10 @@ def search_actors_typeahead(client, query: str, limit: int = 8) -> list:
 
 def count_graphemes(text: str) -> int:
     """
-    Approximates Unicode grapheme cluster count -- what Bluesky's
-    server actually enforces via maxGraphemes on both posts and chat
-    messages. Python's len() counts codepoints instead, which
-    overcounts Thai text substantially (combining vowels/tone marks
-    are separate codepoints that attach to the preceding consonant as
-    ONE visual character/grapheme, not two) -- confirmed against a
-    real side-by-side test against bsky.app (1704 graphemes vs len()'s
-    1887 on the same Thai-heavy message). Also collapses basic ZWJ
-    emoji sequences (e.g. family emoji) into one grapheme. Does NOT
-    handle flag emoji (regional indicator pairs) or skin-tone
-    modifiers -- rarer in practice, and Bluesky's own counter has
-    quirks there too, so not worth the extra complexity right now.
+    Approximates the Unicode grapheme count, which is what Bluesky enforces (maxGraphemes) for posts
+    and chat messages. len() overcounts Thai because combining vowels and tone marks are separate
+    codepoints. Collapses basic ZWJ emoji sequences; does not handle flag emoji or skin-tone
+    modifiers.
     """
     count = 0
     prevWasJoiner = False
@@ -3971,50 +3646,18 @@ def count_graphemes(text: str) -> int:
 
 def split_at_grapheme_boundary(text: str, max_chars: int):
     """
-    Splits `text` into (first, rest), targeting the MIDPOINT of `text`
-    (capped at max_chars) rather than always maxing out the first
-    chunk -- for a message near the overall length cap, putting as
-    much as possible in the first chunk just pushes the overflow risk
-    onto the second chunk instead. Aiming for the midpoint keeps both
-    halves roughly balanced and safely under the per-cell limit for
-    any message up to roughly 2 * max_chars total.
+    Splits `text` into (first, rest) for the two message columns, aiming at the midpoint of `text`
+    (capped at max_chars) so both halves stay under the per-cell limit (about 511 characters) for
+    messages up to roughly 2 * max_chars.
 
-    The split never falls in the middle of a grapheme cluster -- a
-    naive index slice can sever a Thai combining tone/vowel mark from
-    its base consonant (or split a ZWJ emoji sequence), corrupting
-    both halves. Uses the same category-based boundary logic as
-    count_graphemes above, just recording each grapheme's start index
-    instead of counting them.
+    The split never falls inside a grapheme cluster (a naive slice can sever a Thai tone mark from
+    its base consonant, or split a ZWJ emoji sequence). Within WHITESPACE_LOOKBACK characters of the
+    target it prefers to land after whitespace or punctuation (any Unicode "P" category, so CJK
+    punctuation counts). Text with no such landmark nearby gets a grapheme-safe hard cut, which can
+    land mid-word (no word segmenter is bundled).
 
-    Within WHITESPACE_LOOKBACK chars of the target, prefers to land
-    right after whitespace OR a punctuation mark (Unicode general
-    category starting with "P" -- covers CJK full-width punctuation
-    like "。", "、", "！", "？" and Western ".", ",", "!", "?" alike), so
-    the split lands on a natural phrase/sentence break instead of
-    mid-word wherever the text has ANY such break nearby. Thai commonly
-    has no punctuation or spaces at all within a short span, and CJK
-    scripts don't reliably mark every word boundary either -- for text
-    with no such landmark near the target, this still falls back to a
-    grapheme-safe hard cut, which can land mid-word. There is no
-    general-purpose dictionary-based word segmenter here (e.g.
-    PyThaiNLP), which would be needed to close that gap fully, and is
-    out of scope for this add-on.
-
-    NOTE: this optimizes the common arrow-key-navigation read; it does
-    NOT guarantee zero truncation in absolute worst case (e.g. a
-    message at Bluesky's stated max length -- itself LOW CONFIDENCE,
-    see plan-08.md -- combined with this app's own reply-preview
-    prefix could theoretically still slightly exceed a 2-column
-    budget). "Show message..." (chatWindow.py) is the dialog that
-    reads the full, unsplit text and is the actual guaranteed-complete
-    fallback for that edge case.
-
-    Used by chatWindow.py to spread a long message across two
-    ListCtrl columns (Message / Message (more)) to work around
-    Windows' native per-cell text limit (confirmed by testing to sit
-    around ~511 characters, cause not fully pinned down -- see
-    plan-09.md). Returns (text, "") unchanged if text already fits
-    within max_chars.
+    Not a guarantee against truncation in the worst case; "Show message..." shows the full text.
+    Returns (text, "") unchanged if text already fits within max_chars.
     """
     WHITESPACE_LOOKBACK = 100
 

@@ -11,11 +11,13 @@ import ui as nvdaUi
 from . import db
 from . import client
 from . import uiutil
+from . import keymap
 from .feedWindow import (
     FeedListMixin,
     ItemActionMixin,
     UserActionMixin,
     EmbedViewMixin,
+    _VirtualPostList,
     _format_post_time,
     _announce_now,
     _post_web_url,
@@ -41,6 +43,16 @@ def _describe_notification(notif: dict) -> str:
         "quote": _("Quoted"),
         # Translators: Notification-type label -- the bell-icon activity subscription feature (subscribed to someone's new posts).
         "subscribed-post": _("New post"),
+        # Translators: Notification-type label -- someone liked a post you reposted.
+        "like-via-repost": _("Liked your repost"),
+        # Translators: Notification-type label -- someone reposted a post you reposted.
+        "repost-via-repost": _("Reposted your repost"),
+        # Translators: Notification-type label -- someone joined through your starter pack.
+        "starterpack-joined": _("Joined your starter pack"),
+        # Translators: Notification-type label -- your account was verified.
+        "verified": _("Your account was verified"),
+        # Translators: Notification-type label -- your account's verification was removed.
+        "unverified": _("Your verification was removed"),
     # Translators: Fallback notification-type label when the reason is unrecognized.
     }.get(reason, reason or _("Notification"))
 
@@ -63,6 +75,7 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
     SUPPORTS_FOCUS_NEXT_UNREAD = True
     SUPPORTS_SELECT_ALL = True
     TIME_COLUMN_INDEX = 2  # Author(0)/Notification(1)/Received(2): 3 columns, not the usual 4
+    VIRTUAL_LIST = True
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -75,7 +88,7 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
+        self.postList = _VirtualPostList(self, self._cellAt)
         # Translators: Column header for a notification's author.
         self.postList.InsertColumn(0, _("Author"), width=180)
         # Translators: Column header for a notification's content.
@@ -85,10 +98,10 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
         sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to open the Post action menu. Shows the Alt+A shortcut.
-        self.postActionButton = wx.Button(self, label=_("&Post action... (Alt+A)"))
-        # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
-        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
+        # Translators: Button to open the Post action menu. The current shortcut is appended automatically.
+        self.postActionButton = wx.Button(self, label=_("&Post action...") + keymap.hint("post_action"))
+        # Translators: Button to open the User action menu. The current shortcut is appended automatically.
+        self.userActionButton = wx.Button(self, label=_("&User action...") + keymap.hint("user_action"))
         actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.userActionButton)
         sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
@@ -126,10 +139,12 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
             nvdaUi.message(_("{} tab").format(self.TAB_NAME))
             self._restoreFocusPosition()
 
-    def _insertRow(self, index: int, notif: dict, mode: str):
-        self.postList.InsertItem(index, self._authorLabel(notif, mode))
-        self.postList.SetItem(index, 1, _describe_notification(notif))
-        self.postList.SetItem(index, 2, _format_post_time(notif.get("indexed_at")))
+    def _rowCells(self, notif: dict, mode: str):
+        return [
+            self._authorLabel(notif, mode),
+            _describe_notification(notif),
+            _format_post_time(notif.get("indexed_at")),
+        ]
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
         return db.get_notification_page(self._account["id"], before_indexed_at=before_indexed_at, limit=limit)
@@ -191,7 +206,7 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
     def onDeletePostShortcut(self):
         # Delete would otherwise target the post behind the notification.
         # Translators: Announced when Delete is pressed on a notification.
-        nvdaUi.message(_("Delete doesn't apply to notifications. Use Post action (Alt+A) to manage the post."))
+        nvdaUi.message(_("Delete doesn't apply to notifications. Use the Post action menu to manage the post."))
 
     def onUserAction(self, evt=None):
         notif = self._getFocusedPost()
@@ -251,16 +266,16 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
         if not subjectUri:
             if notif.get("reason") == "follow":
                 # Translators: Announced when Post action is invoked on a follow notification, which has no post.
-                nvdaUi.message(_("Follow notifications have no post -- try User action (Alt+U) instead."))
+                nvdaUi.message(_("Follow notifications have no post -- try the User action menu instead."))
             else:
                 # Translators: Announced when a notification's post isn't available at all.
-                nvdaUi.message(_("This notification's post isn't available -- try Check for updates (F5) to resync."))
+                nvdaUi.message(_("This notification's post isn't available -- try Check for updates to resync."))
             return None
 
         post = db.get_post(subjectUri)
         if post is None:
             # Translators: Announced when a notification's post exists but isn't cached locally yet.
-            nvdaUi.message(_("This notification's post isn't cached yet -- try Check for updates (F5) to resync."))
+            nvdaUi.message(_("This notification's post isn't cached yet -- try Check for updates to resync."))
             return None
         return post
 

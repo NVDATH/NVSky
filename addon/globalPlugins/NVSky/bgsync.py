@@ -10,6 +10,8 @@ diffs before/after to report whether anything actually changed --
 callers use this to decide whether to announce/reload a visible panel.
 Returns (changed: bool, summary: str or None).
 """
+import datetime
+
 from logHandler import log
 
 from . import client
@@ -279,12 +281,7 @@ def sync_profile(atprotoClient, account_id: int):
                     else:
                         users = client.get_known_followers(atprotoClient, did)
                 elif kind in ("likes", "reposts"):
-                    # BUG FIX: these used to fall into the "search"
-                    # else-branch below, which requires entry["query"]
-                    # -- likes/reposts entries store "post_uri" instead
-                    # (see _openUserListForPost), so query was always
-                    # None and background sync silently skipped these
-                    # tabs every single tick since C shipped.
+                    # likes/reposts tabs store "post_uri", not "query".
                     postUri = entry.get("post_uri")
                     if not postUri:
                         continue
@@ -356,6 +353,59 @@ def sync_thread(atprotoClient, account_id: int):
         if len(posts) != len(before):
             names.append(entry.get("custom_name") or _thread_display_name(posts))
     return bool(names), names
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def seconds_until_due(now, lastIso, intervalMinutes):
+    """Seconds until a category is due (<= 0 means due now); None if it never ran or the stamp is unreadable."""
+    if not lastIso:
+        return None
+    try:
+        last = datetime.datetime.fromisoformat(lastIso)
+    except (ValueError, TypeError):
+        return None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=datetime.timezone.utc)
+    return intervalMinutes * 60 - (now - last).total_seconds()
+
+
+def collect_due(now, accounts, enabled, interval_of, last_of):
+    """[(seconds overdue, account id, category)], most overdue first. Accounts with background checks off are skipped."""
+    due = []
+    for account in accounts:
+        accountId = account["id"]
+        if not enabled(accountId):
+            continue
+        for category in SYNC_FUNCTIONS:
+            minutes = interval_of(accountId, category)
+            if minutes <= 0:
+                continue
+            remaining = seconds_until_due(now, last_of(accountId, category), minutes)
+            overdue = minutes * 60 if remaining is None else -remaining
+            if overdue >= 0:
+                due.append((overdue, accountId, category))
+    due.sort(key=lambda item: -item[0])
+    return due
+
+
+def group_by_account(due):
+    """{account id: [categories]}, the account holding the most overdue category first."""
+    grouped = {}
+    for _overdue, accountId, category in due:
+        grouped.setdefault(accountId, []).append(category)
+    return grouped
+
+
+def db_readers():
+    """(enabled, interval_of, last_of) reading the real settings, each account from its own file."""
+    def interval_of(accountId, category):
+        with db.account_context(accountId):
+            return db.get_bg_sync_interval(category)
+
+    return db.get_bg_enabled, interval_of, db.get_bg_sync_last
 
 
 # category key -> (sync function, needs_my_did)

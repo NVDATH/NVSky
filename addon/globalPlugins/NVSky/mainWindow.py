@@ -44,6 +44,7 @@ from . import db
 from . import chatWindow
 from . import uiutil
 from . import soundpack
+from . import keymap
 from .compose import ComposeDialog
 from . import client
 
@@ -72,17 +73,17 @@ class MainWindow(wx.Frame):
 
         # Persistent toolbar shared by every tab.
         toolbarSizer = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Toolbar button to sync the current tab. Shows the F5 shortcut.
-        self.checkUpdatesButton = wx.Button(panel, label=_("Check for &updates (F5)"))
-        # Translators: Toolbar button to compose a new post. Shows the Ctrl+N shortcut. Relabeled to "New chat.../New list..." in chat/lists context, see onPageChanged.
-        self.newPostButton = wx.Button(panel, label=_("&New post... (Ctrl+N)"))
+        # Translators: Toolbar button to sync the current tab. The current shortcut is appended automatically.
+        self.checkUpdatesButton = wx.Button(panel, label=_("Check for &updates") + keymap.hint("check_updates"))
+        # Translators: Toolbar button to compose a new post. The current shortcut is appended. Relabeled to "New chat.../New list..." in chat/lists context, see onPageChanged.
+        self.newPostButton = wx.Button(panel, label=_("&New post...") + keymap.hint("new_item"))
         # Translators: Toolbar button, only shown while a Lists tab is active, to find and subscribe to a list by link.
         self.findListsButton = wx.Button(panel, label=_("&Find lists by user..."))
         self.findListsButton.Hide()  # only shown while a Lists tab is active, see onPageChanged
-        # Translators: Toolbar button to open NVSky's settings. Shows the Ctrl+P shortcut.
-        self.settingsButton = wx.Button(panel, label=_("&Settings... (Ctrl+P)"))
-        # Translators: Toolbar button to remove the current removable tab. Shows the Ctrl+W shortcut.
-        self.removeTabButton = wx.Button(panel, label=_("&Remove current tab (Ctrl+W)"))
+        # Translators: Toolbar button to open NVSky's settings. The current shortcut is appended automatically.
+        self.settingsButton = wx.Button(panel, label=_("&Settings...") + keymap.hint("settings"))
+        # Translators: Toolbar button to remove the current removable tab. The current shortcut is appended automatically.
+        self.removeTabButton = wx.Button(panel, label=_("&Remove current tab") + keymap.hint("remove_tab"))
         # Translators: Toolbar button to close the NVSky window.
         self.closeButton = wx.Button(panel, label=_("&Close"))
         for button in (
@@ -311,15 +312,20 @@ class MainWindow(wx.Frame):
             )
             isListsContext = pageIdentity is not None and pageIdentity["kind"] == "permanent" and pageIdentity["key"] == "lists"
             self.findListsButton.Show(isListsContext)
+            newHint = keymap.hint("new_item")
             if isChatContext:
-                # Translators: Toolbar button relabeled while a Chat tab is active. Shows the Ctrl+N shortcut.
-                self.newPostButton.SetLabel(_("&New chat... (Ctrl+N)"))
+                # Translators: Toolbar button relabeled while a Chat tab is active. The current shortcut is appended.
+                self.newPostButton.SetLabel(_("&New chat...") + newHint)
             elif isListsContext:
-                # Translators: Toolbar button relabeled while a Lists tab is active. Shows the Ctrl+N shortcut.
-                self.newPostButton.SetLabel(_("&New list... (Ctrl+N)"))
+                # Translators: Toolbar button relabeled while a Lists tab is active. The current shortcut is appended.
+                self.newPostButton.SetLabel(_("&New list...") + newHint)
             else:
-                # Translators: Toolbar button to compose a new post. Shows the Ctrl+N shortcut.
-                self.newPostButton.SetLabel(_("&New post... (Ctrl+N)"))
+                # Translators: Toolbar button to compose a new post. The current shortcut is appended.
+                self.newPostButton.SetLabel(_("&New post...") + newHint)
+            # Refreshed here too so a changed keymap shows after the tabs are rebuilt.
+            self.checkUpdatesButton.SetLabel(_("Check for &updates") + keymap.hint("check_updates"))
+            self.settingsButton.SetLabel(_("&Settings...") + keymap.hint("settings"))
+            self.removeTabButton.SetLabel(_("&Remove current tab") + keymap.hint("remove_tab"))
             if not self._activationSuppressed:
                 onActivated = getattr(panel, "onTabActivated", None)
                 if callable(onActivated):
@@ -500,42 +506,47 @@ class MainWindow(wx.Frame):
     def onCharHook(self, evt):
         keyCode = evt.GetKeyCode()
 
-        # Escape/Alt+F4/Close close the whole window; Ctrl+W only removes the current (removable) tab.
-        if keyCode == wx.WXK_ESCAPE:
+        # close_window closes the whole window; remove_tab only removes the current (removable) tab.
+        if keymap.matches(evt, "close_window"):
             focused = self.FindFocus()
             if isinstance(focused, wx.TextCtrl) and focused.IsMultiLine() and focused.GetValue().strip():
                 return
             self.Close()
             return
-        if evt.ControlDown() and keyCode == ord("W"):
+        if keymap.matches(evt, "remove_tab"):
             self.removeCurrentTab()
             return
-        if evt.ControlDown() and keyCode == ord("P"):
+        if keymap.matches(evt, "settings"):
             self.onSettings()
             return
-        if evt.ControlDown() and keyCode == wx.WXK_F2:
+        if keymap.matches(evt, "rename_tab"):
             self.renameCurrentTab()
+            return
+        if keymap.matches(evt, "next_account") or keymap.matches(evt, "previous_account"):
+            from . import cycle_account
+            # After the key handler returns: the switch rebuilds this window's tabs.
+            wx.CallAfter(cycle_account, 1 if keymap.matches(evt, "next_account") else -1)
             return
         if evt.ControlDown() and ord("1") <= keyCode <= ord("9"):
             index = keyCode - ord("1")
             if index < self.notebook.GetPageCount():
                 self.notebook.SetSelection(index)
             return
-        if evt.ControlDown() and keyCode == wx.WXK_F5:
+        if keymap.matches(evt, "check_all"):
             self.checkAllOpenTabs()
             return
-        # F5/Ctrl+N fallbacks for when focus is outside a panel (panels handle
-        # them themselves). Shift+F5 is panel-only ("load older").
-        if keyCode == wx.WXK_F5 and not evt.ShiftDown():
+        # check_updates/new_item fallbacks for when focus is outside a panel (panels handle
+        # them themselves). load_older is panel-only.
+        if keymap.matches(evt, "check_updates"):
             self.onCheckForUpdates()
             return
-        if evt.ControlDown() and keyCode == ord("N"):
+        if keymap.matches(evt, "new_item"):
             self.onNewPost()
             return
-        if evt.ControlDown() and evt.ShiftDown() and keyCode == wx.WXK_PAGEUP:
+        if keymap.matches(evt, "move_tab_left"):
             self.moveCurrentTab(-1)
             return
-        if evt.ControlDown() and evt.ShiftDown() and keyCode == wx.WXK_PAGEDOWN:
+        if keymap.matches(evt, "move_tab_right"):
             self.moveCurrentTab(1)
             return
 

@@ -10,6 +10,7 @@ import functools
 import threading
 import time
 
+import api
 import controlTypes
 import queueHandler
 import speech
@@ -24,12 +25,17 @@ app_closing = False
 
 
 def start_worker(worker, progress=True):
-    """Runs worker in a daemon thread; the progress sound plays until it finishes."""
+    """Runs worker in a daemon thread; the progress sound plays until it finishes.
+    The thread works for the account that was current when it was started."""
+    from . import db
     from . import soundpack
+
+    accountId = db.current_account_id()
 
     def run():
         try:
-            worker()
+            with db.account_context(accountId):
+                worker()
         finally:
             if progress:
                 soundpack.stop_progress()
@@ -37,6 +43,28 @@ def start_worker(worker, progress=True):
     if progress:
         soundpack.start_progress()
     threading.Thread(target=run, daemon=True).start()
+
+
+def announce_after_menu(text, timeout=3.0):
+    """Speaks `text` once NVDA's focus has left the popup menu (its focus event would cut speech)."""
+    deadline = time.time() + timeout
+    menuRoles = (controlTypes.Role.POPUPMENU, controlTypes.Role.MENUITEM, controlTypes.Role.MENUBAR)
+
+    def speak():
+        speech.cancelSpeech()
+        nvdaUi.message(text, speechPriority=speech.priorities.Spri.NOW)
+
+    def poll():
+        try:
+            inMenu = api.getFocusObject().role in menuRoles
+        except Exception:
+            inMenu = False
+        if inMenu and time.time() < deadline:
+            wx.CallLater(100, poll)
+        else:
+            wx.CallLater(150, speak)  # the focus event of the control the menu returned to comes just after
+
+    wx.CallLater(100, poll)
 
 
 def copy_text_to_clipboard(text: str) -> bool:
@@ -224,15 +252,8 @@ def move_focus_and_check_announce(list_ctrl, index: int) -> bool:
     hadRealFocus = list_ctrl.HasFocus()
     previousIndex = list_ctrl.GetFocusedItem()
 
-    # Select() on a multi-select ListCtrl (postList has LC_SINGLE_SEL
-    # off for Ctrl+A/bulk actions) only ADDS index to the selection --
-    # it doesn't clear whatever was already selected. Confirmed by
-    # testing (see plan-09.md): without this, Alt+number left both the
-    # old and new row selected, so Post action's single-vs-multi-select
-    # detection wrongly showed the bulk "mark read/unread" menu, and
-    # User action reported "needs a single post selected." Same idiom
-    # already used in feedWindow.py's _jumpToUserPost for the identical
-    # problem on Left/Right jump -- just missing here until now.
+    # Select() on a multi-select ListCtrl only ADDS to the selection, so clear the others first;
+    # otherwise Post action/User action see a multi-selection after Alt+number or a jump.
     for j in range(list_ctrl.GetItemCount()):
         if j != index and list_ctrl.GetItemState(j, wx.LIST_STATE_SELECTED):
             list_ctrl.SetItemState(j, 0, wx.LIST_STATE_SELECTED)
@@ -262,6 +283,11 @@ def safe_ui_callback(func=None, *, check_app_closing=True):
         def wrapper(self, *args, **kwargs):
             if check_app_closing and app_closing:
                 return None
+            if isinstance(self, wx.Panel):
+                from . import db
+                account = getattr(self, "_account", None)
+                if account is not None and account.get("id") != db.current_account_id():
+                    return None  # a tab of another account (its window was rebuilt): the result is not for this screen
             try:
                 return f(self, *args, **kwargs)
             except RuntimeError as e:

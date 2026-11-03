@@ -83,12 +83,18 @@ class EmbedViewMixin:
                 # Translators: Disabled-looking menu item shown when a just-posted video hasn't finished processing on the server yet.
                 _("Video not ready yet (Check for updates first)"),
                 # Translators: Announced when trying to view a video embed that hasn't finished processing yet.
-                lambda: nvdaUi.message(_("This video was just posted -- press F5 to refresh, then try again.")),
+                lambda: nvdaUi.message(_("This video was just posted -- check for updates, then try again.")),
             )
             added = True
 
         linkUrl = embed.get("link_url")
-        if linkUrl:
+        if linkUrl and feedWindow._is_gif_url(linkUrl):
+            # Translators: Context menu item to open a post's animated GIF in a browser.
+            self._addMenuItem(menu, _("Open &GIF"), lambda: self._openWebLink(linkUrl))
+            # Translators: Context menu item to copy a post's animated GIF address.
+            self._addMenuItem(menu, _("Copy GIF &URL"), lambda: self._copyEmbedUrl(linkUrl, _("GIF URL")))
+            added = True
+        elif linkUrl:
             title = embed.get("link_title") or linkUrl
             # Translators: Context menu item to open a post's link preview in a browser. {} is the link's title or URL.
             self._addMenuItem(menu, _("Open &link: {}").format(title), lambda: self._openWebLink(linkUrl))

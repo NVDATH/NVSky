@@ -7,7 +7,6 @@ file; its helpers are only touched inside method bodies.
 """
 import datetime
 import json
-import threading
 
 import wx
 
@@ -71,6 +70,53 @@ class ItemActionMixin:
             return
         # Translators: Announced when Delete is pressed on a post that isn't the account's own.
         nvdaUi.message(_("You can only delete your own posts."))
+
+    _POST_SHORTCUTS = {
+        "post_reply": "_openReply", "post_quote": "_openQuote", "post_repost": "_toggleRepost",
+        "post_like": "_togglePostLike", "post_save": "_toggleBookmark", "post_copy_text": "_copyPostText",
+        "post_copy_link": "_copyPostLink", "post_view_thread": "_openThread", "post_view_quotes": "_openQuotes",
+        "post_share_to_chat": "_shareToChat", "post_mute_thread": "_muteThread", "post_hide": "_hidePost",
+        "post_report": "_reportPost", "post_pin": "_togglePinToProfile", "post_edit_replies": "_editReplyPermissions",
+    }
+
+    def runPostShortcut(self, actionId):
+        # Also called unbound by the thread/quotes tabs, so only list-control and handler lookups here.
+        if self.postList.GetSelectedItemCount() > 1:
+            if actionId in ("post_mark_read", "post_mark_unread"):
+                bulk = getattr(self, "_markSelectedNotificationsRead", None) or self._markSelectedRead
+                bulk(actionId == "post_mark_read")
+            else:
+                # Translators: Announced when a post shortcut is used with several posts selected.
+                nvdaUi.message(_("This action needs a single post selected."))
+            return
+        getPost = getattr(self, "_getActionablePost", None)
+        post = getPost() if getPost is not None else self._getFocusedPost()
+        if post is None:
+            if getPost is None:
+                # Translators: Announced when the post-action menu is invoked with no post focused.
+                nvdaUi.message(_("No post selected."))
+            return
+        if actionId in ("post_pin", "post_edit_replies"):
+            account = getattr(self, "_account", None)
+            if not account or post.get("author_did") != account.get("did"):
+                # Translators: Announced when a shortcut for a your-own-post action is used on someone else's post.
+                nvdaUi.message(_("This action only works on your own posts."))
+                return
+        name, args = ItemActionMixin._POST_SHORTCUTS.get(actionId), (post,)
+        if actionId == "post_view_likes":
+            name, args = "_openUserListForPost", ("likes", post)
+        elif actionId == "post_view_reposts":
+            name, args = "_openUserListForPost", ("reposts", post)
+        elif actionId == "post_mark_read":
+            name, args = "_setMarkRead", (post, True)
+        elif actionId == "post_mark_unread":
+            name, args = "_setMarkRead", (post, False)
+        handler = getattr(self, name, None) if name else None
+        if handler is None:
+            # Translators: Announced when a shortcut's action doesn't exist in the current tab.
+            nvdaUi.message(_("This action isn't available in this tab."))
+            return
+        handler(*args)
 
     def _showPostActionMenu(self, post):
         isOwnPost = self._account and post.get("author_did") == self._account.get("did")
@@ -212,7 +258,7 @@ class ItemActionMixin:
                 soundpack.play("unlike" if wasLiked else "like")
             wx.CallAfter(self._onLikeToggleDone, post, message, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _reloadOtherLikesTabs(self):
@@ -267,7 +313,7 @@ class ItemActionMixin:
                 soundpack.play("unsave" if wasBookmarked else "save")
             wx.CallAfter(self._onBookmarkToggleDone, post, message, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onBookmarkToggleDone(self, post, message, error):
@@ -344,7 +390,7 @@ class ItemActionMixin:
                 error = str(e)
             wx.CallAfter(self._onMuteThreadDone, post, wasMuted, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onMuteThreadDone(self, post, wasMuted, error):
@@ -429,7 +475,7 @@ class ItemActionMixin:
                 error = str(e)
             wx.CallAfter(self._onDeletePostDone, post, previousIndex, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onDeletePostDone(self, post, previousIndex, error):
@@ -495,7 +541,7 @@ class ItemActionMixin:
                 workerError = str(e)
             wx.CallAfter(self._onPinActionDone, workerError)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onPinActionDone(self, error):
@@ -532,7 +578,7 @@ class ItemActionMixin:
                 error = str(e)
             wx.CallAfter(self._onQuotesFetchedForOpen, post["uri"], quotes, error, originKey)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onQuotesFetchedForOpen(self, targetUri, quotes, error, originKey):
@@ -769,7 +815,7 @@ class ItemActionMixin:
                 error = str(e)
             wx.CallAfter(self._onThreadFetchedForOpen, posts, targetIndex, error, originKey)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onThreadFetchedForOpen(self, posts, targetIndex, error, originKey):
@@ -834,7 +880,7 @@ class ItemActionMixin:
                 error = str(e)
             wx.CallAfter(self._onRepostDone, post, wasReposted, previousUri, newUri, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onRepostDone(self, post, wasReposted, previousUri, newUri, error):
@@ -884,7 +930,7 @@ class ItemActionMixin:
             # Translators: Announced after successfully sending a post report.
             wx.CallAfter(self._onActionDone, _("Report sent.") if not error else None, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     def _markSelectedRead(self, read: bool):
         posts = self._getSelectedPosts()

@@ -13,6 +13,7 @@ What you can do with NVSky:
 - Manage your lists, follows, mutes, blocks, and muted words.
 - Use several Bluesky accounts and switch between them at any time.
 - Hear sounds for actions and events, using sound packs you can customize.
+- Have a list read to you row by row, hands-free, with auto read.
 
 NVSky stores your posts, notifications, chat messages, and lists in an encrypted database on your computer. Your tabs open instantly. NVSky only contacts the network when you ask for updates, or when a scheduled background check is due.
 
@@ -31,10 +32,12 @@ NVSky does not have its own image viewer, video player, or web view. Images and 
 - [Writing a post](#writing-a-post)
 - [The tabs](#the-tabs): Home, Notifications, Explore, Saved, Likes, Chat, Lists, People
 - [Tabs that open on demand](#tabs-that-open-on-demand)
+- [Using more than one account](#using-more-than-one-account)
 - [Real-time updates (Jetstream)](#real-time-updates-jetstream)
 - [Settings](#settings)
 - [Notification area icon](#notification-area-icon)
 - [Reading unread counts](#reading-unread-counts)
+- [Auto read](#auto-read)
 - [Sound packs](#sound-packs)
 - [Privacy and security](#privacy-and-security)
 - [Known issues](#known-issues)
@@ -56,10 +59,11 @@ If that shortcut conflicts with something else on your system, you can change it
 2. Find the **NVSky** category.
 3. Choose **Open the NVSky main window** and assign the shortcut you want.
 
-The NVSky category has two more commands. Neither has a shortcut until you assign one yourself, the same way as above:
+The NVSky category has three more commands. None of them has a shortcut until you assign one yourself, the same way as above:
 
 - **Open a quick new post window** opens the compose window directly, without opening the main window first.
 - **Read the unread count of every open NVSky tab** speaks your unread counts. See [Reading unread counts](#reading-unread-counts).
+- **Start or stop auto read** reads the current list tab to you row by row. See [Auto read](#auto-read).
 
 You can also open NVSky's settings from the NVDA menu: Preferences, then **NVSky Settings...**
 
@@ -77,6 +81,8 @@ To log in:
 If what you typed doesn't look like an App Password, NVSky warns you once and lets you continue if you press Log in again.
 
 You can add more accounts, switch between them, or remove them in **Settings > Accounts**.
+
+The first time you log in, while no main window is open yet, NVSky does one full check of every tab so that they are filled in, and says "Sync complete." when it is done.
 
 ## The main window
 
@@ -103,11 +109,24 @@ When you switch tabs, NVDA speaks the tab's name, and focus moves to the main co
 - **Ctrl+P** opens Settings.
 - **Escape** closes the NVSky window. While you have text typed into a multi-line box (for example a half-written chat message), Escape does nothing, so you can't lose your text by accident.
 
+Most of these shortcuts can be changed, and many actions that have no shortcut yet can be given one, in [Settings > Keymap](#keymap).
+
 NVSky also remembers which tab you were on when you closed it, and opens on that tab next time.
 
 ## How post lists work
 
 Home, Saved, Likes, Lists (curation lists), Notifications, and every tab that shows posts (threads, user timelines, feed previews, saved searches) behave the same way.
+
+### What a row shows
+
+Every row has the same columns, and NVDA reads them in order:
+
+- **Embed:** what is attached to the post, for example "Image" (or "Image (2)", followed by the alt text if there is any), "Video", "Link", "Quote post", "Quote + image", "Quote + video", "Quote + link", or "Animated GIF". A post hidden behind a content warning shows "Warning".
+- **Author:** who wrote the post. For a repost it is the person who reposted it, because that is why the post is in your list. The original author is named at the start of the message.
+- **Message:** the text of the post. A reply starts with "Reply to @name:", a repost with "Reposted @name:", and a quote adds "Quote from @name:" and the quoted text after the post's own text. Web addresses are shown in full, even where Bluesky's own apps shorten them. A post hidden behind a content warning shows "(Content warning: ...)" with the category names instead of its text.
+- **Posted:** when it was posted, in the format you chose in Settings > Display. Relative times such as "5 minutes ago" update by themselves.
+
+Notifications use the columns Author, Notification, and Received. Chat messages use Reactions, From, Message, Message (more), and Sent.
 
 ### Moving around
 
@@ -126,7 +145,7 @@ Home, Saved, Likes, Lists (curation lists), Notifications, and every tab that sh
 
 ### Copying and searching
 
-- **Ctrl+C** copies the focused row. The copy contains the full text of the post (not only what fits on screen) and a link back to the post.
+- **Ctrl+C** copies the focused row. The copy contains the full text of the post (not only what fits on screen) and a link back to the post. In user lists, and in the trees of the Chat and Lists tabs, it copies the text of the focused row.
 - NVSky has no search box inside each list, because NVDA can already search a list for you. Press **NVDA+Ctrl+F** to search, then **NVDA+F3** and **NVDA+Shift+F3** for the next and previous match. The Explore tab is different: it searches Bluesky itself.
 
 ### Other post list keys
@@ -157,7 +176,7 @@ Press **Alt+A** on a post to open a menu of everything you can do with it. The s
 - **Save** or **Unsave**. Saved posts appear in the Saved tab.
 - **Copy...** copies the post text, or a link to the post.
 - **View...** opens the thread, the list of people who liked the post, the people who reposted it, or the posts that quote it. Each opens in its own tab.
-- **Embed...** appears when the post has an image, video, or link. You can open an image, copy it to the clipboard, send it to Be My Eyes, open a video, copy a video address, open a link, or copy a link address.
+- **Embed...** appears when the post has an image, video, animated GIF, or link. You can open an image, copy it to the clipboard, send it to Be My Eyes, open a video, copy a video address, open a link, or copy a link address. For an animated GIF you can open it in your browser or copy its address.
 - **More...** has Share to chat, Mute or Unmute thread, Hide post for me, and Report post.
 
 If you select several posts (with Ctrl+A or by selecting rows), the menu only offers marking them as read or unread.
@@ -181,12 +200,13 @@ Press **Alt+U** on a post to act on the people connected to it. If more than one
 Press **Ctrl+N** (or use the quick new post command) to open the compose window. Replying and quoting open the same window with the original post shown above your text.
 
 - Type your post in the text box. A counter shows how much of Bluesky's 300-character limit you have used. Thai and other combined characters are counted the way Bluesky counts them.
-- **Attach media...** lets you add up to four images, or one video. You can't mix images and a video in the same post.
+- **Attach media...** lets you add up to four images (JPG, PNG, GIF, or WebP), or one video (MP4, MPEG, MOV, or WebM). You can't mix images and a video in the same post. Bluesky only shows the first frame of a GIF, and NVSky tells you so when you attach one.
 - For each image, NVSky asks you for alt text (a description for people who can't see the image). It is optional, but strongly recommended. If an image is larger than Bluesky's 1 MB limit, NVSky offers to shrink it for you.
-- For a video, NVSky shows its progress while it uploads and while Bluesky processes it. You hear rising beeps as it moves through the steps. You can cancel at any time.
-- If your text contains a web address, NVSky offers to attach a link preview card. If there is more than one address, press **Choose link...** to pick which one gets the card.
+- For a video, NVSky first checks its format and, where it can, its size and length against Bluesky's current limits (at the moment 300 MB and 10 minutes), and asks Bluesky whether you have reached today's upload limit. Bluesky has the final say, and its limits have changed before. Then NVSky shows its progress while the video uploads and Bluesky processes it. You hear rising beeps as it moves through the steps. You can cancel at any time. When it is done, NVSky asks you for alt text for the video too.
+- If your text contains a web address, NVSky offers to attach a link preview card. If there is more than one address, press **Choose link...** to pick which one gets the card. No link preview is offered when the post has images or a video, or when it quotes another post.
+- Web addresses in your text become real links, and an @handle that belongs to a real account becomes a mention of that account. Text that looks like a handle but isn't one stays plain text.
 - **Content labels** lets you label your own post as Pornography, Sexually suggestive, Nudity, or Graphic media.
-- **Ctrl+Enter** sends the post.
+- **Ctrl+Enter** sends the post. Once it is sent, your post appears in Home at once, and its counts and media links are filled in at the next check.
 - **Ctrl+W** or the **Cancel** button closes the window without posting.
 - **Escape** does nothing in this window, on purpose, so you can't lose a half-written post by accident.
 
@@ -208,7 +228,7 @@ Home supports all the [post list](#how-post-lists-work) keys, including Space, L
 
 ### Notifications
 
-Shows likes, reposts, follows, replies, mentions, quotes, and new posts from accounts you subscribed to.
+Shows likes, reposts, follows, replies, mentions, quotes, and new posts from accounts you subscribed to. It also shows when someone likes or reposts a post that is your own repost, when someone joins through your starter pack, and when your account is verified or loses its verification.
 
 Each row shows who did it, what happened, the text of the related post if there is one, and when.
 
@@ -302,6 +322,12 @@ The Chat tab shows your conversations in a tree on the left, the messages of the
 
 Press the Menu key or right-click on a message to get: **Reply**, **React...** (pick an emoji; reacting again with your own emoji offers to remove it), **Copy text**, **Show message...**, and **Delete for me** (this removes the message only for you).
 
+### Writing messages
+
+Type in the **Message** box and press Ctrl+Enter or the **Send** button. **Emoji...** opens a list of common emoji to insert. Choose "Custom..." in it to type or paste any other emoji. A counter shows the length of your message against 1000 characters. That limit is an estimate, because Bluesky doesn't publish one. NVSky refuses a longer message and plays the warning sound.
+
+To reply to a message, choose **Reply** in its menu. The compose box then shows "Replying to:" with the start of that message, and **Cancel reply** drops the reply. A message you send appears in the list at once and is confirmed a moment later.
+
 ### Conversation menu
 
 Press the Menu key or right-click on a conversation in the tree for:
@@ -314,6 +340,17 @@ Press the Menu key or right-click on a conversation in the tree for:
 For group chats, the menu also has **Manage members...**. If you are the owner of the group, it also has **Lock this group** or **Unlock this group**, **Edit name...**, **Join requests...**, and **Invite link...**.
 
 A group's owner can't leave until the group is locked. NVSky tells you this if you try.
+
+### Group chats
+
+Group chats are marked experimental, see [Known issues](#known-issues). In the conversation tree a group shows tags such as "(group)" and "(locked)". An owner also sees how many join requests are waiting, for example "1 join request". A group without a name is shown with the names of its members.
+
+- **Manage members...** shows the current members as a checklist. Check people and press **Remove checked** to remove them, after you confirm. To add people, type a handle or name in the search box, check the results you want, and press **Add checked**. The change shows at once and is undone if Bluesky refuses it.
+- **Edit name...** renames the group. This is for the owner.
+- **Lock this group** stops everyone from sending messages. In a locked group the message box is replaced by a note saying so, and **Unlock this group** reverses it. An owner has to lock a group before leaving it.
+- **Join requests...** lists the people who asked to join, with **Approve** and **Reject** buttons. This is for the owner.
+- **Invite link...** is for the owner. In its dialog you choose who can join (anyone, or only people you follow, each either joining instantly or having to ask) and press **Save**. NVSky then shows the invite code, which is a piece of text and not a web address, with **Copy**, **Edit permissions...**, and **Disable link** or **Enable link**. Bluesky doesn't let NVSky check whether a link already exists, so Save either creates a link or updates the existing one.
+- To join a group, press **Join group...** in the new chat window and paste an invite link or code. After a short pause NVSky shows the group's name, its owner, how many members it has, and whether joining needs the owner's approval. Press **Join**. If approval is needed, the request is sent and a **Withdraw request** button appears so you can take it back.
 
 ### Message requests
 
@@ -340,7 +377,7 @@ There are two kinds of list:
 
 Press the Menu key or right-click on a list for:
 
-- **Remove list**, for lists you created.
+- **Remove list**, for lists you created. Pressing **Delete** on a list does the same. Either way NVSky asks you to confirm.
 - **Show in new tab**, for curation lists.
 - **Manage members...** lets you add or remove members. You can only change lists you created, and for other people's lists the members are read-only.
 - **Mute list** or **Unmute list**, and **Block list** or **Unblock list**, for moderation lists.
@@ -361,11 +398,27 @@ The kinds of tab that can open on demand are:
 - **Thread**, from Post action > View > Thread, or from Enter. It shows the whole conversation from the first post down to the replies, with replies marked by ">" signs to show how deep they are. Press F5 to reload the thread. Its Post action menu is shorter: Like, Copy, and Embed.
 - **Quotes**, from Post action > View > Quotes. It lists the posts that quote a post. If the quoted post is yours, you can also choose **Detach my post from this quote...**, which removes that quote from your post's quote list without touching the other person's post.
 - **Likes** and **Reposts** of a post, from Post action > View. These are lists of people.
-- **Timeline**, **Followers**, **Following**, and **Known followers** of a person, from User action > View.
+- **Timeline**, **Followers**, **Following**, and **Known followers** of a person, from User action > View. A person's timeline shows their pinned post first, marked "Pinned:".
 - **Feed preview** and **Search** tabs, from Explore. A feed preview has an **Add to my feeds** button.
 - **A list**, from Lists > Show in new tab.
 - **A conversation**, from Chat > Open in new tab.
 - **People search**, from Explore, with the People result type.
+
+## Using more than one account
+
+You can log in with several Bluesky accounts in Settings > Accounts and switch between them whenever you like. One account is active at a time, and the tabs, the notification area icon, and the commands all work on it.
+
+Each account is kept apart: it has its own saved data in its own encrypted database file, and nearly all of NVSky's settings belong to it too (General, Display, Feed manager, Sound, and so on). Your keyboard shortcuts are shared by all accounts.
+
+To switch the active account you can:
+
+- Choose **Set as active** in Settings > Accounts.
+- Choose the account in the menu of the notification area icon. This menu lists accounts only when you have more than one.
+- Use the **Switch to the next account** and **Switch to the previous account** actions. They have no shortcut until you assign one in [Settings > Keymap](#keymap), and they work while the main window has focus. With only one account, NVSky tells you so.
+
+After a switch NVSky says which account is now active. The tabs of an open main window are rebuilt for the new account, auto read stops, and real-time updates restart for the new account.
+
+Background checks cover every account that has **Check this account in the background** turned on, one account at a time. When something new is found for an account that is not active, the announcement starts with that account's handle, for example "@name: New post in: Home". Real-time updates, the notification area icon's counts, and the command that reads your unread counts only cover the active account.
 
 ## Real-time updates (Jetstream)
 
@@ -399,12 +452,15 @@ Lists your logged-in accounts, and marks the active one. You can:
 - **Add account...** to log in with another Bluesky account.
 - **Set as active** to switch to the selected account.
 - **Remove account** to remove the selected account. This also deletes its saved data and its stored App Password from your computer, and can't be undone.
+- **Check this account in the background** decides whether the scheduled background checks include the selected account. It is on by default. An account with checks turned off is marked in the list.
 
-These actions take effect immediately and don't wait for OK. Switching accounts rebuilds the tabs in an open main window. Any unsaved changes in Settings that belong to the previous account are thrown away, and NVSky tells you so.
+These actions take effect immediately and don't wait for OK. Before you add or switch to another account, NVSky first saves the Settings changes you made for the account you are leaving. If that save fails, NVSky tells you and stays on the current account. If you remove an account, unsaved changes that belonged to it are thrown away, and NVSky tells you so. Switching accounts rebuilds the tabs in an open main window. See [Using more than one account](#using-more-than-one-account).
 
 ### General
 
 - **Enter key action on a post:** what pressing Enter does on a post. Choices are View thread (the default), Reply, Quote post, Repost / Undo repost, Like / Unlike, and Toggle read/unread.
+- **Auto read delay between rows (seconds, 1 to 10):** how long auto read waits after finishing one row before it reads the next. See [Auto read](#auto-read).
+- **Auto read voice profile:** one of your NVDA configuration profiles, or "(None, keep the current voice)". Auto read speaks each row with that profile's voice settings. See [Auto read](#auto-read).
 - **Speak when background sync finds new content in:** a checklist of categories. For each one you check, NVSky speaks a short announcement when a background check finds something new. All are checked by default. A sound still plays if the sound is enabled for it.
 - **Background sync intervals:** how often, in minutes, each category is checked while you aren't looking at it. Setting it to 0 turns that category off. The categories are Home, Notifications, Saved / Likes, Chat, Lists, Search / feed previews, Profile / people & post lists, and Thread. Saved / Likes is off by default.
 - **Enable real-time Home feed updates (Jetstream):** see [Real-time updates](#real-time-updates-jetstream). The Home and Lists scheduled checks keep running as a backup.
@@ -433,6 +489,20 @@ Manages the custom feeds you have added. Each row shows the feed name, its creat
 
 See [Sound packs](#sound-packs) for how to add your own packs.
 
+### Keymap
+
+Lists the keyboard shortcuts of NVSky's own windows, so you can see every key and change them. Each row shows the action, its shortcut, and where it works: the main window, tabs with lists, Chat, the new post window, the Settings window, or one of three groups of actions that have no shortcut until you give them one (Post actions, User actions, and Chat message actions). A shortcut is shown as "(fixed)" if it is built in and can't be changed, "(changed)" if it differs from its default, and "Not assigned" if the action has none.
+
+- **Change...** (or Enter on a row) asks you to press the new shortcut. Press Escape to cancel.
+- **Remove shortcut** leaves the action without a shortcut.
+- **Reset** puts the selected action back to its default. **Reset all** does the same for every action, after asking you to confirm.
+
+NVSky does not accept Tab, Shift+Tab, Up, or Down, which are for moving around. If another action that works in the same place already uses the key, NVSky tells you which one and does not accept it. It also warns you, but still accepts the key, when a letter, digit, or symbol on its own would stop NVDA's type-to-search in lists, or when Alt with a letter may clash with a button's access key.
+
+Giving a shortcut to a Post action, User action, or Chat message action runs it straight on the focused post, user, or message, without opening the menu. A few of them only work on your own posts. The two account switching actions also have no default; see [Using more than one account](#using-more-than-one-account). Auto read is not in this list; assign its shortcut in NVDA's Input gestures dialog.
+
+Changes are saved when you press OK or Apply. The shortcuts shown on buttons update when you close Settings.
+
 ### Profile
 
 Edit your Bluesky profile: **Display name**, **Bio**, and the buttons **Change avatar...** and **Change banner...**. The profile loads the first time you open this tab. A new avatar or banner is only uploaded when you press OK or Apply.
@@ -443,7 +513,7 @@ Add or remove muted words and tags. Press **Add** and type a word, or select one
 
 ## Notification area icon
 
-NVSky can show an icon in the Windows notification area (the system tray). Its tooltip is your unread count. Press Enter or click on the icon to open NVSky. Its menu has **Open NVSky** and **NVSky Settings...**.
+NVSky can show an icon in the Windows notification area (the system tray). Its tooltip is your unread count. Press Enter or click on the icon to open NVSky. Its menu has **Open NVSky** and **NVSky Settings...**. If you have more than one account, the menu also lists them, each with its unread count when it has any, and choosing one makes it the active account.
 
 ### Turning it on and choosing what it shows
 
@@ -482,6 +552,22 @@ Besides the notification area icon, you can ask NVSky for your unread counts at 
 
 The command speaks the unread count of every tab you have open that has one, leaving out tabs with nothing unread, for example "NVSky unread: Home 3, Notifications 2, Chat 1". If nothing is unread, it says "NVSky: no unread". If the main window is closed, it reads Home, Notifications, and Chat only (and only the ones you have turned on).
 
+## Auto read
+
+Auto read reads a list tab to you, one row after another, without you pressing anything between rows. It does what pressing Space does (jump to the next unread item, oldest unread first, whatever your sort order), and then does it again and again.
+
+To use it, assign a shortcut to **Start or stop auto read** in NVDA's Input gestures dialog, in the NVSky category. It has no default shortcut. Press it once to start and again to stop.
+
+- Each row is read in full, whatever fits on screen. When the speech has finished, auto read waits for the delay you set in Settings > General (1 to 10 seconds) and moves on. Each row is marked as read as it is reached.
+- With the main window open, it reads the current tab and moves the focus to each row as it goes. With the main window closed, it reads the tab you last used from NVSky's saved data, and the tab opens on the row you stopped at next time. This works for Home, Notifications, Saved, Likes, and list, user timeline, and search or feed preview tabs. If your last tab was another kind, NVSky tells you it can't read it.
+- It is not available on the Chat and People tabs, on Explore results other than Posts, on moderation lists, or on thread and quotes tabs. NVSky says so if you try.
+- Saved, Likes, and Explore posts have no unread tracking. There auto read reads the rows in order, starting after the row you are on.
+- The sounds for posts with an image, video, link, quote, or content warning play as each row is reached. Posts with a content warning are read as the warning, not their text.
+- If you choose a voice profile in Settings > General, each row is read with that profile's voice settings, and NVDA returns to your normal voice afterwards. If the profile was deleted, or is already active, auto read just uses the current voice.
+- Spoken announcements of background checks are held back while auto read is running.
+
+Auto read stops by itself when there is nothing more to read. It also stops as soon as you press something that makes NVDA speak, or silence speech, so you can take over at any moment. If your speech synthesizer never reports that it finished a row, auto read stops after a while and tells you.
+
 ## Sound packs
 
 Sound packs live in NVSky's own `SoundPack` folder, with one subfolder for each pack. To make your own pack:
@@ -490,6 +576,16 @@ Sound packs live in NVSky's own `SoundPack` folder, with one subfolder for each 
 2. Put `.wav` files in it, named after the events, for example `like.wav`, `error.wav`, or `new_message.wav`.
 3. Open Settings > Sound and choose your pack.
 
+The file names, all ending in `.wav`, are:
+
+- Post and chat actions: `like`, `unlike`, `repost`, `unrepost`, `save`, `unsave`, `send_post`, `delete`, `follow`, `unfollow`, `block_mute` (for mute, block, subscribe, and report), and `send_message`.
+- Things that arrive: `new_message` and `notification`.
+- The window and its tabs: `main_open`, `main_close`, `open_tab`, and `close_tab`.
+- Feedback: `boundary` (the end of a list), `error`, `ready` (a check or load finished), and `max_length` (text over the length limit).
+- A row gets the focus: `embed_image`, `embed_video`, `embed_gif`, `embed_link`, `embed_quote`, and `content_warning`.
+- Auto read: `autoread_start` and `autoread_stop`.
+- `progress`, the looped sound described below.
+
 A pack doesn't need every file. Events without a file are silent. A file named `progress.wav` is played in a loop while NVSky is waiting for something; without it, NVSky plays a soft repeating beep instead. Choose "Silent / No sound" in Settings > Sound to turn everything off.
 
 ## Privacy and security
@@ -497,7 +593,7 @@ A pack doesn't need every file. Events without a file are silent. A file named `
 NVSky takes care to keep your Bluesky data away from other people who can use your computer.
 
 - Your **App Password** is encrypted with Windows' DPAPI before it is saved.
-- Your **whole local database** is encrypted using [SQLCipher](https://www.zetetic.net/sqlcipher/). That includes every saved post, notification, chat message, and list, for every account you have logged in. This is not limited to sensitive fields. The key that protects the database is itself protected with DPAPI.
+- Your **whole local database** is encrypted using [SQLCipher](https://www.zetetic.net/sqlcipher/). That includes every saved post, notification, chat message, and list. Each account you have logged in has its own database file, and all of them are protected the same way. This is not limited to sensitive fields. The key that protects the database is itself protected with DPAPI.
 
 DPAPI ties this protection to **one Windows user account on one computer**. That is a deliberate choice for security, but it has consequences:
 
@@ -511,14 +607,13 @@ If you use NVSky on more than one computer, log in separately on each. This is e
 
 - The conversation list doesn't go past the first 50 conversations, so accounts with more than 50 won't see the rest in the Chat tab.
 - Temporary files from opening images and videos are only cleaned up when NVDA starts, so they can stay in your Temp folder for up to about 24 hours.
-- Switching the active account while the Settings dialog is open, and very large amounts of notifications or chat, have not been fully tested.
+- Using more than one account has only been tried with one real account. Switching between two accounts, and background checks of several accounts, have not been tested with real accounts. Switching the active account while the Settings dialog is open, and very large amounts of notifications or chat, have not been fully tested.
 - Several Bluesky features used for group chats and invite links are marked inside NVSky as experimental, because not every case has been tried against a real server. If you get an error in one of these areas, please report it with as much detail as you can.
-- These have not been tested with a real account and may misbehave: blocking or unblocking a whole moderation list, the "isn't accepting messages from you" check when starting a chat, hiding the Chat tab for accounts without direct messages, and **Mark all read** on accounts with a very large number of conversations.
+- These have not been tested with a real account and may misbehave: uploading a new avatar or banner in Settings > Profile, blocking or unblocking a whole moderation list, the "isn't accepting messages from you" check when starting a chat, hiding the Chat tab for accounts without direct messages, and **Mark all read** on accounts with a very large number of conversations.
 - If Bluesky limits how fast your account can make requests, NVSky tells you roughly how long to wait instead of showing a raw error. Background checks resume by themselves afterwards.
 - Occasionally, while you read through a feed, the status bar may show the wrong text instead of the unread count. Switching to another tab and back fixes it.
 - NVSky has only been tested with a small number of accounts. Setting up a brand new account, and accounts with a very large number of followers, lists, or conversations, have not been verified.
 - Real-time updates (Jetstream) are not available when you follow, and list, roughly 250 accounts or more. See [Real-time updates](#real-time-updates-jetstream).
-- If you use more than one account, a post that two of your accounts have both seen shares some saved state, such as whether you liked or reposted it. After you switch accounts, press F5 so NVSky refreshes it. Until then, Like, Repost, or Save on such a post may report an error.
 - Because the notification area icon is removed and added again when its count changes, NVDA's focus may jump to another icon if you are on the NVSky icon at that moment. NVSky tries to bring focus back, but you may need to move back yourself. See [Notification area icon](#notification-area-icon).
 
 ## Additional information

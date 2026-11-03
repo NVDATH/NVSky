@@ -25,7 +25,7 @@ CONFIDENCE. An account that never opened Chat in the official app may
 not have DMs enabled server-side yet (see client.get_chat_client).
 """
 import json
-import threading
+
 import traceback
 
 import wx
@@ -41,8 +41,9 @@ from .feedWindow import RemovableTabMixin
 from . import timeutils
 from . import uiutil
 from . import soundpack
+from . import keymap
 
-# LOW CONFIDENCE: the DM length limit isn't documented; 1000 is a best guess.
+# The DM length limit isn't documented; 1000 is an estimate.
 CHAT_MESSAGE_MAX_LENGTH = 1000
 
 # Characters in the "Message" column before spilling into "Message (more)".
@@ -177,12 +178,7 @@ def _pick_emoji(parent, title):
 
 
 def _show_message_dialog(parent, title, text):
-    # Read-only, freely-scrollable full text -- same idea as the
-    # Column Review add-on's cell-inspection dialog (which the user
-    # used to independently confirm the ~511-char cutoff is native to
-    # the ListCtrl itself, not specific to LC_VIRTUAL -- see
-    # plan-09.md). Exists specifically to bypass the ListCtrl's own
-    # text storage/retrieval entirely.
+    # Read-only, scrollable full text: bypasses the ListCtrl's cell limit of about 511 characters.
     dlg = wx.Dialog(parent, title=title, size=(500, 350))
     sizer = wx.BoxSizer(wx.VERTICAL)
     textCtrl = wx.TextCtrl(dlg, value=text, style=wx.TE_MULTILINE | wx.TE_READONLY)
@@ -318,7 +314,7 @@ class _ChatMessagePanelMixin:
             except Exception as e:
                 log.error(f"NVSky: background mark-message-read failed: {e}")
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     def _announceNthNewestMessage(self, n: int):
         # _currentMessages follows the on-screen sort order, so the index
@@ -496,7 +492,7 @@ class _ChatMessagePanelMixin:
                 error = str(e)
             wx.CallAfter(self._onDeleteMessageDone, convoId, message, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onDeleteMessageDone(self, convoId, message, error):
@@ -568,7 +564,7 @@ class _ChatMessagePanelMixin:
                     error = str(e)
                 wx.CallAfter(self._onReactionDone, convoId, message, existingReactions, error)
 
-            threading.Thread(target=worker, daemon=True).start()
+            uiutil.start_worker(worker, progress=False)
             return
 
         # Translators: Title of the emoji picker when reacting to a message.
@@ -592,7 +588,7 @@ class _ChatMessagePanelMixin:
                     error = str(e)
                 wx.CallAfter(self._onReactionDone, convoId, message, existingReactions, error)
 
-            threading.Thread(target=worker, daemon=True).start()
+            uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onReactionDone(self, convoId, message, previousReactions, error):
@@ -635,6 +631,10 @@ class _ChatMessagePanelMixin:
         if index >= len(messages):
             return
         message = messages[index]
+        if not message.get("message_id"):
+            # Translators: Announced when trying to reply, react, or delete a message that hasn't finished sending yet.
+            nvdaUi.message(_("This message hasn't finished sending yet."))
+            return
 
         menu = wx.Menu()
         # Translators: Context menu item to reply to a chat message.
@@ -706,7 +706,9 @@ class _ChatMessagePanelMixin:
         if not hasattr(self, "_currentMessages"):
             self._currentMessages = []
         # is_read=1: my own message (the resynced row gets it via reconcile too).
-        tempMessage = {"sender_did": self._account["did"], "text": text, "sent_at": None, "is_read": 1}
+        tempMessage = {
+            "message_id": None, "sender_did": self._account["did"], "text": text, "sent_at": None, "is_read": 1,
+        }
         self._currentMessages.insert(0, tempMessage) if newestFirst else self._currentMessages.append(tempMessage)
         soundpack.play("send_message")
         # Delayed so the confirmation doesn't land on the same instant as the keypress.
@@ -739,7 +741,7 @@ class _ChatMessagePanelMixin:
 
             wx.CallAfter(self._onSendComplete, convoId, None)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onSendComplete(self, convoId, error):
@@ -770,7 +772,7 @@ class _ChatMessagePanelMixin:
                 error = str(e)
             wx.CallAfter(self._onCheckAllConvosDone, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onCheckAllConvosDone(self, error):
@@ -781,13 +783,8 @@ class _ChatMessagePanelMixin:
             # Translators: Announced when checking every conversation for updates fails. {} is the error message.
             nvdaUi.message(_("Could not check all chats for updates: {}").format(error))
             return
-        # _reloadMessagesIfCurrent alone only re-renders the currently
-        # open conversation's messages -- confirmed via testing that
-        # this left ChatWindow's conversation tree (unread counts, new
-        # conversations, reordering) stale even though sync_convos had
-        # already written fresh data to the DB. _reloadConvoListIfAny
-        # is a no-op in this mixin -- ChatWindow overrides it to call
-        # _loadFromCache(); ConvoTabWindow has no such list to refresh.
+        # Re-render the open conversation, then the conversation list (ChatWindow overrides
+        # _reloadConvoListIfAny; ConvoTabWindow has no list).
         self._reloadMessagesIfCurrent(self._currentConvoId)
         self._reloadConvoListIfAny()
         # Translators: Announced after checking every conversation for updates.
@@ -813,43 +810,71 @@ class _ChatMessagePanelMixin:
         elif keyCode == wx.WXK_DOWN and index == len(messages) - 1:
             soundpack.play("boundary")
 
+    def runMessageShortcut(self, actionId):
+        index = _focused_list_index(self.messageList)
+        messages = getattr(self, "_currentMessages", [])
+        convoId = self._currentConvoId
+        if index == -1 or index >= len(messages) or not convoId:
+            # Translators: Announced when opening the message context menu with no message focused.
+            nvdaUi.message(_("No message selected."))
+            return
+        message = messages[index]
+        if not message.get("message_id"):
+            # Translators: Announced when trying to reply, react, or delete a message that hasn't finished sending yet.
+            nvdaUi.message(_("This message hasn't finished sending yet."))
+            return
+        if actionId == "message_reply":
+            self._startReply(message)
+        elif actionId == "message_react":
+            self._reactToMessage(convoId, message)
+        elif actionId == "message_copy":
+            self._copyMessageText(message)
+        elif actionId == "message_show":
+            self._showFullMessage(message)
+        elif actionId == "message_delete":
+            self._deleteMessageForSelf(message)
+
     def onCharHook(self, evt):
         keyCode = evt.GetKeyCode()
-        if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers() and self.FindFocus() is self.messageList:
+        inList = self.FindFocus() is self.messageList
+        if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers() and inList:
             self._checkMessageListBoundaryBeforeKey(keyCode)
-        if keyCode == wx.WXK_F5 and evt.ControlDown():
-            # Let this bubble up to MainWindow's own Ctrl+F5 handler
-            # (checkAllOpenTabs -- updates every open tab in the addon,
-            # not just Chat's conversations).
+        if keymap.matches(evt, "check_all"):
+            # Let this bubble up to MainWindow's checkAllOpenTabs (every open tab, not just Chat).
             evt.Skip()
             return
-        if keyCode == wx.WXK_F5 and evt.ShiftDown():
+        if keymap.matches(evt, "chat_check_all"):
             self.onCheckAllConvos()
             return
-        if keyCode == wx.WXK_F5:
+        if keymap.matches(evt, "check_updates"):
             self.onRefreshSelectedConvo()
             return
-        if keyCode == wx.WXK_RETURN and evt.ControlDown():
+        if keymap.matches(evt, "send"):
             self.onSend(None)
             return
-        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown() and self.FindFocus() is self.messageList:
+        if keymap.matches(evt, "copy_row") and inList:
             self._copyFocusedMessageRow()
             return
-        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown() and self.FindFocus() is self.messageList:
+        if keymap.matches(evt, "jump_row") and inList:
             uiutil.jump_to_row(self, self.messageList, row_text=self._messageRowText)
             return
         if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
             self._announceNthNewestMessage(keyCode - ord("0"))
             return
-        if keyCode == wx.WXK_LEFT and not evt.HasAnyModifiers() and self.FindFocus() is self.messageList:
+        if keymap.matches(evt, "jump_to_replied") and inList:
             self._jumpToRepliedMessage()
             return
-        if keyCode == wx.WXK_RIGHT and not evt.HasAnyModifiers() and self.FindFocus() is self.messageList:
+        if keymap.matches(evt, "jump_to_reply") and inList:
             self._jumpBackToReply()
             return
-        if keyCode == wx.WXK_SPACE and self.FindFocus() is self.messageList:
+        if keymap.matches(evt, "next_unread_message") and inList:
             self._focusNextUnreadMessage()
             return
+        if inList:
+            actionId = keymap.match_group(evt, "message")
+            if actionId:
+                self.runMessageShortcut(actionId)
+                return
         evt.Skip()
 
 def _extract_join_code(text: str) -> str:
@@ -864,7 +889,7 @@ def _extract_join_code(text: str) -> str:
 
 
 class JoinGroupDialog(wx.Dialog):
-    """LOW CONFIDENCE end to end -- see client.request_join_group's docstring."""
+    """Join a group from an invite link or code, with a preview of the group."""
 
     PREVIEW_DEBOUNCE_MS = 800
 
@@ -1093,22 +1118,11 @@ class JoinGroupDialog(wx.Dialog):
 
 class NewChatDialog(wx.Dialog):
     """
-    Start a new 1:1 conversation, or -- if more than one recipient
-    ends up added -- a new GROUP chat, decided automatically from how
-    many recipients are queued when "Start chat" is pressed. Same
-    search+checklist pattern as ManageGroupMembersDialog (and
-    feedWindow.py's ManageMembersDialog for Lists) -- both search
-    results and the accumulated recipients list are check-list boxes,
-    so several people can be queued or removed in one action, kept
-    deliberately consistent with those dialogs' UX.
+    Start a new 1:1 chat, or a group chat when more than one recipient is queued or a group name is
+    set. Search results and queued recipients are check lists, like ManageGroupMembersDialog.
 
-    Requires an actual first message either way:
-    chat.bsky.convo.getConvoForMembers (1:1) and
-    chat.bsky.group.createGroup (group, EXPERIMENTAL -- see
-    client.create_group's docstring) both only resolve/create the
-    conversation record, neither puts anything in it -- an empty
-    conversation isn't listed anywhere (not even on bsky.app) until a
-    real message is sent to it.
+    A first message is required: both calls only create the conversation record, and an empty
+    conversation isn't listed anywhere until a message is sent.
     """
 
     def __init__(self, parent, account, on_started=None):
@@ -1231,7 +1245,7 @@ class NewChatDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onUserSearchDone, results, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onUserSearchDone(self, results, error):
@@ -1324,13 +1338,7 @@ class NewChatDialog(wx.Dialog):
             return
         groupName = self.groupNameText.GetValue().strip() or None
         recipients = list(self._recipients)
-        # A group name typed in forces a group even with a single
-        # recipient (e.g. deliberately starting a 2-person group
-        # instead of a plain 1:1). LOW CONFIDENCE: whether
-        # chat.bsky.group.createGroup actually accepts just one
-        # initial member has never been tested -- if the server
-        # rejects it, paste back the error and this will need a
-        # minimum-2 guard added here instead.
+        # A group name forces a group even with a single recipient.
         isGroup = len(recipients) > 1 or bool(groupName)
         nvdaUi.message(
             # Translators: Announced while creating a new group chat.
@@ -1359,7 +1367,7 @@ class NewChatDialog(wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onStartChatDone, convo, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onStartChatDone(self, convo, error):
@@ -1388,7 +1396,7 @@ class NewChatDialog(wx.Dialog):
 
 
 class JoinRequestsDialog(wx.Dialog):
-    """LOW CONFIDENCE -- see client.list_join_requests's docstring."""
+    """Pending join requests of a group, to approve or reject."""
 
     def __init__(self, parent, account, convo):
         self._account = account
@@ -1527,9 +1535,10 @@ class JoinRequestsDialog(wx.Dialog):
 
 
 class InviteLinkDialog(wx.Dialog):
-    """LOW CONFIDENCE end to end -- see client.create_join_link's docstring.
-    Two sibling panels toggled via Show/Hide instead of rebuilding
-    controls in place -- rebuilding broke wx's tab order chain."""
+    """
+    Create, edit, enable or disable a group's invite link. Two sibling panels are toggled with
+    Show/Hide: rebuilding controls in place broke wx's tab order.
+    """
 
     JOIN_RULE_OPTIONS = [
         # Translators: Invite-link join rule: anyone with the link joins immediately.
@@ -1541,9 +1550,7 @@ class InviteLinkDialog(wx.Dialog):
         # Translators: Invite-link join rule: only people you follow can request approval.
         (_("People I follow can request to join"), "followedByOwner", True),
     ]
-    # No real shareable URL exists for group invites -- only the code
-    # itself, usable by pasting into another NVSky's Join Group dialog
-    # (or the equivalent in-app paste flow). Confirmed by testing.
+    # Group invites have no shareable URL, only the code (pasted into the Join group dialog).
 
     def __init__(self, parent, account, convo):
         self._account = account
@@ -1788,20 +1795,9 @@ class InviteLinkDialog(wx.Dialog):
 
 class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
     """
-    Add/remove members for an existing group conversation. Both the
-    current-members list and the search-results list are check-list
-    boxes (gui.nvdaControls.CustomCheckListBox -- same control
-    feedWindow.py's ManageMembersDialog already uses for Lists), so
-    several members can be added or removed in one action instead of
-    one at a time -- matches that dialog's UX on purpose.
-
-    Per-member context menu reuses UserActionMixin (View profile/
-    Follow/Mute/Block etc, same as Feed tab) plus Message/Remove added
-    here.
-
-    EXPERIMENTAL -- chat.bsky.group.* has never been exercised against
-    a real server in this project before now. Paste back a traceback
-    if either action fails.
+    Add or remove members of a group conversation. Both lists are check-list boxes, so several
+    members can be added or removed at once (same UX as the Lists member dialog). The per-member
+    context menu reuses UserActionMixin plus Message/Remove.
     """
 
     def __init__(self, parent, account, convo, members):
@@ -1961,7 +1957,7 @@ class ManageGroupMembersDialog(feedWindow.UserActionMixin, wx.Dialog):
                 error = str(e)
             wx.CallAfter(self._onSearchDone, results, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onSearchDone(self, results, error):
@@ -2205,8 +2201,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.composeText = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER, size=(-1, 60))
         # Translators: Button to open the emoji picker for the compose box.
         self.emojiButton = wx.Button(self, label=_("&Emoji..."))
-        # Translators: Button to send the composed chat message. Shows the Ctrl+Enter shortcut.
-        self.sendButton = wx.Button(self, label=_("&Send (Ctrl+Enter)"))
+        # Translators: Button to send the composed chat message. The current shortcut is appended automatically.
+        self.sendButton = wx.Button(self, label=_("&Send") + keymap.hint("send"))
         composeRow.Add(self.composeLabel, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
         composeRow.Add(self.composeText, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
         composeRow.Add(self.emojiButton, flag=wx.RIGHT, border=5)
@@ -2216,8 +2212,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.charCountLabel = wx.StaticText(self, label="")
         sizer.Add(self.charCountLabel, flag=wx.LEFT | wx.BOTTOM, border=10)
 
-        # Dedicated static widget (not composeLabel retexted in place --
-        # that used to get read with stale tree focus, see history).
+        # Dedicated static widget: retexting composeLabel in place got read with stale tree focus.
         self.lockNotice = wx.StaticText(
             # Translators: Shown in place of the compose box for a locked group chat.
             self, label=_("This group is locked -- no new messages can be sent."),
@@ -2400,11 +2395,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         return f"{prefix}{name}{suffix}"
 
     def _updateStatusBar(self):
-        totalUnread = 0
-        if self._account:
-            totalUnread = sum(
-                db.get_unread_message_count(self._account["id"], c["convo_id"]) for c in self._convos
-            )
+        totalUnread = db.get_total_unread_message_count(self._account["id"]) if self._account else 0
         # Translators: Chat tab status bar text. First {} is unread count, second {} is conversation count.
         self.statusBar.SetStatusText(_("Chat {} unread {} conversations").format(totalUnread, len(self._convos)))
         from . import refresh_tray
@@ -2475,9 +2466,8 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 soundpack.play("boundary")
 
     def onConvoSelected(self, evt):
-        # Defensive guard -- tree can apparently get torn down from an
-        # unconfirmed path; catches it as a no-op instead of crashing
-        # NVDA. Report if this still fires, the real cause is unknown.
+        # Defensive guard: the tree can be torn down from a path not yet identified; treat it as a
+        # no-op instead of crashing NVDA.
         try:
             if not getattr(self, "convoTree", None):
                 return
@@ -2603,7 +2593,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         keyCode = evt.GetKeyCode()
         if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers():
             self._checkConvoTreeBoundaryBeforeKey(keyCode)
-        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown():
+        if keymap.matches(evt, "copy_row"):
             if uiutil.copy_focused_row(self.convoTree):
                 return
         evt.Skip()
@@ -2675,16 +2665,14 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
         self.Bind(wx.EVT_MENU, lambda e: self._markAllConvosRead(), markAllReadItem)
         self.Bind(wx.EVT_MENU, lambda e: self._toggleMuteConvo(convo), muteItem)
 
-        # An owner can't Leave until the group is locked (server's
-        # OwnerCannotLeave error, confirmed by testing) -- only offer
-        # Leave when that failure case doesn't apply.
+        # An owner can't leave until the group is locked (OwnerCannotLeave): only offer Leave when
+        # that doesn't apply.
         if not (isGroup and isAdmin and not locked):
             # Translators: Context menu item to leave a conversation.
             leaveItem = menu.Append(wx.ID_ANY, _("&Leave conversation..."))
             self.Bind(wx.EVT_MENU, lambda e: self._leaveConvo(convo), leaveItem)
         if isGroup and isAdmin:
-            # LOCK REQUIRES OWNER -- confirmed via a real 400
-            # InsufficientRole error from a regular member.
+            # Locking requires the owner (InsufficientRole otherwise).
             # Translators: Context menu item to unlock a group conversation.
             # Translators: Context menu item to lock a group conversation.
             lockItem = menu.Append(wx.ID_ANY, _("Unlo&ck this group") if locked else _("Loc&k this group"))
@@ -2698,8 +2686,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             manageMembersItem = menu.Append(wx.ID_ANY, _("Mana&ge members..."))
             self.Bind(wx.EVT_MENU, lambda e: self._manageGroupMembers(convo), manageMembersItem)
         if isGroup and isAdmin:
-            # RENAME REQUIRES OWNER TOO -- same InsufficientRole error
-            # confirmed for a regular member.
+            # Renaming requires the owner too.
             # Translators: Context menu item to rename a group.
             editNameItem = menu.Append(wx.ID_ANY, _("&Edit name..."))
             self.Bind(wx.EVT_MENU, lambda e: self._editGroupName(convo), editNameItem)
@@ -2752,7 +2739,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onEditGroupNameDone, convoId, name, previousName, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onEditGroupNameDone(self, convoId, name, previousName, error):
@@ -2800,7 +2787,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onSetGroupLockedDone, convoId, locked, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onSetGroupLockedDone(self, convoId, requestedLocked, error):
@@ -2850,7 +2837,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onAcceptConvoDone, convoId, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onAcceptConvoDone(self, convoId, error):
@@ -2903,7 +2890,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onMarkReadDone, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onMarkReadDone(self, error):
@@ -2932,7 +2919,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
             except Exception as e:
                 log.error(f"NVSky: background mark-all-read failed: {e}")
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     def _toggleMuteConvo(self, convo):
         convoId = convo["convo_id"]
@@ -2959,7 +2946,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onToggleMuteConvoDone, convo, wasMuted, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onToggleMuteConvoDone(self, convo, previousMuted, error):
@@ -3016,7 +3003,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
 
         # Plain thread, not uiutil.start_worker -- same fix as
         # listsWindow.py's Remove list, same reasoning.
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onLeaveConvoDone(self, error):
@@ -3076,7 +3063,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onRefreshSelectedConvoDone, convoId, error, previousMessageCount)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onRefreshSelectedConvoDone(self, convoId, error, previousMessageCount):
@@ -3148,7 +3135,7 @@ class ChatWindow(_ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onCheckForUpdatesDone, error, previousMessageCount)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onCheckForUpdatesDone(self, error, previousMessageCount=0):
@@ -3211,7 +3198,7 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
         # Translators: Button to open the emoji picker for the compose box.
         self.emojiButton = wx.Button(self, label=_("&Emoji..."))
         # Translators: Button to send the composed chat message. Shows the Ctrl+Enter shortcut.
-        self.sendButton = wx.Button(self, label=_("&Send (Ctrl+Enter)"))
+        self.sendButton = wx.Button(self, label=_("&Send") + keymap.hint("send"))
         composeRow.Add(self.composeText, proportion=1, flag=wx.EXPAND | wx.RIGHT, border=5)
         composeRow.Add(self.emojiButton, flag=wx.RIGHT, border=5)
         composeRow.Add(self.sendButton)
@@ -3406,9 +3393,8 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
                     )
                 if targetIndex is None:
                     targetIndex = 0 if newestFirst else len(messages) - 1
-                # SetFocus() before Focus()/Select() -- confirmed by
-                # testing this avoids a double-announcement on tab
-                # switch that the reversed order caused.
+                # SetFocus() before Focus()/Select(): the reverse order double-announces on a tab
+                # switch.
                 if moveFocus:
                     self.messageList.SetFocus()
                 self.messageList.Focus(targetIndex)
@@ -3452,7 +3438,7 @@ class ConvoTabWindow(RemovableTabMixin, _ChatMessagePanelMixin, wx.Panel):
                 error = str(e)
             wx.CallAfter(self._onCheckForUpdatesDone, error, previousMessageCount)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onCheckForUpdatesDone(self, error, previousMessageCount=0):

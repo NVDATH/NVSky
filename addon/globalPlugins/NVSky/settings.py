@@ -13,6 +13,7 @@ import threading
 import webbrowser
 import wx
 
+import config
 import gui
 import gui.nvdaControls
 from logHandler import log
@@ -23,7 +24,15 @@ from . import client
 from . import uiutil
 from . import timeutils
 from . import soundpack
+from . import keymap
 from .compose import CONTENT_LABEL_DISPLAY_NAMES
+
+# Developer-only page; diagnostics.py is left out of release builds.
+# I18N: its strings and the "Diagnostics" tab title are intentionally NOT translated; do not wrap them in _().
+try:
+    from .diagnostics import DiagnosticsPage
+except ImportError:
+    DiagnosticsPage = None
 
 APP_PASSWORD_URL = "https://bsky.app/settings/app-passwords"
 STRFTIME_REFERENCE_URL = "https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes"
@@ -149,9 +158,10 @@ class LoginDialog(wx.Dialog):
 
 
 class AccountsPanel(wx.Panel):
-    def __init__(self, parent, onAccountChanged=None):
+    def __init__(self, parent, onAccountChanged=None, beforeAccountChange=None):
         super().__init__(parent)
         self._onAccountChanged = onAccountChanged
+        self._beforeAccountChange = beforeAccountChange  # (proceed) -> saves the pages' edits, then calls proceed
         self._accounts = []
 
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -164,6 +174,10 @@ class AccountsPanel(wx.Panel):
         # Translators: Column header for the account handle in the accounts list.
         self.accountList.InsertColumn(0, _("Handle"), width=300)
         sizer.Add(self.accountList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+
+        # Translators: Checkbox in Settings > Accounts: whether background sync checks the selected account.
+        self.bgCheck = wx.CheckBox(self, label=_("&Check this account in the background"))
+        sizer.Add(self.bgCheck, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
         buttonRow = wx.BoxSizer(wx.HORIZONTAL)
         # Translators: Button to log into and add a new Bluesky account.
@@ -182,6 +196,8 @@ class AccountsPanel(wx.Panel):
         self.addButton.Bind(wx.EVT_BUTTON, self.onAdd)
         self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
         self.setActiveButton.Bind(wx.EVT_BUTTON, self.onSetActive)
+        self.bgCheck.Bind(wx.EVT_CHECKBOX, self.onBgCheckChanged)
+        self.accountList.Bind(wx.EVT_LIST_ITEM_FOCUSED, lambda e: (self._updateBgCheck(), e.Skip()))
 
         self.refresh()
 
@@ -193,6 +209,9 @@ class AccountsPanel(wx.Panel):
         for i, acc in enumerate(self._accounts):
             # Translators: Suffix appended to the currently-active account's handle in the accounts list.
             marker = _(" (active)") if acc["is_active"] else ""
+            if not db.get_bg_enabled(acc["id"]):
+                # Translators: Suffix appended to an account in the accounts list when background sync skips it.
+                marker += _(" (no background checks)")
             self.accountList.InsertItem(i, f'{acc["handle"]}{marker}')
             if focusAccountId is not None and acc["id"] == focusAccountId:
                 selectIndex = i
@@ -203,6 +222,7 @@ class AccountsPanel(wx.Panel):
         if hasAccounts:
             self.accountList.Focus(selectIndex)
             self.accountList.Select(selectIndex)
+        self._updateBgCheck()
 
         self.Layout()
 
@@ -220,7 +240,32 @@ class AccountsPanel(wx.Panel):
             return None
         return self._accounts[index]
 
+    def _beforeChange(self, proceed):
+        # The settings pages still hold edits for the account being left: save them first.
+        if self._beforeAccountChange is not None:
+            self._beforeAccountChange(proceed)
+        else:
+            proceed()
+
+    def _updateBgCheck(self):
+        account = self._getSelectedAccount()
+        self.bgCheck.Show(account is not None)
+        if account is not None:
+            self.bgCheck.SetValue(db.get_bg_enabled(account["id"]))
+        self.Layout()
+
+    def onBgCheckChanged(self, evt):
+        account = self._getSelectedAccount()
+        if account is None:
+            return
+        db.set_bg_enabled(account["id"], self.bgCheck.GetValue())
+        self.refresh(focusAccountId=account["id"])
+        self.bgCheck.SetFocus()
+
     def onAdd(self, evt):
+        self._beforeChange(self._showLogin)
+
+    def _showLogin(self):
         dlg = LoginDialog(self)
         if dlg.ShowModal() == wx.ID_OK and dlg.result:
             self.refresh(focusAccountId=dlg.result["id"])
@@ -265,6 +310,13 @@ class AccountsPanel(wx.Panel):
         if account is None:
             nvdaUi.message(_("No account selected."))
             return
+        if account["is_active"]:
+            # Translators: Announced when the selected account is already the active one. {} is the account handle.
+            nvdaUi.message(_("{} is already the active account.").format(account["handle"]))
+            return
+        self._beforeChange(lambda: self._setActive(account))
+
+    def _setActive(self, account):
         db.set_active_account(account["id"])
         self.refresh(focusAccountId=account["id"])
         # Translators: Announced after switching the active account. {} is the account handle.
@@ -354,6 +406,8 @@ SOUND_EVENT_LABELS = {
     # Translators: Sound event label.
     "embed_video": _("Post with a video focused"),
     # Translators: Sound event label.
+    "embed_gif": _("Post with an animated GIF focused"),
+    # Translators: Sound event label.
     "embed_link": _("Post with a link preview focused"),
     # Translators: Sound event label.
     "embed_quote": _("Quote post focused"),
@@ -363,6 +417,10 @@ SOUND_EVENT_LABELS = {
     "main_open": _("NVSky window opened"),
     # Translators: Sound event label.
     "main_close": _("NVSky window closed"),
+    # Translators: Sound event label.
+    "autoread_start": _("Auto read started"),
+    # Translators: Sound event label.
+    "autoread_stop": _("Auto read stopped"),
 }
 
 
@@ -382,6 +440,31 @@ class GeneralPanel(wx.Panel):
         )
         self.enterActionChoice.SetSelection(selectedIndex)
         sizer.Add(self.enterActionChoice, flag=wx.LEFT | wx.TOP, border=10)
+
+        # Translators: Label of the auto read delay field in Settings > General.
+        autoReadLabel = wx.StaticText(self, label=_("Auto read &delay between rows (seconds, 1 to 10):"))
+        sizer.Add(autoReadLabel, flag=wx.LEFT | wx.TOP, border=10)
+        self.autoReadDelaySpin = wx.SpinCtrl(
+            self, min=1, max=10, initial=db.get_autoread_delay(), name="Auto read delay between rows (seconds)"
+        )
+        sizer.Add(self.autoReadDelaySpin, flag=wx.LEFT | wx.TOP, border=10)
+
+        # Translators: Label of the auto read voice profile dropdown in Settings > General.
+        autoReadProfileLabel = wx.StaticText(self, label=_("Auto read &voice profile:"))
+        sizer.Add(autoReadProfileLabel, flag=wx.LEFT | wx.TOP, border=10)
+        try:
+            self._autoReadProfileNames = [n for n in config.conf.listProfiles() if n]
+        except Exception:
+            self._autoReadProfileNames = []
+        self.autoReadProfileChoice = wx.Choice(
+            # Translators: First entry of the auto read voice profile dropdown: keep NVDA's current voice.
+            self, choices=[_("(None, keep the current voice)")] + self._autoReadProfileNames
+        )
+        savedProfile = db.get_autoread_profile()
+        self.autoReadProfileChoice.SetSelection(
+            self._autoReadProfileNames.index(savedProfile) + 1 if savedProfile in self._autoReadProfileNames else 0
+        )
+        sizer.Add(self.autoReadProfileChoice, flag=wx.LEFT | wx.TOP, border=10)
 
         # Translators: Label above the per-category background-sync speech checklist.
         bgSyncAnnounceLabel = wx.StaticText(self, label=_("&Speak when background sync finds new content in:"))
@@ -435,20 +518,15 @@ class GeneralPanel(wx.Panel):
             label=_(
                 "Keeps a live connection open so new posts (and reposts) from people you "
                 "follow appear immediately in Home, and new posts from members of your own "
-                "lists appear immediately there too -- instead of waiting for their scheduled "
-                "checks below. Replaces Home's and Lists' own scheduled checks while enabled. "
+                "lists appear immediately there too, without waiting for the scheduled "
+                "checks below. Those checks keep running as a backup; set Home and Lists to 0 "
+                "to rely on real-time updates alone. Not available when you follow and list "
+                "roughly 250 accounts or more. "
                 "Uses a small amount of extra network/CPU continuously while NVSky is running."
             ),
         )
         jetstreamNote.Wrap(500)
         sizer.Add(jetstreamNote, flag=wx.LEFT | wx.RIGHT | wx.TOP, border=10)
-
-        self._homeRowLabel = None
-        self._homeRowSpin = None
-        self._homeRowItem = None
-        self._listRowLabel = None
-        self._listRowSpin = None
-        self._listRowItem = None
 
         for category, label in bgSyncFields:
             row = wx.BoxSizer(wx.HORIZONTAL)
@@ -460,16 +538,8 @@ class GeneralPanel(wx.Panel):
             )
             row.Add(rowLabel, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=5)
             row.Add(spin)
-            rowItem = sizer.Add(row, flag=wx.LEFT | wx.TOP, border=10)
+            sizer.Add(row, flag=wx.LEFT | wx.TOP, border=10)
             self._bgSyncSpins[category] = spin
-            if category == "home":
-                self._homeRowLabel = rowLabel
-                self._homeRowSpin = spin
-                self._homeRowItem = rowItem
-            elif category == "lists":
-                self._listRowLabel = rowLabel
-                self._listRowSpin = spin
-                self._listRowItem = rowItem
 
         # Translators: Label above the "clear all cache" section in Settings > General.
         cacheLabel = wx.StaticText(self, label=_("All cached data (active account):"))
@@ -491,31 +561,34 @@ class GeneralPanel(wx.Panel):
         self.SetSizer(sizer)
 
         self.clearCacheButton.Bind(wx.EVT_BUTTON, self.onClearCache)
-        self.jetstreamCheck.Bind(wx.EVT_CHECKBOX, self._onJetstreamCheckChanged)
-        self._onJetstreamCheckChanged(None)
 
-    def _onJetstreamCheckChanged(self, evt):
-        enabled = self.jetstreamCheck.GetValue()
-        if self._homeRowLabel is not None:
-            self._homeRowLabel.Show(not enabled)
-            self._homeRowSpin.Show(not enabled)
-            if self._homeRowItem:
-                self._homeRowItem.Show(not enabled)
-        if self._listRowLabel is not None:
-            self._listRowLabel.Show(not enabled)
-            self._listRowSpin.Show(not enabled)
-            if self._listRowItem:
-                self._listRowItem.Show(not enabled)
-
-        self.Layout()
-        if evt is not None:
-            evt.Skip()
+    def reload(self):
+        # Another account is active now: show its settings.
+        current = db.get_ui_state("enter_action") or "view_thread"
+        self.enterActionChoice.SetSelection(
+            next((i for i, (key, _label) in enumerate(ENTER_ACTION_CHOICES) if key == current), 0)
+        )
+        self.autoReadDelaySpin.SetValue(db.get_autoread_delay())
+        savedProfile = db.get_autoread_profile()
+        self.autoReadProfileChoice.SetSelection(
+            self._autoReadProfileNames.index(savedProfile) + 1 if savedProfile in self._autoReadProfileNames else 0
+        )
+        announce = db.get_bg_sync_announce_categories()
+        self.bgSyncAnnounceList.CheckedItems = [
+            i for i, (key, _label) in enumerate(BG_SYNC_CATEGORY_LABELS) if key in announce
+        ]
+        self.jetstreamCheck.SetValue(db.get_jetstream_enabled())
+        for category, spin in self._bgSyncSpins.items():
+            spin.SetValue(db.get_bg_sync_interval(category))
 
     def onTabActivated(self):
         self.enterActionChoice.SetFocus()
 
     def apply(self):
         db.set_ui_state("enter_action", ENTER_ACTION_CHOICES[self.enterActionChoice.GetSelection()][0])
+        db.set_autoread_delay(self.autoReadDelaySpin.GetValue())
+        profileIndex = self.autoReadProfileChoice.GetSelection()
+        db.set_autoread_profile(self._autoReadProfileNames[profileIndex - 1] if profileIndex > 0 else "")
         for category, spin in self._bgSyncSpins.items():
             db.set_bg_sync_interval(category, spin.GetValue())
         checkedCategories = {BG_SYNC_CATEGORY_LABELS[i][0] for i in self.bgSyncAnnounceList.CheckedItems}
@@ -729,6 +802,28 @@ class DisplayPanel(wx.Panel):
         self._notificationBaseline = {}
         self._notificationReady = False
         self._notificationLoadedOnce = False
+
+    def reload(self):
+        # Another account is active now: show its settings.
+        self.sortOrderChoice.SetSelection(0 if (db.get_ui_state("sort_order") or "newest_first") == "newest_first" else 1)
+        self.authorModeChoice.SetSelection(0 if (db.get_ui_state("column1_display") or "display_name") == "display_name" else 1)
+        modeValues = [value for _label, value in TIME_MODE_CHOICES]
+        currentMode = db.get_ui_state("time_format_mode") or "relative_24h"
+        self.timeModeChoice.SetSelection(modeValues.index(currentMode) if currentMode in modeValues else 0)
+        self.customPatternCtrl.SetValue(db.get_ui_state("time_format_custom_pattern") or "%Y-%m-%d %H:%M:%S")
+        self._updateCustomPatternState()
+        enabledTabs = db.get_enabled_tabs()
+        self.tabsList.CheckedItems = [i for i, (key, _label) in enumerate(OPTIONAL_TAB_CHOICES) if key in enabledTabs]
+        self.trayCheck.SetValue(db.get_tray_enabled())
+        trayWanted = db.get_tray_categories()
+        self.trayCategoriesList.CheckedItems = [
+            i for i, (key, _label) in enumerate(TRAY_CATEGORY_CHOICES) if key in trayWanted
+        ]
+        self.trayTextChoice.SetSelection(1 if db.get_tray_per_tab() else 0)
+        self._onTrayCheckChanged(None)
+        self.tabsChanged = False
+        self.reloadContentLabels()
+        self.reloadNotificationPrefs()
 
     def onTabActivated(self):
         self.sortOrderChoice.SetFocus()
@@ -1377,6 +1472,11 @@ class SoundPanel(wx.Panel):
     def onTabActivated(self):
         self.packChoice.SetFocus()
 
+    def reload(self):
+        # Another account is active now: show its settings.
+        self._loadPackChoices()
+        self._loadEventChecks()
+
     def _loadPackChoices(self):
         self._packNames = [soundpack.SILENT_PACK] + soundpack.list_packs()
         # Translators: Sound-pack picker entry to disable all NVSky sounds.
@@ -1407,6 +1507,265 @@ class SoundPanel(wx.Panel):
         db.set_soundpack_disabled_events(disabledKeys)
 
         soundpack.reload()
+
+
+class _KeyCaptureDialog(wx.Dialog):
+    """Captures one key press as a new shortcut. Escape cancels."""
+
+    def __init__(self, parent, actionId, bindings):
+        # Translators: Title of the dialog that captures a new keyboard shortcut.
+        super().__init__(parent, title=_("Change shortcut"))
+        self._actionId = actionId
+        self._bindings = bindings
+        self.text = None
+        self.warning = None
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        # Translators: Instruction in the change-shortcut dialog. {} is the action name.
+        prompt = _("Press the new shortcut for {}. Press Escape to cancel.")
+        promptLabel = wx.StaticText(self, label=prompt.format(keymap.label(actionId)))
+        promptLabel.Wrap(420)
+        sizer.Add(promptLabel, flag=wx.ALL, border=10)
+
+        # Translators: Label of the field showing the shortcut being captured.
+        shortcutLabel = wx.StaticText(self, label=_("&Shortcut:"))
+        sizer.Add(shortcutLabel, flag=wx.LEFT | wx.RIGHT, border=10)
+        self.shortcutText = wx.TextCtrl(
+            self, value=keymap.display_text(bindings[actionId]), style=wx.TE_READONLY
+        )
+        sizer.Add(self.shortcutText, flag=wx.EXPAND | wx.ALL, border=10)
+
+        # Translators: Button to close the change-shortcut dialog without changing anything.
+        cancelBtn = wx.Button(self, wx.ID_CANCEL, label=_("&Cancel"))
+        sizer.Add(cancelBtn, flag=wx.ALIGN_CENTER | wx.BOTTOM, border=10)
+
+        self.SetSizerAndFit(sizer)
+        self.CentreOnScreen()
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+        self.shortcutText.SetFocus()
+
+    def onCharHook(self, evt):
+        keyCode = evt.GetKeyCode()
+        if keyCode == wx.WXK_ESCAPE:
+            self.EndModal(wx.ID_CANCEL)
+            return
+        text = keymap.event_to_text(evt)
+        if text is None:
+            if keyCode not in (wx.WXK_SHIFT, wx.WXK_CONTROL, wx.WXK_ALT):
+                # Translators: Announced when a pressed key can't be used as a shortcut.
+                nvdaUi.message(_("That key can't be used."))
+            return
+        error, warning = keymap.check(self._actionId, text, self._bindings)
+        shown = keymap.display_text(text)
+        if error:
+            self.shortcutText.SetValue(shown)
+            nvdaUi.message(f"{shown}: {error}")
+            return
+        self.text = text
+        self.warning = warning
+        self.EndModal(wx.ID_OK)
+
+
+class KeymapPanel(wx.Panel):
+    """Settings > Keymap. Changes are staged in self._bindings and saved on OK/Apply."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._ids = keymap.actions()
+        self._bindings = keymap.effective()
+        self.changed = False  # True once saved, so closing Settings rebuilds the tabs' button labels
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Translators: Label above the shortcut list in Settings > Keymap.
+        listLabel = wx.StaticText(self, label=_("&Shortcuts:"))
+        sizer.Add(listLabel, flag=wx.LEFT | wx.TOP, border=10)
+        self.shortcutList = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        # Translators: Column header for the name of an action in the keymap list.
+        self.shortcutList.InsertColumn(0, _("Action"), width=320)
+        # Translators: Column header for an action's keyboard shortcut in the keymap list.
+        self.shortcutList.InsertColumn(1, _("Shortcut"), width=170)
+        # Translators: Column header for where an action's shortcut works in the keymap list.
+        self.shortcutList.InsertColumn(2, _("Where"), width=140)
+        sizer.Add(self.shortcutList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+
+        buttonRow = wx.BoxSizer(wx.HORIZONTAL)
+        # Translators: Button to change the selected shortcut.
+        self.changeButton = wx.Button(self, label=_("&Change..."))
+        # Translators: Button to remove the selected shortcut, leaving the action without one.
+        self.removeButton = wx.Button(self, label=_("Re&move shortcut"))
+        # Translators: Button to put the selected shortcut back to its default.
+        self.resetButton = wx.Button(self, label=_("&Reset"))
+        # Translators: Button to put every shortcut back to its default.
+        self.resetAllButton = wx.Button(self, label=_("Reset &all"))
+        buttonRow.Add(self.changeButton, flag=wx.RIGHT, border=5)
+        buttonRow.Add(self.removeButton, flag=wx.RIGHT, border=5)
+        buttonRow.Add(self.resetButton, flag=wx.RIGHT, border=5)
+        buttonRow.Add(self.resetAllButton)
+        sizer.Add(buttonRow, flag=wx.LEFT | wx.RIGHT, border=10)
+
+        note = wx.StaticText(
+            self,
+            # Translators: Explanatory note below the keymap list in Settings > Keymap.
+            label=_(
+                "Shortcuts marked fixed are built in and can't be changed; they are listed so you can see every key. "
+                "Actions marked Not assigned have no shortcut yet: choose Change to give them one. "
+                "Auto read has no shortcut here: assign one in NVDA's Input gestures dialog, under NVSky. "
+                "Changes are saved when you press OK or Apply; shortcuts shown on buttons update when "
+                "you close Settings."
+            ),
+        )
+        note.Wrap(500)
+        sizer.Add(note, flag=wx.ALL, border=10)
+
+        self.SetSizer(sizer)
+
+        self.changeButton.Bind(wx.EVT_BUTTON, self.onChange)
+        self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
+        self.resetButton.Bind(wx.EVT_BUTTON, self.onReset)
+        self.resetAllButton.Bind(wx.EVT_BUTTON, self.onResetAll)
+        self.shortcutList.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.onChange)
+
+        self._render(target_index=0)
+
+    def onTabActivated(self):
+        self.shortcutList.SetFocus()
+
+    def _render(self, target_index=None):
+        previouslyFocused = self.shortcutList.GetFocusedItem()
+        self.shortcutList.Freeze()
+        try:
+            self.shortcutList.DeleteAllItems()
+            for i, actionId in enumerate(self._ids):
+                text = keymap.display_text(self._bindings[actionId])
+                if keymap.is_fixed(actionId):
+                    # Translators: Shortcut column value for a shortcut that can't be changed. {} is the shortcut.
+                    text = _("{} (fixed)").format(text)
+                elif not text:
+                    # Translators: Shortcut column value for an action that has no shortcut.
+                    text = _("Not assigned")
+                elif self._bindings[actionId] != keymap.default(actionId):
+                    # Translators: Shortcut column value for a shortcut changed from its default. {} is the shortcut.
+                    text = _("{} (changed)").format(text)
+                self.shortcutList.InsertItem(i, keymap.label(actionId))
+                self.shortcutList.SetItem(i, 1, text)
+                self.shortcutList.SetItem(i, 2, keymap.group_label(keymap.group(actionId)))
+            if target_index is not None:
+                index = target_index
+            elif previouslyFocused != -1:
+                index = previouslyFocused
+            else:
+                index = 0
+            index = max(0, min(index, len(self._ids) - 1))
+            self.shortcutList.Focus(index)
+            self.shortcutList.Select(index)
+            self.shortcutList.EnsureVisible(index)
+        finally:
+            self.shortcutList.Thaw()
+
+    def _selectedIndex(self):
+        index = self.shortcutList.GetFocusedItem()
+        if index == -1 or index >= len(self._ids):
+            # Translators: Spoken when a shortcut action is needed but none is selected.
+            nvdaUi.message(_("No shortcut selected."))
+            return None
+        return index
+
+    def onChange(self, evt=None):
+        index = self._selectedIndex()
+        if index is None:
+            return
+        actionId = self._ids[index]
+        if self._guardFixed(actionId):
+            return
+        dlg = _KeyCaptureDialog(self, actionId, self._bindings)
+        result = dlg.ShowModal()
+        text, warning = dlg.text, dlg.warning
+        dlg.Destroy()
+        self.shortcutList.SetFocus()
+        if result != wx.ID_OK or text is None:
+            return
+        self._bindings[actionId] = text
+        self._render(target_index=index)
+        # Translators: Announced after changing a shortcut. First {} is the action name, second {} is the new shortcut.
+        message = _("{} is now {}.").format(keymap.label(actionId), keymap.display_text(text))
+        if warning:
+            message += " " + warning
+        wx.CallLater(250, nvdaUi.message, message)
+
+    def _guardFixed(self, actionId):
+        if not keymap.is_fixed(actionId):
+            return False
+        # Translators: Announced when trying to change a built-in shortcut.
+        nvdaUi.message(_("This shortcut is fixed and can't be changed."))
+        return True
+
+    def onRemove(self, evt):
+        index = self._selectedIndex()
+        if index is None:
+            return
+        actionId = self._ids[index]
+        if self._guardFixed(actionId):
+            return
+        if not self._bindings[actionId]:
+            # Translators: Announced when removing a shortcut from an action that has none.
+            nvdaUi.message(_("No shortcut to remove."))
+            return
+        self._bindings[actionId] = ""
+        self._render(target_index=index)
+        # Translators: Announced after removing a shortcut. {} is the action name.
+        nvdaUi.message(_("{} now has no shortcut.").format(keymap.label(actionId)))
+
+    def onReset(self, evt):
+        index = self._selectedIndex()
+        if index is None:
+            return
+        actionId = self._ids[index]
+        if self._guardFixed(actionId):
+            return
+        defaultText = keymap.default(actionId)
+        if self._bindings[actionId] == defaultText:
+            # Translators: Announced when resetting a shortcut that already has its default.
+            nvdaUi.message(_("Already the default."))
+            return
+        if defaultText:
+            error, _warning = keymap.check(actionId, defaultText, self._bindings)
+            if error:
+                nvdaUi.message(error)
+                return
+        self._bindings[actionId] = defaultText
+        self._render(target_index=index)
+        if defaultText:
+            # Translators: Announced after resetting a shortcut. First {} is the action name, second {} is the default shortcut.
+            nvdaUi.message(_("{} reset to {}.").format(keymap.label(actionId), keymap.display_text(defaultText)))
+        else:
+            # Translators: Announced after resetting an action whose default is no shortcut. {} is the action name.
+            nvdaUi.message(_("{} reset: no shortcut.").format(keymap.label(actionId)))
+
+    def onResetAll(self, evt):
+        if all(self._bindings[a] == keymap.default(a) for a in self._ids):
+            nvdaUi.message(_("Already the default."))
+            return
+        confirm = wx.MessageDialog(
+            self,
+            # Translators: Confirmation body for resetting every shortcut.
+            _("Reset every shortcut to its default?"),
+            # Translators: Title of the reset-all-shortcuts confirmation dialog.
+            _("Reset all"), wx.YES_NO | wx.NO_DEFAULT,
+        )
+        confirmed = confirm.ShowModal() == wx.ID_YES
+        confirm.Destroy()
+        if not confirmed:
+            return
+        self._bindings = {a: keymap.default(a) for a in self._ids}
+        self._render(target_index=0)
+        # Translators: Announced after resetting every shortcut.
+        nvdaUi.message(_("All shortcuts reset."))
+
+    def apply(self):
+        if self._bindings != keymap.effective():
+            keymap.save(self._bindings)
+            self.changed = True
 
 
 class ProfilePanel(wx.Panel):
@@ -1888,13 +2247,17 @@ class NVSkySettingsDialog(wx.Dialog):
 
         panel.SetSizer(sizer)
 
-        self.accountsPanel = AccountsPanel(self.notebook, onAccountChanged=self._onAccountChanged)
+        self.accountsPanel = AccountsPanel(
+            self.notebook, onAccountChanged=self._onAccountChanged, beforeAccountChange=self._applyBeforeSwitch
+        )
         self.generalPanel = GeneralPanel(self.notebook)
         self.displayPanel = DisplayPanel(self.notebook)
         self.feedManagerPanel = FeedManagerPanel(self.notebook)
         self.soundPanel = SoundPanel(self.notebook)
+        self.keymapPanel = KeymapPanel(self.notebook)
         self.profilePanel = ProfilePanel(self.notebook)
         self.mutedWordsPanel = MutedWordsPanel(self.notebook)
+        self.diagnosticsPanel = DiagnosticsPage(self.notebook) if DiagnosticsPage is not None else None
 
         # Translators: Settings dialog tab name (accounts management).
         self.notebook.AddPage(self.accountsPanel, _("Accounts"))
@@ -1906,10 +2269,15 @@ class NVSkySettingsDialog(wx.Dialog):
         self.notebook.AddPage(self.feedManagerPanel, _("Feed manager"))
         # Translators: Settings dialog tab name (sound options).
         self.notebook.AddPage(self.soundPanel, _("Sound"))
+        # Translators: Settings dialog tab name (keyboard shortcuts).
+        self.notebook.AddPage(self.keymapPanel, _("Keymap"))
         # Translators: Settings dialog tab name (profile editing).
         self.notebook.AddPage(self.profilePanel, _("Profile"))
         # Translators: Settings dialog tab name (muted words/tags management).
         self.notebook.AddPage(self.mutedWordsPanel, _("Muted words"))
+        if self.diagnosticsPanel is not None:
+            # Developer-only; not translated (diagnostics.py is excluded from builds).
+            self.notebook.AddPage(self.diagnosticsPanel, "Diagnostics")
 
         self.okBtn.Bind(wx.EVT_BUTTON, self.onOk)
         self.cancelBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
@@ -1921,6 +2289,8 @@ class NVSkySettingsDialog(wx.Dialog):
 
         self.CentreOnScreen()
         self._activationSuppressed = False
+        self._pagesAccountId = self._currentAccountId()
+        self._updateTitle()
         # Page 0 was auto-selected while suppressed; focus it once deliberately.
         wx.CallAfter(self._activatePage, 0)
 
@@ -1932,18 +2302,51 @@ class NVSkySettingsDialog(wx.Dialog):
             callable(getattr(page, "pendingTasks", None)) and page.pendingTasks() for page in self._pages()
         )
 
+    def _accountPages(self):
+        return [
+            self.generalPanel, self.displayPanel, self.feedManagerPanel,
+            self.soundPanel, self.profilePanel, self.mutedWordsPanel,
+        ]
+
+    def _currentAccountId(self):
+        account = db.get_active_account()
+        return account["id"] if account else None
+
+    def _updateTitle(self):
+        index = self.notebook.GetSelection()
+        pageName = self.notebook.GetPageText(index) if index != wx.NOT_FOUND else ""
+        account = db.get_active_account()
+        if account is None:
+            # Translators: Title of the NVSky Settings dialog. {} is the name of the page shown.
+            self.SetTitle(_("{} - NVSky Settings").format(pageName))
+        else:
+            # Translators: Title of the NVSky Settings dialog. First {} is the name of the page shown, second {} is the handle of the account whose settings it shows.
+            self.SetTitle(_("{} - NVSky Settings - {}").format(pageName, account["handle"]))
+
+    def _applyBeforeSwitch(self, proceed):
+        self._startApply(closeAfter=False, then=proceed)
+
     def _onAccountChanged(self):
-        # Pending server-side edits belong to the previous account: the panels drop them on reload.
-        if self._hasPendingServerChanges():
-            # Translators: Announced when switching accounts discards unsaved server-side settings changes.
-            nvdaUi.message(_("Unsaved changes for the previous account were discarded."))
-        self.profilePanel.reload()
-        self.mutedWordsPanel.reload()
-        self.feedManagerPanel.reload()
-        self.displayPanel.reloadContentLabels()
-        self.displayPanel.reloadNotificationPrefs()
+        self._reloadForAccount()
         if self._onAccountChangedExternal:
             self._onAccountChangedExternal()
+
+    def accountSwitchedExternally(self):
+        # The account was switched from outside (tray, shortcut): refresh the pages only.
+        self.accountsPanel.refresh(focusAccountId=self._currentAccountId())
+        self._reloadForAccount()
+
+    def _reloadForAccount(self):
+        newId = self._currentAccountId()
+        if newId != self._pagesAccountId:
+            # Edits made before a switch were saved first; what is left belonged to a removed account.
+            if self._hasPendingServerChanges():
+                # Translators: Announced when switching accounts discards unsaved server-side settings changes.
+                nvdaUi.message(_("Unsaved changes for the previous account were discarded."))
+            self._pagesAccountId = newId
+            for page in self._accountPages():
+                page.reload()
+            self._updateTitle()
 
     def onPageChanging(self, evt):
         # Move real focus to the notebook before the page swaps (see MainWindow.onPageChanging).
@@ -1962,6 +2365,7 @@ class NVSkySettingsDialog(wx.Dialog):
         panel = self.notebook.GetPage(index)
         # Announce the tab name first, then grant real focus (the order that avoids losing the race).
         pageText = self.notebook.GetPageText(index)
+        self._updateTitle()
         # Translators: Announced when switching to a Settings dialog tab. {} is the tab name.
         nvdaUi.message(_("{} tab").format(pageText))
         onActivated = getattr(panel, "onTabActivated", None)
@@ -1988,7 +2392,7 @@ class NVSkySettingsDialog(wx.Dialog):
     def onApply(self, evt):
         self._startApply(closeAfter=False)
 
-    def _startApply(self, closeAfter):
+    def _startApply(self, closeAfter, then=None):
         if self._applying:
             return
         self._applying = True
@@ -2005,7 +2409,7 @@ class NVSkySettingsDialog(wx.Dialog):
                 tasks.extend(tasksFn())
 
         if not tasks:
-            self._finishApply(closeAfter, [], [])
+            self._finishApply(closeAfter, [], [], then)
             return
 
         def worker():
@@ -2014,7 +2418,7 @@ class NVSkySettingsDialog(wx.Dialog):
             try:
                 atprotoClient = client.get_client_for_active_account()
             except Exception as e:
-                wx.CallAfter(self._finishApply, closeAfter, [], [(t, str(e)) for t in tasks])
+                wx.CallAfter(self._finishApply, closeAfter, [], [(t, str(e)) for t in tasks], then)
                 return
             for task in tasks:
                 try:
@@ -2023,12 +2427,12 @@ class NVSkySettingsDialog(wx.Dialog):
                 except Exception as e:
                     log.error(f"NVSky: saving {task.label} failed: {e}")
                     failures.append((task, str(e)))
-            wx.CallAfter(self._finishApply, closeAfter, done, failures)
+            wx.CallAfter(self._finishApply, closeAfter, done, failures, then)
 
         uiutil.start_worker(worker)
 
     @uiutil.safe_ui_callback(check_app_closing=False)
-    def _finishApply(self, closeAfter, done, failures):
+    def _finishApply(self, closeAfter, done, failures, then=None):
         self._applying = False
         self.okBtn.Enable()
         self.applyBtn.Enable()
@@ -2042,6 +2446,9 @@ class NVSkySettingsDialog(wx.Dialog):
             return
         if done:
             soundpack.play("ready")
+        if then is not None:
+            then()
+            return
         if closeAfter:
             self.Close()
         else:
@@ -2050,7 +2457,7 @@ class NVSkySettingsDialog(wx.Dialog):
 
     def onClose(self, evt):
         gui.mainFrame.postPopup()
-        needsRebuild = self.displayPanel.tabsChanged
+        needsRebuild = self.displayPanel.tabsChanged or self.keymapPanel.changed
         self.Destroy()
         if needsRebuild:
             from . import rebuild_main_window_tabs

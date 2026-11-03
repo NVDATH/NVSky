@@ -5,7 +5,7 @@ menu (Alt+U) used by every tab or dialog that shows posts or users.
 feedWindow is imported as a module (not by name) because it imports this
 file; its helpers are only touched inside method bodies.
 """
-import threading
+
 import webbrowser
 
 import wx
@@ -18,6 +18,7 @@ from . import client
 from . import db
 from . import soundpack
 from . import uiutil
+from . import keymap
 from . import feedWindow
 
 
@@ -61,7 +62,7 @@ class UserActionMixin:
         # Cached relation state gives truthful labels and no confirm dialog;
         # otherwise fall back to the ambiguous toggle (network check + confirm).
         cached = db.get_author(did)
-        if cached is not None:
+        if cached is not None and cached.get("viewer_known", 1):
             followingUri = cached.get("viewer_following")
             isMuted = bool(cached.get("viewer_muted"))
             blockingUri = cached.get("viewer_blocking")
@@ -113,6 +114,72 @@ class UserActionMixin:
         self._populateUserActionMenu(menu, did, handle, display_name)
         self.PopupMenu(menu)
         menu.Destroy()
+
+    def runUserShortcut(self, actionId, did, handle, display_name=None):
+        if actionId == "user_profile":
+            self.viewProfile(did)
+        elif actionId == "user_timeline":
+            self.showTimeline(did, handle, display_name)
+        elif actionId == "user_followers":
+            self.showFollowers(did, handle, display_name)
+        elif actionId == "user_following":
+            self.showFollowing(did, handle, display_name)
+        elif actionId == "user_known_followers":
+            self.showKnownFollowers(did, handle, display_name)
+        elif actionId == "user_lists":
+            self.showUserLists(did, handle, display_name)
+        elif actionId == "user_start_chat":
+            self.startChat(did, handle)
+        elif actionId == "user_follow":
+            self._relationShortcut(did, handle, "follow")
+        elif actionId == "user_mute":
+            self._relationShortcut(did, handle, "mute")
+        elif actionId == "user_block":
+            self._relationShortcut(did, handle, "block")
+        elif actionId == "user_subscribe":
+            self._relationShortcut(did, handle, "activity_sub")
+        elif actionId == "user_add_to_list":
+            self.addToList(did, handle, display_name)
+        elif actionId == "user_copy_url":
+            self.copyProfileUrl(did, handle)
+        elif actionId == "user_open_web":
+            webbrowser.open(f"https://bsky.app/profile/{handle or did}")
+        elif actionId == "user_report":
+            self._reportActor(did, handle)
+
+    def _relationShortcut(self, did, handle, kind):
+        # Same choice the user action menu makes: cached state if known, else ask the server first.
+        cached = db.get_author(did)
+        if cached is not None and cached.get("viewer_known", 1):
+            current = {
+                "follow": cached.get("viewer_following"),
+                "mute": bool(cached.get("viewer_muted")),
+                "block": cached.get("viewer_blocking"),
+                "activity_sub": bool(cached.get("viewer_activity_subscription")),
+            }[kind]
+            self._toggleRelationCached(did, handle, kind, current)
+        elif kind == "activity_sub":
+            # Translators: Announced when a subscribe shortcut is used before the subscription state is known.
+            nvdaUi.message(_("The subscription state isn't known yet. Open the User action menu once first."))
+        else:
+            self._toggleRelation(did, handle, kind)
+
+    def runCustomShortcut(self, evt, post):
+        """Runs the post or user action assigned to this key press on `post`. True if handled."""
+        from .itemActions import ItemActionMixin
+        actionId = keymap.match_group(evt, "post")
+        if actionId:
+            ItemActionMixin.runPostShortcut(self, actionId)
+            return True
+        actionId = keymap.match_group(evt, "user")
+        if not actionId:
+            return False
+        if post is None:
+            # Translators: Announced when the post-action menu is invoked with no post focused.
+            nvdaUi.message(_("No post selected."))
+            return True
+        self.runUserShortcut(actionId, post["author_did"], post.get("handle"), post.get("display_name"))
+        return True
 
     def showTimeline(self, did, handle, display_name=None):
         # Opens or focuses the user's timeline tab (needs the real MainWindow).
@@ -289,7 +356,7 @@ class UserActionMixin:
                 error = str(e)
             wx.CallAfter(self._onStartChatDone, convo, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onStartChatDone(self, convo, error):
@@ -433,7 +500,7 @@ class UserActionMixin:
             # Translators: Announced after a follow/mute/block action succeeds.
             wx.CallAfter(self._onUserActionDone, _("Done.") if not error else None, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onUserActionDone(self, message, error):
@@ -507,7 +574,7 @@ class UserActionMixin:
                 error = str(e)
             wx.CallAfter(self._onRelationCachedDone, did, kind, currentValue, resultValue, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onRelationCachedDone(self, did, kind, previousValue, resultValue, error):
@@ -562,7 +629,7 @@ class UserActionMixin:
             # Translators: Announced after successfully sending a user report.
             wx.CallAfter(self._onUserActionDone, _("Report sent.") if not error else None, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
 
 class UserListMixin:
@@ -666,20 +733,30 @@ class UserListMixin:
         self.showUserActionMenu(user["did"], user["handle"], user.get("display_name"))
 
     def onUserListCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
-        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.userList:
+        inList = self.FindFocus() is self.userList
+        if keymap.matches(evt, "copy_row") and inList:
             if uiutil.copy_focused_row(self.userList):
                 return
-        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.userList:
+        if keymap.matches(evt, "jump_row") and inList:
             uiutil.jump_to_row(self, self.userList)
             return
-        if evt.AltDown() and keyCode == ord("U"):
+        if keymap.matches(evt, "user_action"):
             self.onUserAction()
             return
-        if keyCode == wx.WXK_F5 and not evt.ShiftDown() and not evt.ControlDown():
+        if keymap.matches(evt, "check_updates"):
             self.onCheckForUpdates(None)
             return
-        if evt.ControlDown() and keyCode == wx.WXK_DELETE:
+        if keymap.matches(evt, "clear_cache"):
             self.onClearCache()
             return
+        if inList:
+            actionId = keymap.match_group(evt, "user")
+            if actionId:
+                user = self._getFocusedUser()
+                if user is None:
+                    # Translators: Announced when the user-action menu (Alt+U) is invoked with no user focused.
+                    nvdaUi.message(_("No user selected."))
+                else:
+                    self.runUserShortcut(actionId, user["did"], user["handle"], user.get("display_name"))
+                return
         evt.Skip()

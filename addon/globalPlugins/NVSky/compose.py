@@ -32,6 +32,7 @@ from . import client
 from . import attachments as attachmentModule
 from . import uiutil
 from . import soundpack
+from . import keymap
 
 CONTENT_LABEL_DISPLAY_NAMES = {
     # Translators: Content label display name (used when self-labeling a post).
@@ -160,7 +161,7 @@ class VideoUploadDialog(wx.Dialog):
                 blob, error = None, str(e)
             wx.CallAfter(self._onDone, blob, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     # state name -> (status phrase, beep step). Step 0 is the dialog's own
     # initial "Attaching..." text, steps 1-5 climb with the job states, and
@@ -309,8 +310,8 @@ class ComposeDialog(wx.Dialog):
         )
         sizer.Add(self.labelCheckList, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP | wx.BOTTOM, border=10)
 
-        # Translators: Button to submit the post. Shows the Ctrl+Enter shortcut.
-        self.postButton = wx.Button(self, label=_("&Post (Ctrl+Enter)"))
+        # Translators: Button to submit the post. The current shortcut is appended automatically.
+        self.postButton = wx.Button(self, label=_("&Post") + keymap.hint("send"))
         self.cancelButton = wx.Button(self, label=_("&Cancel"))
         buttonRow = wx.BoxSizer(wx.HORIZONTAL)
         buttonRow.Add(self.postButton, flag=wx.RIGHT, border=5)
@@ -585,14 +586,12 @@ class ComposeDialog(wx.Dialog):
         if keyCode == wx.WXK_ESCAPE:
             return
 
-        if evt.ControlDown() and keyCode == ord("W"):
+        if keymap.matches(evt, "close_dialog"):
             self.Close()
             return
 
-        # Works regardless of which control currently has focus (including
-        # the multiline text box, where a plain key-down binding on the
-        # control itself isn't reliable for Enter).
-        if evt.ControlDown() and keyCode in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+        # Works regardless of which control has focus, including the multiline text box.
+        if keymap.matches(evt, "send"):
             self.onPost(evt)
             return
 

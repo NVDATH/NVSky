@@ -5,7 +5,7 @@ ProfileDialog, UserListTabWindow, ThreadTabWindow, QuotesTabWindow,
 UserTimelineTabWindow, FeedPreviewTabWindow, SavedWindow, and LikesWindow:
 the smaller tab/dialog classes that don't warrant their own files.
 """
-import threading
+
 import wx
 
 import gui
@@ -15,6 +15,7 @@ from . import db
 from . import client
 from . import uiutil
 from . import soundpack
+from . import keymap
 from .feedWindow import (
     RemovableTabMixin,
     UserActionMixin,
@@ -78,7 +79,7 @@ class ProfileDialog(UserActionMixin, wx.Dialog):
         if evt.GetKeyCode() == wx.WXK_ESCAPE:
             self.Close()
             return
-        if evt.AltDown() and evt.GetKeyCode() == ord("U"):
+        if keymap.matches(evt, "user_action"):
             self.showUserActionMenu(self._profile["did"], self._profile["handle"], self._profile.get("display_name"))
             return
         evt.Skip()
@@ -171,7 +172,7 @@ class UserListTabWindow(RemovableTabMixin, UserActionMixin, UserListMixin, wx.Pa
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
         # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
-        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
+        self.userActionButton = wx.Button(self, label=_("&User action...") + keymap.hint("user_action"))
         actionRow.Add(self.userActionButton)
         sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
 
@@ -373,10 +374,10 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to open the Post action menu. Shows the Alt+A shortcut.
-        self.postActionButton = wx.Button(self, label=_("&Post action... (Alt+A)"))
-        # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
-        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
+        # Translators: Button to open the Post action menu. The current shortcut is appended automatically.
+        self.postActionButton = wx.Button(self, label=_("&Post action...") + keymap.hint("post_action"))
+        # Translators: Button to open the User action menu. The current shortcut is appended automatically.
+        self.userActionButton = wx.Button(self, label=_("&User action...") + keymap.hint("user_action"))
         actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.userActionButton)
         sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
@@ -443,24 +444,26 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
             checkButton.SetFocus()
 
     def onCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
-        if keyCode == wx.WXK_F5 and not evt.ShiftDown() and not evt.ControlDown():
+        inList = self.FindFocus() is self.postList
+        if keymap.matches(evt, "check_updates"):
             self.onCheckForUpdates(None)
             return
-        if evt.AltDown() and keyCode == ord("A"):
+        if keymap.matches(evt, "post_action"):
             self.onPostAction()
             return
-        if evt.AltDown() and keyCode == ord("U"):
+        if keymap.matches(evt, "user_action"):
             self.onUserAction()
             return
-        if evt.ControlDown() and keyCode == wx.WXK_DELETE:
+        if keymap.matches(evt, "clear_cache"):
             self.onClearCache()
             return
-        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "copy_row") and inList:
             self._copyFocusedPostRow()
             return
-        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "jump_row") and inList:
             uiutil.jump_to_row(self, self.postList)
+            return
+        if inList and self.runCustomShortcut(evt, self._getFocusedPost()):
             return
         evt.Skip()
 
@@ -647,7 +650,7 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
                 message = None
             wx.CallAfter(self._onLikeSynced, post, message, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     def _copyPostText(self, post):
         self._copyToClipboard(post.get("text", ""))
@@ -701,10 +704,10 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to open the Post action menu.
-        self.postActionButton = wx.Button(self, label=_("&Post action..."))
-        # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
-        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
+        # Translators: Button to open the Post action menu. The current shortcut is appended automatically.
+        self.postActionButton = wx.Button(self, label=_("&Post action...") + keymap.hint("post_action"))
+        # Translators: Button to open the User action menu. The current shortcut is appended automatically.
+        self.userActionButton = wx.Button(self, label=_("&User action...") + keymap.hint("user_action"))
         actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.userActionButton)
         sizer.Add(actionRow, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM, border=10)
@@ -751,21 +754,23 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         self._jumpBackToOrigin()
 
     def onCharHook(self, evt):
-        keyCode = evt.GetKeyCode()
-        if keyCode == wx.WXK_F5 and not evt.ShiftDown() and not evt.ControlDown():
+        inList = self.FindFocus() is self.postList
+        if keymap.matches(evt, "check_updates"):
             self.onCheckForUpdates(None)
             return
-        if evt.AltDown() and keyCode == ord("A"):
+        if keymap.matches(evt, "post_action"):
             self.onPostAction()
             return
-        if evt.AltDown() and keyCode == ord("U"):
+        if keymap.matches(evt, "user_action"):
             self.onUserAction()
             return
-        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "copy_row") and inList:
             self._copyFocusedPostRow()
             return
-        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "jump_row") and inList:
             uiutil.jump_to_row(self, self.postList)
+            return
+        if inList and self.runCustomShortcut(evt, self._getFocusedPost()):
             return
         evt.Skip()
 
@@ -944,7 +949,7 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
                 message = None
             wx.CallAfter(self._onLikeSynced, post, message, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     def _copyPostText(self, post):
         self._copyToClipboard(post.get("text", ""))
@@ -981,7 +986,7 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
                 error = str(e)
             wx.CallAfter(self._onDetachDone, quotingPost, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onDetachDone(self, quotingPost, error):
@@ -1008,6 +1013,7 @@ class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, U
 
     SUPPORTS_FOCUS_NEXT_UNREAD = True
     SUPPORTS_SELECT_ALL = True
+    VIRTUAL_LIST = True
 
     def __init__(self, parent, did: str, owner_label: str, origin_key: str = None):
         super().__init__(parent)
@@ -1042,6 +1048,7 @@ class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, U
         if self._account is not None:
             db.remove_open_temp_tab(self._account["id"], "user_timeline", self._did)
             db.clear_feed_key_cache(self._account["id"], self._feedKey)
+            db.clear_feed_key_cache(self._account["id"], client.pin_feed_key(self._did))
         self._jumpBackToOrigin()
 
     def _getActionablePost(self):
@@ -1052,7 +1059,33 @@ class UserTimelineTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, U
         return post
 
     def _dbGetPage(self, before_indexed_at=None, limit=None):
-        return db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
+        posts = db.get_feed_page(self._account["id"], self._feedKey, before_indexed_at=before_indexed_at, limit=limit)
+        if before_indexed_at is not None or limit is not None:
+            return posts  # pagination probes and top-of-feed checks ignore the pin
+        pins = db.get_feed_page(self._account["id"], client.pin_feed_key(self._did), limit=1)
+        if not pins:
+            return posts
+        pinned = dict(pins[0])
+        pinned["_pinned"] = True
+        # Keeps the pin out of _loadMore's "oldest loaded post" minimum.
+        pinned["feed_indexed_at"] = "9999-12-31T23:59:59.999Z"
+        return [pinned] + [p for p in posts if p["uri"] != pinned["uri"]]
+
+    def _applySortOrder(self, posts):
+        # The pin stays first whatever the sort order.
+        pinned = [p for p in posts if p.get("_pinned")]
+        return pinned + super()._applySortOrder([p for p in posts if not p.get("_pinned")])
+
+    def _rowCells(self, post, mode):
+        cells = super()._rowCells(post, mode)
+        if post.get("_pinned"):
+            # Translators: Prefix on a user's pinned post in their timeline tab. {} is the post text.
+            cells[2] = _("Pinned: {}").format(cells[2])
+        return cells
+
+    def _doClearCache(self):
+        db.clear_feed_key_cache(self._account["id"], client.pin_feed_key(self._did))
+        super()._doClearCache()
 
     def _dbGetUnreadCount(self):
         return db.get_unread_count(self._account["id"], self._feedKey)
@@ -1097,6 +1130,7 @@ class FeedPreviewTabWindow(RemovableTabMixin, FeedListMixin, ItemActionMixin, Us
 
     SUPPORTS_FOCUS_NEXT_UNREAD = True
     SUPPORTS_SELECT_ALL = True
+    VIRTUAL_LIST = True
 
     def __init__(self, parent, tab_name: str, kind: str, source_key: str, filters: dict = None, feed_key: str = None, origin_key: str = None):
         super().__init__(parent)
@@ -1211,6 +1245,7 @@ class SavedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
     """Saved posts (bookmarks): feed_key "saved" via sync_saved(). Unsaving a post removes its row (_onBookmarkChanged)."""
 
     TAB_KEY = "saved"
+    VIRTUAL_LIST = True
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -1284,6 +1319,7 @@ class LikesWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
     """Posts the active account liked, newest like first. Optional permanent tab."""
 
     TAB_KEY = "likes"
+    VIRTUAL_LIST = True
 
     def __init__(self, parent):
         super().__init__(parent)

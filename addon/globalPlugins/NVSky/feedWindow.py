@@ -10,10 +10,9 @@ userActions.py/itemActions.py/embedView.py and are re-exported here, so
 import core
 import datetime
 import json
-import threading
+import urllib.parse
 import wx
 import speech
-
 import gui
 from logHandler import log
 import ui as nvdaUi
@@ -23,6 +22,7 @@ from . import client
 from . import timeutils
 from . import uiutil
 from . import soundpack
+from . import keymap
 from .compose import ComposeDialog, CONTENT_LABEL_DISPLAY_NAMES
 from .userActions import UserActionMixin, UserListMixin
 from .itemActions import ItemActionMixin
@@ -32,7 +32,6 @@ PAGE_SIZE = 50
 MAX_NETWORK_PAGE_WALK = 5
 
 COLUMN_DISPLAY_NAME = "display_name"
-COLUMN_HANDLE = "handle"
 
 # Translators: Permanent tab label for the Home feed.
 TAB_NAME = _("Home")
@@ -73,6 +72,14 @@ def _format_post_time(iso_timestamp: str) -> str:
     return timeutils.format_timestamp(iso_timestamp, mode=mode, custom_pattern=pattern)
 
 
+def _is_gif_url(url) -> bool:
+    # The GIF picker posts a Tenor media address as an external embed.
+    if not url:
+        return False
+    parsed = urllib.parse.urlparse(url)
+    return parsed.netloc.lower() == "media.tenor.com" or parsed.path.lower().endswith(".gif")
+
+
 def _embed_sound_event(embed_json: str):
     """Maps an embed's $type to a soundpack event key, or None. A quote
     with attached media plays the media's sound (image/video/link)."""
@@ -89,7 +96,7 @@ def _embed_sound_event(embed_json: str):
         if embed.get("video_url") or embed.get("video_alt") is not None:
             return "embed_video"
         if embed.get("link_url"):
-            return "embed_link"
+            return "embed_gif" if _is_gif_url(embed["link_url"]) else "embed_link"
         return "embed_quote"
     if "images" in embed_type or "gallery" in embed_type:
         return "embed_image"
@@ -98,7 +105,7 @@ def _embed_sound_event(embed_json: str):
     if "record" in embed_type:
         return "embed_quote"
     if "external" in embed_type:
-        return "embed_link"
+        return "embed_gif" if _is_gif_url(embed.get("link_url")) else "embed_link"
     return None
 
 
@@ -135,6 +142,9 @@ def _describe_embed(embed_json: str) -> str:
             # Translators: Embed summary for a quote post that also carries an attached video.
             return _("Quote + video")
         if embed.get("link_url"):
+            if _is_gif_url(embed["link_url"]):
+                # Translators: Embed summary for a quote post that also carries an animated GIF.
+                return _("Quote + animated GIF")
             # Translators: Embed summary for a quote post that also carries a link-preview card.
             return _("Quote + link")
         # Translators: Fallback embed summary for a quote post with media whose type couldn't be determined.
@@ -143,6 +153,11 @@ def _describe_embed(embed_json: str) -> str:
         # Translators: Embed summary for a plain quote post.
         return _("Quote post")
     if "external" in embed_type:
+        if _is_gif_url(embed.get("link_url")):
+            gifTitle = embed.get("link_title")
+            # Translators: Embed summary for a post with an animated GIF, showing its description. {} is the description.
+            # Translators: Embed summary for a post with an animated GIF and no description.
+            return _("Animated GIF: {}").format(gifTitle) if gifTitle else _("Animated GIF")
         # Translators: Embed summary for a post with a link-preview card.
         return _("Link")
     return ""
@@ -288,6 +303,21 @@ def sync_like_state(post: dict, account_id: int):
             panel._loadFromCache(reset=True)
 
 
+class _VirtualPostList(wx.ListCtrl):
+    """A report list that holds no rows itself: the host supplies a cell's text when it is drawn or read."""
+
+    def __init__(self, parent, cellText):
+        super().__init__(parent, style=wx.LC_REPORT | wx.LC_VIRTUAL)
+        self._cellText = cellText
+
+    def OnGetItemText(self, item, col):
+        return self._cellText(item, col)
+
+    def DeleteAllItems(self):
+        self.SetItemCount(0)
+        return True
+
+
 class RemovableTabMixin:
     """
     Shared behavior for removable temp tabs: the "<TAB_NAME> - NVSky -
@@ -356,6 +386,8 @@ class FeedListMixin:
         self._loadingTimer = None
         self._checkingUpdates = False
         self._suppressFocusEvents = False
+        self._cellCache = {}  # virtual list only: row index -> cell texts, built when first asked for
+        self._cellMode = COLUMN_DISPLAY_NAME
         # Only meaningful for hosts with SUPPORTS_JUMP_TO_USER = True,
         # but harmless to always set -- keeps _jumpToUserPost/
         # onItemFocused from needing a getattr(..., False) fallback.
@@ -374,6 +406,8 @@ class FeedListMixin:
     # Index of the time column: 3 for the standard layout; hosts with other
     # layouts override it (SetItem on a missing column crashes NVDA).
     TIME_COLUMN_INDEX = 3
+    # True: the post list is a _VirtualPostList (needs _rowCells for the host's row layout).
+    VIRTUAL_LIST = False
 
     def _onTimeRefreshTick(self, evt):
         # Absolute/custom modes print the same string every time --
@@ -385,13 +419,16 @@ class FeedListMixin:
             return
         if not self.postList.IsShownOnScreen():
             return
+        if self.VIRTUAL_LIST:
+            for index, cells in self._cellCache.items():
+                if index < len(self._posts) and len(cells) > self.TIME_COLUMN_INDEX:
+                    cells[self.TIME_COLUMN_INDEX] = _format_post_time(self._posts[index].get("indexed_at"))
+            count = min(len(self._posts), self.postList.GetItemCount())
+            if count:
+                self.postList.RefreshItems(0, count - 1)
+            return
         for i, post in enumerate(self._posts):
             self.postList.SetItem(i, self.TIME_COLUMN_INDEX, _format_post_time(post.get("indexed_at")))
-
-    def _stopTimeRefreshTimer(self):
-        timer = getattr(self, "_timeRefreshTimer", None)
-        if timer is not None:
-            timer.Stop()
 
     def _updateTitle(self):
         # Translators: Fallback account label in the window title when no account is active.
@@ -475,30 +512,29 @@ class FeedListMixin:
 
     def _buildStandardFeedSizer(self, extra_top=None, extra_action_widgets=None):
         """
-        Standard feed-tab layout: optional extra_top row above postList,
-        postList itself, Post action/User action buttons (+ optional
-        extra_action_widgets after them), statusBar. Calls self.SetSizer().
-        Was byte-for-byte duplicated across SavedWindow/ListTabWindow/
-        FeedPreviewTabWindow/FeedWindow before this (see plan-13.md).
-        extra_top: a wx.Sizer to place above postList (e.g. FeedWindow's
-        filter-choice row).
-        extra_action_widgets: list of wx.Window added to the action row
-        after userActionButton (e.g. "Add to my feeds").
+        Standard feed-tab layout: optional extra_top row above postList, postList, Post action/User
+        action buttons (+ optional extra_action_widgets after them), statusBar. Calls
+        self.SetSizer(). extra_top: a wx.Sizer above postList (e.g. FeedWindow's filter-choice row).
+        extra_action_widgets: wx.Window objects added to the action row after userActionButton (e.g.
+        "Add to my feeds").
         """
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         if extra_top is not None:
             sizer.Add(extra_top, flag=wx.ALL, border=10)
 
-        self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
+        if self.VIRTUAL_LIST:
+            self.postList = _VirtualPostList(self, self._cellAt)
+        else:
+            self.postList = wx.ListCtrl(self, style=wx.LC_REPORT)
         self._buildFeedListColumns()
         sizer.Add(self.postList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to open the Post action menu. Shows the Alt+A shortcut.
-        self.postActionButton = wx.Button(self, label=_("&Post action... (Alt+A)"))
-        # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
-        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
+        # Translators: Button to open the Post action menu. The current shortcut is appended automatically.
+        self.postActionButton = wx.Button(self, label=_("&Post action...") + keymap.hint("post_action"))
+        # Translators: Button to open the User action menu. The current shortcut is appended automatically.
+        self.userActionButton = wx.Button(self, label=_("&User action...") + keymap.hint("user_action"))
         actionRow.Add(self.postActionButton, flag=wx.RIGHT, border=5)
         actionRow.Add(self.userActionButton)
         if extra_action_widgets:
@@ -542,12 +578,58 @@ class FeedListMixin:
         if getattr(self, "TAB_KEY", None) == "home":
             db.set_home_active_filter(self._account["id"], self._feedKey)
 
+    def _rowCells(self, post: dict, mode: str):
+        # Default row layout (Embed/Author/Message/Posted). A host with its own _insertRow needs its own _rowCells to go virtual.
+        return [
+            _visible_embed_text(post),
+            self._authorLabel(post, mode),
+            _visible_message_text(post),
+            _format_post_time(post.get("indexed_at")),
+        ]
+
     def _insertRow(self, index: int, post: dict, mode: str):
-        # Default row layout (Embed/Author/Message/Posted); NotificationsWindow overrides it.
-        self.postList.InsertItem(index, _visible_embed_text(post))
-        self.postList.SetItem(index, 1, self._authorLabel(post, mode))
-        self.postList.SetItem(index, 2, _visible_message_text(post))
-        self.postList.SetItem(index, 3, _format_post_time(post.get("indexed_at")))
+        # NotificationsWindow overrides it.
+        cells = self._rowCells(post, mode)
+        self.postList.InsertItem(index, cells[0])
+        for col in range(1, len(cells)):
+            self.postList.SetItem(index, col, cells[col])
+
+    def _cellsAt(self, index):
+        cells = self._cellCache.get(index)
+        if cells is None:
+            cells = self._cellCache[index] = self._rowCells(self._posts[index], self._cellMode)
+        return cells
+
+    def _cellAt(self, index, col):
+        # The virtual list calls this for every cell it draws or is asked to read.
+        if not 0 <= index < len(self._posts):
+            return ""
+        cells = self._cellsAt(index)
+        return cells[col] if col < len(cells) else ""
+
+    def _rowParts(self, index):
+        if self.VIRTUAL_LIST:
+            return list(self._cellsAt(index))
+        return [self.postList.GetItemText(index, col) for col in range(self.postList.GetColumnCount())]
+
+    def _setCell(self, index, col, text):
+        if not self.VIRTUAL_LIST:
+            self.postList.SetItem(index, col, text)
+            return
+        cells = list(self._cellsAt(index))
+        cells[col] = text
+        self._cellCache[index] = cells
+        self.postList.RefreshItem(index)
+
+    def _clearSelection(self, keep=None):
+        selected = []
+        i = self.postList.GetFirstSelected()
+        while i != -1:
+            selected.append(i)
+            i = self.postList.GetNextSelected(i)
+        for i in selected:
+            if i != keep:
+                self.postList.SetItemState(i, 0, wx.LIST_STATE_SELECTED)
 
     def _render(self):
         # Sorted here (not just at fetch time) so switching the setting
@@ -565,9 +647,17 @@ class FeedListMixin:
         self.postList.Freeze()
         self._suppressFocusEvents = True
         try:
-            self.postList.DeleteAllItems()
-            for i, post in enumerate(self._posts):
-                self._insertRow(i, post, mode)
+            if self.VIRTUAL_LIST:
+                self._cellMode = mode
+                self._cellCache = {}
+                self._clearSelection()
+                self.postList.SetItemCount(len(self._posts))
+                if self._posts:
+                    self.postList.RefreshItems(0, len(self._posts) - 1)
+            else:
+                self.postList.DeleteAllItems()
+                for i, post in enumerate(self._posts):
+                    self._insertRow(i, post, mode)
 
             restored = False
             if focusedUri:
@@ -611,14 +701,8 @@ class FeedListMixin:
         # MainWindow already uses to hide Remove current tab on
         # permanent tabs.
         #
-        # Also Disable(), not just Hide() -- CONFIRMED bug elsewhere
-        # (ChatWindow's Accept button): a Hide()-only wx.Button still
-        # fires its own mnemonic (Alt+A/Alt+U here) even while
-        # invisible, since wx dispatches mnemonics to any control that
-        # is merely non-shown but still enabled. Alt+A/Alt+U are
-        # global shortcuts used everywhere in this app, so a stray
-        # hidden-but-enabled instance is a real risk of a silent
-        # duplicate/wrong-target trigger on any empty list.
+        # Disable() too, not just Hide(): a hidden but enabled button still fires its mnemonic
+        # (Alt+A/Alt+U), a silent wrong-target trigger on an empty list.
         hasItems = bool(self._posts)
         for buttonName in ("postActionButton", "userActionButton"):
             button = getattr(self, buttonName, None)
@@ -655,9 +739,7 @@ class FeedListMixin:
         # repeated per tab and occasionally forgotten -- the exact
         # class of bug already hit twice over in Chat.
         if uiutil.move_focus_and_check_announce(self.postList, index):
-            columnCount = self.postList.GetColumnCount()
-            parts = [self.postList.GetItemText(index, col) for col in range(columnCount)]
-            nvdaUi.message(", ".join(p for p in parts if p))
+            nvdaUi.message(", ".join(p for p in self._rowParts(index) if p))
         post = self._posts[index]
         if not post.get("is_read"):
             self._markItemRead(post)
@@ -696,9 +778,7 @@ class FeedListMixin:
             if self._posts:
                 # Select() only adds; clear other selections so Alt+A/Alt+U
                 # don't see a multi-selection.
-                for i in range(self.postList.GetItemCount()):
-                    if i != targetIndex and self.postList.GetItemState(i, wx.LIST_STATE_SELECTED):
-                        self.postList.SetItemState(i, 0, wx.LIST_STATE_SELECTED)
+                self._clearSelection(keep=targetIndex)
                 self.postList.Focus(targetIndex)
                 self.postList.Select(targetIndex)
                 self.postList.EnsureVisible(targetIndex)
@@ -762,9 +842,7 @@ class FeedListMixin:
             if not self._posts[i].get("is_read"):
                 post = self._posts[i]
                 if uiutil.move_focus_and_check_announce(self.postList, i):
-                    columnCount = self.postList.GetColumnCount()
-                    parts = [self.postList.GetItemText(i, col) for col in range(columnCount)]
-                    nvdaUi.message(", ".join(p for p in parts if p))
+                    nvdaUi.message(", ".join(p for p in self._rowParts(i) if p))
                 self._markItemRead(post)
                 post["is_read"] = 1
                 self._updateStatusBar()
@@ -822,7 +900,7 @@ class FeedListMixin:
 
             wx.CallAfter(self._onLoadMoreDone, foundOlder, error, cursor)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onLoadMoreDone(self, foundOlder, error, cursor):
@@ -859,7 +937,7 @@ class FeedListMixin:
             # exhausted since the cursor is still valid, so press
             # Shift+F5 again to keep looking further back.
             # Translators: Announced when no new older posts were found in the pages walked so far. {} is the tab name.
-            nvdaUi.message(_("No older {} posts found nearby -- press Shift+F5 again to keep looking back.").format(self.TAB_NAME))
+            nvdaUi.message(_("No older {} posts found nearby -- load older posts again to keep looking back.").format(self.TAB_NAME))
         else:
             soundpack.play("boundary")
             # Translators: Announced when there are no more older posts to load at all. {} is the tab name.
@@ -905,7 +983,7 @@ class FeedListMixin:
                 error = str(e)
             wx.CallAfter(self._onInitialSyncDone, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onInitialSyncDone(self, error):
@@ -944,7 +1022,7 @@ class FeedListMixin:
                 error = str(e)
             wx.CallAfter(self._onCheckForUpdatesDone, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback
     def _onCheckForUpdatesDone(self, error):
@@ -956,15 +1034,17 @@ class FeedListMixin:
             nvdaUi.message(_("Check for updates failed: {}").format(error))
             return
 
-        oldTopUri = self._posts[0]["uri"] if self._posts else None
+        # A pinned post (user timelines) always sits first and is never "new".
+        oldTopUri = next((p["uri"] for p in self._posts if not p.get("_pinned")), None)
         self._loadFromCache(reset=True)
         self._restoreFocusPosition()
 
+        regular = [p for p in self._posts if not p.get("_pinned")]
         if oldTopUri is None:
-            newCount = len(self._posts)
+            newCount = len(regular)
         else:
             newCount = 0
-            for post in self._posts:
+            for post in regular:
                 if post["uri"] == oldTopUri:
                     break
                 newCount += 1
@@ -1028,62 +1108,68 @@ class FeedListMixin:
 
     def onCharHook(self, evt):
         keyCode = evt.GetKeyCode()
+        inList = self.FindFocus() is self.postList
 
-        if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers() and self.FindFocus() is self.postList:
+        if keyCode in (wx.WXK_UP, wx.WXK_DOWN) and not evt.HasAnyModifiers() and inList:
             self._checkListBoundaryBeforeKey(keyCode)
-        if evt.ControlDown() and keyCode == wx.WXK_DELETE:
+        if keymap.matches(evt, "clear_cache"):
             self.onClearCache()
             return
-        if keyCode == wx.WXK_DELETE and not evt.HasAnyModifiers() and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "delete_post") and inList:
             self.onDeletePostShortcut()
             return
-        if keyCode == wx.WXK_F5 and evt.ControlDown():
+        if keymap.matches(evt, "check_all"):
             evt.Skip()  # bubble up to MainWindow's checkAllOpenTabs
             return
-        if keyCode == wx.WXK_F5 and evt.ShiftDown():
+        if keymap.matches(evt, "load_older"):
             self.onFetchPreviousPosts(None)
             return
-        if keyCode == wx.WXK_F5:
+        if keymap.matches(evt, "check_updates"):
             self.onCheckForUpdates(None)
             return
-        if evt.ControlDown() and keyCode == ord("N") and getattr(self, "SUPPORTS_NEW_POST", False):
+        if keymap.matches(evt, "new_item") and getattr(self, "SUPPORTS_NEW_POST", False):
             self.onNewPost(None)
             return
-        if evt.AltDown() and keyCode == ord("A"):
+        if keymap.matches(evt, "post_action"):
             self.onPostAction()
             return
         if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
             self._onAltNumber(keyCode - ord("0"))
             return
-        if evt.AltDown() and keyCode == ord("U"):
+        if keymap.matches(evt, "user_action"):
             self._onAltU()
             return
-        if keyCode == ord("C") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown():
+        if keymap.matches(evt, "copy_row"):
             focused = self.FindFocus()
             if focused is self.postList:
                 self._copyFocusedPostRow()
                 return
             if isinstance(focused, (wx.ListCtrl, wx.TreeCtrl)) and uiutil.copy_focused_row(focused):
                 return
-        if keyCode == ord("J") and evt.ControlDown() and not evt.ShiftDown() and not evt.AltDown():
+        if keymap.matches(evt, "jump_row"):
             focused = self.FindFocus()
             if isinstance(focused, wx.ListCtrl):
-                uiutil.jump_to_row(self, focused)
+                rowText = None
+                if self.VIRTUAL_LIST and focused is self.postList:
+                    rowText = lambda index: ", ".join(p for p in self._rowParts(index) if p)
+                uiutil.jump_to_row(self, focused, row_text=rowText)
                 return
-        if keyCode == wx.WXK_SPACE and evt.ControlDown() and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "reveal_warning") and inList:
             self._revealContentWarning()
             return
-        if keyCode == wx.WXK_SPACE and not evt.ControlDown() and getattr(self, "SUPPORTS_FOCUS_NEXT_UNREAD", False) and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "next_unread") and getattr(self, "SUPPORTS_FOCUS_NEXT_UNREAD", False) and inList:
             self._focusNextUnread()
             return
-        if evt.ControlDown() and keyCode == ord("A") and getattr(self, "SUPPORTS_SELECT_ALL", False) and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "select_all") and getattr(self, "SUPPORTS_SELECT_ALL", False) and inList:
             self._selectAllPosts()
             return
-        if keyCode == wx.WXK_LEFT and not evt.HasAnyModifiers() and getattr(self, "SUPPORTS_JUMP_TO_USER", False) and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "jump_user_previous") and getattr(self, "SUPPORTS_JUMP_TO_USER", False) and inList:
             self._jumpToUserPost(-1)
             return
-        if keyCode == wx.WXK_RIGHT and not evt.HasAnyModifiers() and getattr(self, "SUPPORTS_JUMP_TO_USER", False) and self.FindFocus() is self.postList:
+        if keymap.matches(evt, "jump_user_next") and getattr(self, "SUPPORTS_JUMP_TO_USER", False) and inList:
             self._jumpToUserPost(1)
+            return
+        if inList and callable(getattr(self, "runCustomShortcut", None)) and self.runCustomShortcut(evt, self._getFocusedPost()):
             return
 
         evt.Skip()
@@ -1121,8 +1207,8 @@ class FeedListMixin:
         matchedNames = _matched_label_names(post)
         revealedEmbedText = f"{CONTENT_WARNING_EMBED_TEXT}, {realEmbedText}" if realEmbedText else CONTENT_WARNING_EMBED_TEXT
         revealedMessageText = f"{CONTENT_WARNING_MESSAGE_TEXT.format(matchedNames)} {realMessageText}".strip()
-        self.postList.SetItem(index, 0, revealedEmbedText)
-        self.postList.SetItem(index, 2, revealedMessageText)
+        self._setCell(index, 0, revealedEmbedText)
+        self._setCell(index, 2, revealedMessageText)
         nvdaUi.message(", ".join(p for p in [revealedEmbedText, revealedMessageText] if p))
 
     def _checkListBoundaryBeforeKey(self, keyCode):
@@ -1154,10 +1240,8 @@ class FeedListMixin:
         self.onUserAction()
 
     # ---------------- Left/Right jump-to-user (SUPPORTS_JUMP_TO_USER) ----------------
-    # Moved here from FeedWindow (see plan-09.md) so ListsWindow can
-    # opt in via the SUPPORTS_JUMP_TO_USER flag too -- logic itself was
-    # already fully generic (self._posts/self.postList only), nothing
-    # FeedWindow-specific.
+    # Shared so any host can opt in via SUPPORTS_JUMP_TO_USER (only self._posts/self.postList are
+    # used).
 
     def _postInvolvesUser(self, post, did):
         if (
@@ -1218,9 +1302,7 @@ class FeedListMixin:
                     # Without this, repeated jumps left multiple rows
                     # selected at once, so Post action (Alt+A) wrongly
                     # treated it as a bulk selection.
-                    for j in range(self.postList.GetItemCount()):
-                        if j != i and self.postList.GetItemState(j, wx.LIST_STATE_SELECTED):
-                            self.postList.SetItemState(j, 0, wx.LIST_STATE_SELECTED)
+                    self._clearSelection(keep=i)
                     self.postList.Focus(i)
                     self.postList.Select(i)
                     self.postList.EnsureVisible(i)
@@ -1241,6 +1323,7 @@ class FeedListMixin:
 
 class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin, wx.Panel):
     TAB_KEY = "home"  # for MainWindow's remember-last-tab feature
+    VIRTUAL_LIST = True
     SUPPORTS_NEW_POST = True
     SUPPORTS_FOCUS_NEXT_UNREAD = True
     SUPPORTS_SELECT_ALL = True
@@ -1317,14 +1400,8 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
             self._filterChoiceMap[1] = ("discover", None)
             for i, feed in enumerate(savedFeeds, start=2):
                 self.filterChoice.Append(feed["display_name"])
-                # feed_key == the raw feed uri, matching how
-                # client.sync_feed_generator_page's _store_feed_item
-                # actually keys its DB writes (confirmed by reading
-                # client.py) -- an earlier "feed:{uri}" prefix here
-                # meant _dbGetPage was reading a completely different
-                # cache entry than _syncPage ever wrote to, so a
-                # custom feed's cache always looked empty and forced a
-                # fresh server sync on every single filter switch.
+                # feed_key is the raw feed uri, matching how sync_feed_generator_page keys its DB
+                # writes (a prefix would read a different cache entry).
                 self._filterChoiceMap[i] = (feed["uri"], feed["uri"])
 
             selectIndex = 0
@@ -1356,11 +1433,7 @@ class FeedWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixin
 
         self._feedKey = feedKey
         self._loadFromCache(reset=True)
-        # Show cache immediately; only actually hit the server if this
-        # feed has never been synced before (empty cache) -- switching
-        # back and forth between filters used to force a fresh
-        # re-fetch every single time, which is both slow and pointless
-        # once a feed already has a cache to show.
+        # Show the cache at once; only sync when this feed has no cache yet.
         self._syncIfCacheEmpty()
         if self._account is not None:
             db.set_home_active_filter(self._account["id"], self._feedKey)

@@ -27,7 +27,7 @@ Features:
     "addon_url": "https://github.com/NVDATH/NVSky",
     "addon_docFileName": "readme.html",
     "addon_minimumNVDAVersion": "2026.1",
-    "addon_lastTestedNVDAVersion": "2026.2",
+    "addon_lastTestedNVDAVersion": "2026.3",
     "addon_updateChannel": "stable",
     # Translators: What's new text for this add-on version, shown in NVDA's Add-on Store.
     # NOTE: content between the CHANGELOG markers below is auto-replaced by
@@ -52,6 +52,15 @@ i18nSources = [
 docFiles = ["readme.html"]
 
 tests = []
-excludedFiles = []
+# fnmatch patterns relative to addon/, written with "/".
+excludedFiles = [
+    "globalPlugins/NVSky/diagnostics.py",
+    "globalPlugins/NVSky/libswap.py",
+    "globalPlugins/NVSky/__pycache__/diagnostics*.pyc",
+    "globalPlugins/NVSky/__pycache__/libswap*.pyc",
+    "globalPlugins/NVSky/lib/versions.json",
+    "globalPlugins/NVSky/lib.new/*",
+    "globalPlugins/NVSky/_upgrade/*",
+]
 baseLanguage = "en"
 markdownExtensions = []

@@ -10,6 +10,7 @@ import ui as nvdaUi
 from . import db
 from . import client
 from . import uiutil
+from . import keymap
 from .feedWindow import UserActionMixin, UserListMixin
 
 
@@ -52,8 +53,8 @@ class PeopleWindow(UserActionMixin, UserListMixin, wx.Panel):
         sizer.Add(self.userList, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
-        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
+        # Translators: Button to open the User action menu. The current shortcut is appended automatically.
+        self.userActionButton = wx.Button(self, label=_("&User action...") + keymap.hint("user_action"))
         # Translators: Button to open the current People list in its own removable tab.
         self.openTabButton = wx.Button(self, label=_("Open in new &tab"))
         actionRow.Add(self.userActionButton, flag=wx.RIGHT, border=5)

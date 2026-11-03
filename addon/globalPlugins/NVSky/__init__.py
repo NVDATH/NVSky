@@ -4,9 +4,18 @@ import json
 import queue
 import threading
 
-# Add our own lib/ folder to sys.path FIRST (insert at index 0).
 _addonDir = os.path.dirname(__file__)
 _libDir = os.path.join(_addonDir, "lib")
+
+# Developer-only: libswap.py is left out of release builds.
+try:
+    from . import libswap
+except ImportError:
+    pass
+else:
+    libswap.apply_pending(_addonDir, _libDir)
+
+# Add our own lib/ folder to sys.path FIRST (insert at index 0).
 if _libDir not in sys.path:
     sys.path.insert(0, _libDir)
 
@@ -28,6 +37,7 @@ from . import uiutil
 from . import soundpack
 from . import attachments
 from . import jetstream
+from . import timeutils
 from .settings import NVSkySettingsDialog, LoginDialog
 from .feedWindow import *
 from .notificationsWindow import NotificationsWindow
@@ -39,6 +49,10 @@ from .mainWindow import MainWindow
 from .chatWindow import ChatWindow, ConvoTabWindow
 from .compose import ComposeDialog
 from . import tray
+from . import autoread
+from . import keymap
+
+keymap.configure(lambda: db.get_ui_state("keymap"), lambda text: db.set_ui_state("keymap", text))
 
 BG_SYNC_TICK_MS = 60_000  # check once a minute which categories are due
 
@@ -53,12 +67,8 @@ _activePlugin = None
 
 def rebuild_main_window_tabs(focus=False):
     """
-    Tells an already-open MainWindow to rebuild every tab against
-    whatever account is active now. Confirmed necessary via testing:
-    AccountsPanel's onSetActive/onAdd (mainWindow.py) only ever updated
-    Settings' own Profile/Muted words panels -- an open MainWindow's
-    tabs (each of which cached self._account once, at construction)
-    never found out an account had changed at all.
+    Tells an already-open MainWindow to rebuild every tab against whatever account is active now
+    (each tab caches its account when it is constructed).
     """
     if _activePlugin is not None:
         _activePlugin._rebuildTabs(focus)
@@ -101,11 +111,41 @@ def set_jetstream_enabled_runtime(enabled: bool):
         _activePlugin._stopJetstream()
 
 
+def _next_account_id(accounts, activeId, delta):
+    """Id of the account `delta` places after the active one (wraps); None with fewer than two accounts."""
+    if len(accounts) < 2:
+        return None
+    ids = [a["id"] for a in accounts]
+    start = ids.index(activeId) if activeId in ids else 0
+    return ids[(start + delta) % len(ids)]
+
+
+def switch_account(account_id):
+    if _activePlugin is not None:
+        return _activePlugin.switch_account(account_id)
+    return False
+
+
+def cycle_account(delta):
+    if _activePlugin is not None:
+        _activePlugin.cycle_account(delta)
+
+
+_trayTimer = None
+TRAY_DEBOUNCE_MS = 300
+
+
 def refresh_tray():
     """Accessor for code with no GlobalPlugin reference (e.g. FeedWindow):
-    re-reads the Home unread count and updates the notification area icon."""
-    if _activePlugin is not None:
-        _activePlugin._refreshTray()
+    re-reads the unread counts and updates the notification area icon.
+    Calls within TRAY_DEBOUNCE_MS share one refresh, which reads the counts when it runs."""
+    global _trayTimer
+    plugin = _activePlugin
+    if plugin is None:
+        return
+    if _trayTimer is not None and _trayTimer.IsRunning():
+        return
+    _trayTimer = wx.CallLater(TRAY_DEBOUNCE_MS, plugin._refreshTray)
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -122,6 +162,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._initDatabase()
         attachments.cleanup_old_temp_files()
         self._terminating = False
+        self._autoReader = autoread.AutoReader()
         self._mainWindow = None
         self._settingsDialog = None
         self._jetstreamClient = None
@@ -162,6 +203,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._bgSyncTimer.Stop()
         except Exception:
             pass
+        try:
+            self._autoReader.terminate()
+        except Exception:
+            pass
         self._stopJetstream()
         self._removeTray()
         self._terminating = True
@@ -196,12 +241,24 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if skip:
             return
         nextHandler()
+        self._autoReader.onGainFocus(obj)
         if rowText:
             # After Ctrl+J: drop NVDA's own announcement (parent controls) and speak just the row.
             speech.cancelSpeech()
             ui.message(rowText)
 
+    def chooseNVDAObjectOverlayClasses(self, obj, clsList):
+        # Called for every object NVDA creates; see tray.choose_overlay.
+        try:
+            tray.choose_overlay(obj, clsList)
+        except Exception:
+            log.debugWarning("NVSky: could not choose the overlay of an object", exc_info=True)
+
     def _checkLibs(self):
+        # On a worker thread: importing atproto takes ~0.7 s and would hold up NVDA's start.
+        threading.Thread(target=self._checkLibsWorker, daemon=True).start()
+
+    def _checkLibsWorker(self):
         libsToCheck = [
             "atproto", "httpx", "pydantic", "libipld",
             "cryptography", "websockets", "cffi",
@@ -215,7 +272,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
         if failed:
             log.error("NVSky: lib import failed:\n" + "\n".join(failed))
-            ui.message(_("NVSky failed to load required libraries. Check the NVDA log for details."))
+            wx.CallAfter(ui.message, _("NVSky failed to load required libraries. Check the NVDA log for details."))
 
     def _initDatabase(self):
         try:
@@ -241,6 +298,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Settings > Accounts after cancelling the standalone
         # LoginDialog), there's nothing to rebuild -- open it fresh
         # instead, same as the direct first-login path.
+        # Sounds and the time format are per-account settings: load the active account's.
+        self._autoReader.stop("quiet")
+        timeutils.invalidate_time_format_cache()
+        soundpack.reload()
         if self._mainWindow is None:
             self._openMainWindow()
             self._runInitialFullSync()
@@ -248,6 +309,40 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._rebuildTabs()
         self._restartJetstreamIfRunning()
         self._refreshTray()
+
+    def switch_account(self, account_id, after_menu=False):
+        """The one way to change the active account from outside the Settings accounts page."""
+        if not db.account_exists(account_id) or account_id == db.current_account_id():
+            return False
+        dialog = self._settingsDialog
+
+        def proceed():
+            db.set_active_account(account_id)
+            self._onSettingsAccountChanged()
+            if dialog is not None and self._settingsDialog is dialog:
+                dialog.accountSwitchedExternally()
+            account = db.get_active_account()
+            if account is not None:
+                # Translators: Announced after switching the active account. {} is the account handle.
+                text = _("{} is now the active account.").format(account["handle"])
+                if after_menu:
+                    uiutil.announce_after_menu(text)
+                else:
+                    nvdaUi.message(text)
+
+        if dialog is not None:
+            dialog._applyBeforeSwitch(proceed)  # saves the edits made for the account being left first
+        else:
+            proceed()
+        return True
+
+    def cycle_account(self, delta):
+        target = _next_account_id(db.get_all_accounts(), db.current_account_id(), delta)
+        if target is None:
+            # Translators: Announced when a switch-account command is used with only one account.
+            nvdaUi.message(_("There is only one account."))
+            return
+        self.switch_account(target)
 
     def _onSettingsDialogClosed(self, evt):
         # NVSkySettingsDialog.onClose already calls gui.mainFrame.postPopup()
@@ -280,11 +375,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         Returns the active account (or None).
         """
         account = db.get_active_account()
-        # LOW CONFIDENCE: chat_supported is set once at login time via
-        # client.check_chat_supported (a probe call, not a documented
-        # capability flag -- see its docstring). Defaults to True/1 for
-        # an account that predates this column, or when nothing is
-        # logged in yet, so nothing changes for the common case.
+        # chat_supported is set at login by client.check_chat_supported (a probe, not a documented
+        # flag). It defaults to True for an account without the column or when nobody is logged in.
         chatSupported = account is None or bool(account.get("chat_supported", 1))
 
         homeTab = FeedWindow(self._mainWindow.notebook)
@@ -335,9 +427,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     allTabs.append(("list", entry["list_uri"], tempTab, listName, True))
                 elif entry.get("type") == "search_preview":
                     if not entry.get("source_key"):
-                        # Stale entry from before "source_key" existed
-                        # (used to be "uri"/"query") -- drop it instead
-                        # of crashing every refresh with a None feed/query.
+                        # Entry from an older version without "source_key": drop it.
                         db.remove_open_temp_tab(account["id"], "search_preview", entry.get("key"))
                         continue
                     # Translators: Fallback tab label when a restored search/feed preview tab has no name cached.
@@ -458,47 +548,41 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _onBgSyncTick(self, evt):
         if self._bgSyncRunning:
             return
-        account = db.get_active_account()
-        if account is None:
+        accounts = db.get_all_accounts()
+        due = bgsync.collect_due(bgsync.utc_now(), accounts, *bgsync.db_readers())
+        if not due:
             return
-
-        due = []
-        for category in bgsync.SYNC_FUNCTIONS:
-            intervalMin = db.get_bg_sync_interval(category)
-            if intervalMin <= 0:
-                continue
-            lastSync = db.get_bg_sync_last(account["id"], category)
-            if self._bgSyncDue(lastSync, intervalMin):
-                due.append(category)
-
-        if due:
-            self._runBgSync(account, due)
-
-    def _bgSyncDue(self, lastSyncIso, intervalMinutes):
-        if not lastSyncIso:
-            return True
-        try:
-            import datetime
-            last = datetime.datetime.fromisoformat(lastSyncIso)
-            now = datetime.datetime.now(datetime.timezone.utc)
-            return (now - last).total_seconds() >= intervalMinutes * 60
-        except (ValueError, TypeError):
-            return True
+        accountId, categories = next(iter(bgsync.group_by_account(due).items()))
+        account = next((a for a in accounts if a["id"] == accountId), None)
+        if account is not None:
+            self._runBgSync(account, categories)
 
     def _runBgSync(self, account, categories):
         self._bgSyncRunning = True
+        accountId = account["id"]
 
-        def worker():
+        def run():
             import datetime
             try:
                 atprotoClient = client.get_client_for_active_account()
             except Exception as e:
-                log.error(f"NVSky: background sync login failed: {e}")
+                log.error(f"NVSky: background sync login failed for @{account['handle']}: {e}")
+                # Stamped, so one failing account cannot hold back the others.
+                try:
+                    failedAt = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    for category in categories:
+                        db.set_bg_sync_last(accountId, category, failedAt)
+                except Exception as stampError:
+                    log.error(f"NVSky: stamping a failed background sync failed: {stampError}")
+                db.close_all_connections()
                 wx.CallAfter(self._onBgSyncAllDone)
                 return
 
             try:
+                announceCategories = db.get_bg_sync_announce_categories()
                 for category in categories:
+                    if not db.account_exists(accountId):
+                        break
                     syncFn, needsMyDid = bgsync.SYNC_FUNCTIONS[category]
                     try:
                         if needsMyDid:
@@ -511,27 +595,32 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
                     nowIso = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     db.set_bg_sync_last(account["id"], category, nowIso)
-                    wx.CallAfter(self._onBgSyncCategoryDone, category, changed, names)
+                    wx.CallAfter(
+                        self._onBgSyncCategoryDone, accountId, account["handle"], category, changed, names,
+                        category in announceCategories,
+                    )
             finally:
-                # This worker runs in a FRESH thread every tick (see
-                # _runBgSync) -- db._get_connection() keeps one sqlite
-                # connection alive per thread for the thread's whole
-                # lifetime by design (see its own docstring), so without
-                # explicitly closing it here, every tick leaked one more
-                # zombie connection that never got cleaned up. Confirmed
-                # as the actual cause of the MemoryError/disk I/O error/
-                # resolve_posts-with-no-message crashes seen in testing
-                # -- connections piling up, not a real DB corruption.
+                # A fresh thread runs every tick and keeps one connection per database file open:
+                # close them so they don't pile up.
                 db.close_all_connections()
 
             wx.CallAfter(self._onBgSyncAllDone)
 
+        def worker():
+            try:
+                with db.account_context(accountId):
+                    run()
+            except Exception as e:
+                log.error(f"NVSky: background sync for @{account['handle']} stopped: {e}")
+                wx.CallAfter(self._onBgSyncAllDone)
+
         threading.Thread(target=worker, daemon=True).start()
 
     @uiutil.safe_ui_callback(check_app_closing=False)
-    def _onBgSyncCategoryDone(self, category, changed, names):
+    def _onBgSyncCategoryDone(self, accountId, handle, category, changed, names, announce):
         if not changed:
             return
+        isActive = accountId == db.current_account_id()
         if category in ("home", "notifications", "chat"):
             self._refreshTray()
         # "notification" sound covers every category with genuinely
@@ -539,31 +628,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # post appearing in Home/Lists/Chat/etc while background sync
         # runs deserves the same audible cue.
         soundpack.play("notification")
-        if category in db.get_bg_sync_announce_categories() and names:
+        prefix = f"@{handle}: " if not isActive and len(db.get_all_accounts()) > 1 else ""
+        say = lambda text: nvdaUi.message(prefix + text)
+        if announce and names and not self._autoReader.running:
             if category == "chat":
                 if len(names) == 1:
                     # Translators: Announced when background sync finds a new chat message. {} is the conversation's name.
-                    nvdaUi.message(_("New chat with {}").format(names[0]))
+                    say(_("New chat with {}").format(names[0]))
                 else:
                     # Translators: Announced when background sync finds new chat messages in several conversations. {} is a comma-separated list of conversation names.
-                    nvdaUi.message(_("New chats with {}").format(", ".join(names)))
+                    say(_("New chats with {}").format(", ".join(names)))
             elif len(names) == 1:
                 # Translators: Announced when background sync finds a new post in one feed/list. {} is its name.
-                nvdaUi.message(_("New post in: {}").format(names[0]))
+                say(_("New post in: {}").format(names[0]))
             else:
                 # Translators: Announced when background sync finds new activity in several feeds/lists. {} is a comma-separated list of names.
-                nvdaUi.message(_("New activity: {}").format(", ".join(names)))
-        if self._mainWindow is None:
+                say(_("New activity: {}").format(", ".join(names)))
+        if self._mainWindow is None or not isActive:
             return
-        # Only reload the tab actually ON SCREEN right now -- reloading
-        # a HIDDEN panel (e.g. ChatWindow while a ConvoTabWindow is the
-        # visible tab) can silently steal real OS focus away from
-        # whatever IS visible. Confirmed via testing: ChatWindow's
-        # convoTree rebuild (DeleteAllItems + re-append) pulls real
-        # focus onto itself even while the panel isn't shown at all.
-        # A background/invisible panel doesn't need a live visual
-        # refresh anyway -- it already re-reads fresh data from the DB
-        # on its own via onTabActivated() the next time it's shown.
+        # Only reload the visible tab: rebuilding a hidden panel (ChatWindow's tree) can steal
+        # focus, and a hidden panel re-reads the DB in onTabActivated anyway.
         activeIndex = self._mainWindow.notebook.GetSelection()
         activePanel = self._mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
         if activePanel is None or not self._panelMatchesCategory(activePanel, category):
@@ -723,6 +807,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         nvdaUi.message(_("Sync complete."))
 
     def _rebuildTabs(self, focus=False):
+        window = self._mainWindow
+        # AddPage makes wx activate the window being filled: while another window has focus, disable it meanwhile.
+        shield = window is not None and not focus and not window.IsActive()
+        if shield:
+            window.Disable()
+        try:
+            self._rebuildTabsNow(focus)
+        finally:
+            if shield and self._mainWindow is window:
+                window.Enable()
+
+    def _rebuildTabsNow(self, focus=False):
         """
         Called via the module-level rebuild_main_window_tabs() when the
         active account changes (Settings > Accounts) while MainWindow
@@ -777,9 +873,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # ComposeDialog is shown non-modally (Show(), never ShowModal()) --
         # calling ShowModal() straight from an NVDA gesture can crash NVDA
         # outright (same class of bug hit before in YoutubePlus).
-        # postPopup() must fire when the dialog actually closes, not right
-        # after Show() -- Show() returns immediately, so calling it inline
-        # here used to tell NVDA the popup was gone while it was still open.
+        # postPopup() must fire when the dialog closes, not right after Show() (which returns at
+        # once).
         gui.mainFrame.prePopup()
         dlg = ComposeDialog(gui.mainFrame, onClosed=None)
         dlg.Bind(wx.EVT_CLOSE, self._onQuickComposeClosed)
@@ -795,6 +890,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(self._unreadSummary())
 
     script_readUnread.__doc__ = _("Read the unread count of every open NVSky tab")
+
+    def script_toggleAutoRead(self, gesture):
+        self._autoReader.toggle()
+
+    # Translators: Description of the auto read command in NVDA's Input gestures dialog (it has no default shortcut).
+    script_toggleAutoRead.__doc__ = _("Start or stop auto read, which reads the current NVSky list tab row by row")
 
     def _startJetstream(self):
         if self._jetstreamClient is not None:
@@ -833,7 +934,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 db.close_all_connections()
             wx.CallAfter(self._onJetstreamFollowsReady, account["id"], dids, listMembers, error)
 
-        threading.Thread(target=worker, daemon=True).start()
+        uiutil.start_worker(worker, progress=False)
 
     @uiutil.safe_ui_callback(check_app_closing=False)
     def _onJetstreamFollowsReady(self, account_id, dids, listMembers, error):
@@ -858,12 +959,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if len(dids) > JETSTREAM_MAX_DIDS:
             log.info(f"NVSky: jetstream -- following list ({len(dids)}) exceeds cap, truncating")
             dids = dids[:JETSTREAM_MAX_DIDS]
+        if not jetstream.can_watch(["app.bsky.feed.post", "app.bsky.feed.repost"], dids):
+            log.info(f"NVSky: jetstream -- {len(dids)} accounts do not fit in one request, not starting")
+            # Translators: Announced when real-time updates can't start because too many accounts would need watching.
+            nvdaUi.message(_("Real-time updates can't watch this many accounts. NVSky keeps using scheduled checks instead."))
+            return
         self._jetstreamAccountId = account_id
         self._jetstreamHomeDids = homeDids
         self._jetstreamListDids = listMembers
         self._jetstreamSeenUris = {}
         self._jetstreamQueue = queue.Queue()
-        self._jetstreamWorkerThread = threading.Thread(target=self._jetstreamWorkerLoop, daemon=True)
+        self._jetstreamWorkerThread = threading.Thread(
+            target=self._jetstreamWorkerMain, args=(account_id,), daemon=True
+        )
         self._jetstreamWorkerThread.start()
 
         storedCursor = db.get_jetstream_cursor(account_id)
@@ -910,8 +1018,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         subjectUri, subjectCid, reposterDid, createdAt = repostInfo
         self._jetstreamQueue.put(("repost", subjectUri, subjectCid, reposterDid, createdAt))
 
+    def _jetstreamWorkerMain(self, accountId):
+        with db.account_context(accountId):
+            self._jetstreamWorkerLoop()
+
     def _jetstreamWorkerLoop(self):
-        accountId = self._jetstreamAccountId
+        accountId = db.current_account_id()
         pendingKeys = set()
         try:
             while True:
@@ -980,7 +1092,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._jetstreamWorkerThread = None
 
     def _chatUnreadTotal(self, accountId):
-        return sum(db.get_unread_message_count(accountId, c["convo_id"]) for c in db.get_convos(accountId))
+        return db.get_total_unread_message_count(accountId)
 
     def _panelUnread(self, panel, accountId):
         """Unread count a tab reports, or None for tabs that don't track one."""
@@ -1056,11 +1168,32 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     on_settings=lambda: self.onOpenSettings(None),
                     counts=counts,
                     per_tab=db.get_tray_per_tab(),
+                    accounts=self._trayAccountChoices,
+                    on_account=lambda accountId: self.switch_account(accountId, after_menu=True),
                 )
             else:
                 self._trayIcon.set_counts(counts, db.get_tray_per_tab())
         except Exception as e:
             log.error(f"NVSky: updating the notification area icon failed: {e}")
+
+    def _trayAccountChoices(self):
+        choices = []
+        for i, acc in enumerate(db.get_all_accounts(), start=1):
+            try:
+                with db.account_context(acc["id"]):  # the tray categories are this account's own setting
+                    unread = sum(n for _name, n in self._trayCounts(acc))
+            except Exception as e:
+                log.error(f"NVSky: counting unread items for a tray menu entry failed: {e}")
+                unread = 0
+            label = acc["handle"]
+            if unread:
+                # Translators: Account entry in the tray menu when it has unread items. First {} is the handle, second {} is the unread count.
+                label = _("{}, {} unread").format(label, unread)
+            if acc["is_active"]:
+                # Translators: Account entry of the active account in the tray menu. {} is the entry text.
+                label = _("{} (active)").format(label)
+            choices.append((acc["id"], f"&{i} {label}" if i < 10 else f"{i} {label}"))
+        return choices
 
     def _removeTray(self):
         if self._trayIcon is not None:

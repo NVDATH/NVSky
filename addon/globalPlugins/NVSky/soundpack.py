@@ -37,9 +37,10 @@ EVENT_KEYS = [
     "send_message", "new_message",
     "notification",
     "open_tab", "close_tab", "boundary", "error", "ready",
-    "embed_image", "embed_video", "embed_link", "embed_quote",
+    "embed_image", "embed_video", "embed_gif", "embed_link", "embed_quote",
     "max_length", "content_warning",
     "main_open", "main_close",
+    "autoread_start", "autoread_stop",
 ]
 
 # Safety net: a progress sound nobody stopped ends itself after this long.

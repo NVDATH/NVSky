@@ -13,6 +13,7 @@ import ui as nvdaUi
 from . import db
 from . import client
 from . import uiutil
+from . import keymap
 from .feedWindow import (
     FeedListMixin,
     ItemActionMixin,
@@ -229,10 +230,10 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         self.feedsResultList.Hide()
 
         actionRow = wx.BoxSizer(wx.HORIZONTAL)
-        # Translators: Button to open the Post action menu. Shows the Alt+A shortcut.
-        self.postActionButton = wx.Button(self, label=_("&Post action... (Alt+A)"))
-        # Translators: Button to open the User action menu. Shows the Alt+U shortcut.
-        self.userActionButton = wx.Button(self, label=_("&User action... (Alt+U)"))
+        # Translators: Button to open the Post action menu. The current shortcut is appended automatically.
+        self.postActionButton = wx.Button(self, label=_("&Post action...") + keymap.hint("post_action"))
+        # Translators: Button to open the User action menu. The current shortcut is appended automatically.
+        self.userActionButton = wx.Button(self, label=_("&User action...") + keymap.hint("user_action"))
         self.resultActionButton = wx.Button(self, label=_("&Action..."))
         # Translators: Button to open a search/user-list result in its own removable tab.
         self.openInTabButton = wx.Button(self, label=_("Open in new &tab"))
@@ -252,13 +253,6 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         self.searchText.Bind(wx.EVT_TEXT, self.onSearchTextChanged)
         self.typeRadio.Bind(wx.EVT_RADIOBOX, self.onTypeChanged)
         self.advBtn.Bind(wx.EVT_BUTTON, self.onAdvBtnClick)
-        self._advToggleId = wx.NewIdRef()
-        self.Bind(wx.EVT_MENU, self.onToggleAdvancedAccel, id=self._advToggleId)
-        # Bound to this panel, not a true top-level window -- per
-        # testing, Alt+V won't fire while focus is already deep inside
-        # the pane's own child fields (advFromText etc). Accepted
-        # limitation rather than plumbing this up to MainWindow.
-        self.SetAcceleratorTable(wx.AcceleratorTable([(wx.ACCEL_ALT, ord("V"), self._advToggleId)]))
         self.postActionButton.Bind(wx.EVT_BUTTON, self.onPostAction)
         self.userActionButton.Bind(wx.EVT_BUTTON, self.onUserAction)
         self.resultActionButton.Bind(wx.EVT_BUTTON, self.onResultAction)
@@ -378,20 +372,23 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         return self.RESULT_TYPE_KEYS[self.typeRadio.GetSelection()]
 
     def onCharHook(self, evt):
+        if keymap.matches(evt, "toggle_advanced"):
+            self.onToggleAdvancedAccel(None)
+            return
         # For non-Posts result types the mixin's handlers would act on a stale
-        # postList; route Alt+A/Alt+U/Alt+number/Shift+F5 to the active list.
+        # postList; route post_action/user_action/Alt+number/load_older to the active list.
         if self._currentType() != "posts":
             keyCode = evt.GetKeyCode()
-            if evt.AltDown() and keyCode == ord("A"):
+            if keymap.matches(evt, "post_action"):
                 self.onResultAction()
                 return
-            if evt.AltDown() and keyCode == ord("U") and self._currentType() == "people":
+            if keymap.matches(evt, "user_action") and self._currentType() == "people":
                 self.onResultAction()
                 return
             if evt.AltDown() and ord("1") <= keyCode <= ord("9"):
                 self._announceNthResult(keyCode - ord("0"))
                 return
-            if keyCode == wx.WXK_F5 and evt.ShiftDown():
+            if keymap.matches(evt, "load_older"):
                 return
         super().onCharHook(evt)
 
@@ -449,12 +446,12 @@ class ExploreWindow(FeedListMixin, ItemActionMixin, UserActionMixin, UserListMix
         self.openInTabButton.Show(showOpenInTab)
         self.openInTabButton.Enable(showOpenInTab)
         labels = {
-            # Translators: Button label when result type is People. Shows the Alt+U shortcut.
-            "people": _("User action... (Alt+U)"),
-            # Translators: Button label when result type is Starter packs. Shows the Alt+A shortcut.
-            "starter_packs": _("Pack action... (Alt+A)"),
-            # Translators: Button label when result type is Feeds. Shows the Alt+A shortcut.
-            "feeds": _("Feed action... (Alt+A)"),
+            # Translators: Button label when result type is People. The current shortcut is appended automatically.
+            "people": _("User action...") + keymap.hint("user_action"),
+            # Translators: Button label when result type is Starter packs. The current shortcut is appended automatically.
+            "starter_packs": _("Pack action...") + keymap.hint("post_action"),
+            # Translators: Button label when result type is Feeds. The current shortcut is appended automatically.
+            "feeds": _("Feed action...") + keymap.hint("post_action"),
         }
         if resultType in labels:
             self.resultActionButton.SetLabel(labels[resultType])
