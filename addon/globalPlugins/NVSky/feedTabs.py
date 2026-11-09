@@ -31,6 +31,7 @@ from .feedWindow import (
     _embed_sound_event,
     _post_web_url,
     _compose_copy_text,
+    _show_full_post,
 )
 
 
@@ -457,6 +458,9 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         if keymap.matches(evt, "clear_cache"):
             self.onClearCache()
             return
+        if keymap.matches(evt, "reveal_warning") and inList:
+            _show_full_post(self, self._getFocusedPost())
+            return
         if keymap.matches(evt, "copy_row") and inList:
             self._copyFocusedPostRow()
             return
@@ -549,10 +553,10 @@ class ThreadTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
-                posts, targetIndex = client.get_thread(atprotoClient, self._targetUri)
+                posts, _targetIndex = client.get_thread(atprotoClient, self._targetUri)
                 error = None
             except Exception as e:
-                posts, targetIndex = None, 0
+                posts = None
                 error = str(e)
             wx.CallAfter(self._onRefreshDone, posts, error)
 
@@ -763,6 +767,9 @@ class QuotesTabWindow(RemovableTabMixin, UserActionMixin, EmbedViewMixin, wx.Pan
             return
         if keymap.matches(evt, "user_action"):
             self.onUserAction()
+            return
+        if keymap.matches(evt, "reveal_warning") and inList:
+            _show_full_post(self, self._getFocusedPost())
             return
         if keymap.matches(evt, "copy_row") and inList:
             self._copyFocusedPostRow()

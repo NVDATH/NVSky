@@ -66,13 +66,13 @@ class ItemActionMixin:
             self._account and post.get("is_repost") and post.get("reposted_by_did") == self._account.get("did")
         )
         if isOwnRepost:
-            self._toggleRepost(post)
+            self._toggleRepost(post, chosen=True)
             return
         # Translators: Announced when Delete is pressed on a post that isn't the account's own.
         nvdaUi.message(_("You can only delete your own posts."))
 
     _POST_SHORTCUTS = {
-        "post_reply": "_openReply", "post_quote": "_openQuote", "post_repost": "_toggleRepost",
+        "post_reply": "_openReply", "post_reply_all": "_openReplyAll", "post_quote": "_openQuote", "post_repost": "_toggleRepost",
         "post_like": "_togglePostLike", "post_save": "_toggleBookmark", "post_copy_text": "_copyPostText",
         "post_copy_link": "_copyPostLink", "post_view_thread": "_openThread", "post_view_quotes": "_openQuotes",
         "post_share_to_chat": "_shareToChat", "post_mute_thread": "_muteThread", "post_hide": "_hidePost",
@@ -137,6 +137,9 @@ class ItemActionMixin:
 
         # Translators: Post action menu item.
         self._addMenuItem(menu, _("&Reply..."), lambda: self._openReply(post))
+        if post.get("quoted_author_handle") or self._replyAllHandles(post):
+            # Translators: Post action menu item: a reply that starts with everyone else the post mentions.
+            self._addMenuItem(menu, _("Reply &all..."), lambda: self._openReplyAll(post))
         # Translators: Post action menu item (already reposted).
         # Translators: Post action menu item (not yet reposted).
         self._addMenuItem(menu, _("Undo re&post") if post.get("viewer_repost_uri") else _("Re&post"),
@@ -759,9 +762,9 @@ class ItemActionMixin:
 
         uiutil.start_worker(worker)
 
-    def _openComposeWithContext(self, reply_to=None, quote_of=None):
+    def _openComposeWithContext(self, reply_to=None, quote_of=None, initial_text=""):
         gui.mainFrame.prePopup()
-        dlg = ComposeDialog(self, onClosed=None, reply_to=reply_to, quote_of=quote_of)
+        dlg = ComposeDialog(self, onClosed=None, reply_to=reply_to, quote_of=quote_of, initial_text=initial_text)
         dlg.Bind(wx.EVT_CLOSE, self._onComposeClosed)
         dlg.Show()
 
@@ -769,22 +772,119 @@ class ItemActionMixin:
         gui.mainFrame.postPopup()
         evt.Skip()
 
-    def _openReply(self, post):
+    def _openReply(self, post, initialText="", chosen=False):
+        if not chosen:
+            # Translators: Title of the which-post picker when replying to a quote post.
+            title = _("Reply to which post?")
+            if self._chooseTarget(post, title, lambda target: self._openReply(target, initialText, chosen=True)):
+                return
         self._openComposeWithContext(reply_to={
             "uri": post["uri"],
             "cid": post["cid"],
             "handle": post.get("handle") or post.get("author_did"),
             "text": post.get("text", ""),
             "is_reply": bool(post.get("reply_parent_uri")),
-        })
+        }, initial_text=initialText)
 
-    def _openQuote(self, post):
+    def _openReplyAll(self, post, chosen=False):
+        if not chosen:
+            # Translators: Title of the which-post picker when replying to a quote post.
+            title = _("Reply to which post?")
+            if self._chooseTarget(post, title, lambda target: self._openReplyAll(target, chosen=True)):
+                return
+        handles = self._replyAllHandles(post)
+        if not handles:
+            # Translators: Announced when Reply all is used on a post that mentions nobody else.
+            nvdaUi.message(_("There is nobody else to mention in this post."))
+            return
+        self._openReply(post, " ".join(f"@{handle}" for handle in handles) + " ", chosen=True)
+
+    def _replyAllHandles(self, post):
+        """Handles a reply-all starts with: whom the post replies to, then everyone it mentions (never its author or me)."""
+        skip = {h.lower() for h in (post.get("handle"), (self._account or {}).get("handle")) if h}
+        candidates = [post.get("reply_to_handle")] + [m.group(1) for m in client.MENTION_REGEX.finditer(post.get("text") or "")]
+        handles = []
+        for handle in candidates:
+            if handle and handle.lower() not in skip:
+                skip.add(handle.lower())
+                handles.append(handle)
+        return handles
+
+    def _openQuote(self, post, chosen=False):
+        if not chosen:
+            # Translators: Title of the which-post picker when quoting a quote post.
+            title = _("Quote which post?")
+            if self._chooseTarget(post, title, lambda target: self._openQuote(target, chosen=True)):
+                return
         self._openComposeWithContext(quote_of={
             "uri": post["uri"],
             "cid": post["cid"],
             "handle": post.get("handle") or post.get("author_did"),
             "text": post.get("text", ""),
         })
+
+    def _chooseTarget(self, post, title, run):
+        """
+        For a quote post: asks whether the action acts on it or on the post it quotes, then calls
+        run(target). True when it took over (also when the person cancels); False for any other post.
+        """
+        if not post.get("quoted_author_handle"):
+            return False
+
+        def preview(text):
+            text = uiutil.single_line(text or "")
+            return text[:60] + "..." if len(text) > 60 else text
+
+        choices = [
+            # Translators: Choice in the which-post picker. First {} is the author's handle, second {} is a preview of the post text.
+            _("This post, by @{}: {}").format(post.get("handle") or post.get("author_did"), preview(post.get("text"))),
+            # Translators: Choice in the which-post picker. First {} is the quoted author's handle, second {} is a preview of the quoted text.
+            _("The quoted post, by @{}: {}").format(post["quoted_author_handle"], preview(post.get("quoted_text"))),
+        ]
+        # Translators: Prompt in the which-post picker, shown for a quote post.
+        dlg = wx.SingleChoiceDialog(self, _("This post quotes another post. Which one?"), title, choices)
+        confirmed = dlg.ShowModal() == wx.ID_OK
+        index = dlg.GetSelection()
+        dlg.Destroy()
+        if not confirmed:
+            return True
+        if index == 0:
+            run(post)
+        else:
+            self._actOnQuoted(post, run)
+        return True
+
+    def _actOnQuoted(self, post, run):
+        # Translators: Announced while loading the post a quote post quotes.
+        feedWindow._announce_now(_("Loading the quoted post, please wait..."))
+        soundpack.start_progress()
+        accountId = self._account["id"]
+
+        def worker():
+            try:
+                atprotoClient = client.get_client_for_active_account()
+                related = client.resolve_quoted_post(atprotoClient, accountId, post)
+                error = None
+            except Exception as e:
+                related = None
+                error = str(e)
+            wx.CallAfter(self._onQuotedResolved, related, error, run)
+
+        uiutil.start_worker(worker, progress=False)
+
+    @uiutil.safe_ui_callback
+    def _onQuotedResolved(self, related, error, run):
+        soundpack.stop_progress()
+        if error:
+            soundpack.play("error")
+            # Translators: Announced when loading the quoted post fails. {} is the error message.
+            nvdaUi.message(_("Could not load the quoted post: {}").format(error))
+            return
+        if related is None:
+            # Translators: Announced when the quoted post can't be seen (deleted or blocked).
+            nvdaUi.message(_("The quoted post isn't available."))
+            return
+        run(related)
 
     def _openThread(self, post):
         # Tab dedup is by thread ROOT uri, known only after the fetch
@@ -852,7 +952,12 @@ class ItemActionMixin:
                 "type": "thread", "key": rootUri, "root_uri": rootUri, "origin_key": originKey,
             })
 
-    def _toggleRepost(self, post):
+    def _toggleRepost(self, post, chosen=False):
+        if not chosen and not post.get("viewer_repost_uri"):
+            # Translators: Title of the which-post picker when reposting a quote post.
+            title = _("Repost which post?")
+            if self._chooseTarget(post, title, lambda target: self._toggleRepost(target, chosen=True)):
+                return
         if post.get("viewer_repost_uri") == "pending":
             # Translators: Announced when an action is repeated while the previous one is still in progress.
             feedWindow._announce_now(_("Please wait..."))

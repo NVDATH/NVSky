@@ -13,7 +13,6 @@ import json
 import urllib.parse
 import wx
 import speech
-import gui
 from logHandler import log
 import ui as nvdaUi
 
@@ -176,7 +175,7 @@ def _compose_copy_text(parts, url) -> str:
     return text
 
 
-def _message_text(post: dict) -> str:
+def _message_text(post: dict, single: bool = True) -> str:
     text = post.get("text", "")
 
     if post.get("quoted_text"):
@@ -185,7 +184,11 @@ def _message_text(post: dict) -> str:
         who = f"@{quotedAuthor}" if quotedAuthor else _("original post")
         # No em dash -- screen readers spell it out as two syllables.
         # Translators: Appended to a post's text to show the quoted post. First {} is the quoted post's text, second {} is who it's from (already localized).
-        text = _("{} Quote from {}: {}").format(text, who, post["quoted_text"])
+        if single:
+            text = _("{} Quote from {}: {}").format(text, who, post["quoted_text"])
+        else:
+            # Translators: Heading above a quoted post's text in the full-post dialog. {} is who it's from (already localized).
+            text = "\n\n".join(part for part in (text, _("Quote from {}:").format(who), post["quoted_text"]) if part)
 
     if post.get("reply_parent_uri"):
         replyToHandle = post.get("reply_to_handle")
@@ -204,7 +207,7 @@ def _message_text(post: dict) -> str:
             # Translators: Prefix on a repost's post text when the original author isn't cached. {} is the post text.
             text = _("Reposted: {}").format(text)
 
-    return uiutil.single_line(text)
+    return uiutil.single_line(text) if single else text
 
 
 # Translators: Short placeholder shown in the Embed column for a content-labeled ("warn") post -- kept generic/brief, the actual category names go in the Message column instead.
@@ -268,6 +271,69 @@ def _visible_message_text(post: dict) -> str:
     if _label_visibility(post) == "warn":
         return CONTENT_WARNING_MESSAGE_TEXT.format(_matched_label_names(post))
     return _message_text(post)
+
+
+def _post_detail_rows(post: dict) -> list:
+    """[(line, link or None)] for the full-post dialog: links in the post, its address, its creation time."""
+    urls = []
+    try:
+        facets = json.loads(post.get("facets_json") or "[]")
+    except (ValueError, TypeError):
+        facets = []
+    for facet in facets if isinstance(facets, list) else []:
+        features = facet.get("features") if isinstance(facet, dict) else None
+        for feature in features or []:
+            uri = feature.get("uri") if isinstance(feature, dict) else None
+            if uri and uri not in urls:
+                urls.append(uri)
+    if not post.get("facets_json"):
+        # Thread and quote tabs keep no facets; the text holds the full links.
+        for url in client.find_all_urls(post.get("text") or ""):
+            if url not in urls:
+                urls.append(url)
+    try:
+        embed = json.loads(post.get("embed_json") or "{}")
+    except (ValueError, TypeError):
+        embed = {}
+    linkUrl = embed.get("link_url") if isinstance(embed, dict) else None
+    if linkUrl and linkUrl not in urls:
+        urls.append(linkUrl)
+
+    rows = []
+    for url in urls:
+        # Translators: Detail line of the full-post dialog. {} is a link in the post.
+        rows.append((_("link: {}").format(url), url))
+    webUrl = _post_web_url(post.get("uri"), post.get("handle") or post.get("author_did"))
+    if webUrl:
+        # Translators: Detail line of the full-post dialog. {} is the address of the post on bsky.app.
+        rows.append((_("post url: {}").format(webUrl), webUrl))
+    created = post.get("created_at") or post.get("indexed_at")
+    if created:
+        # Translators: Detail line of the full-post dialog. {} is when the post was created.
+        rows.append((_("created at: {}").format(timeutils.format_timestamp(created, mode="absolute")), None))
+    return rows
+
+
+def _full_post_text(post: dict) -> str:
+    """Text of the full-post dialog: a content warning above the embed summary and the unflattened message."""
+    lines = []
+    if _label_visibility(post) == "warn":
+        lines.append(CONTENT_WARNING_MESSAGE_TEXT.format(_matched_label_names(post)))
+    lines.append(_describe_embed(post.get("embed_json")))
+    lines.append(_message_text(post, single=False))
+    return "\n".join(line for line in lines if line)
+
+
+def _show_full_post(window, post):
+    """Ctrl+Space in the thread and quotes tabs (their windows have no FeedListMixin)."""
+    if post is None:
+        # Translators: Announced when the post-action menu is invoked with no post focused.
+        nvdaUi.message(_("No post selected."))
+        return
+    from . import postDetails
+    # Translators: Title of the full-post dialog. {} is the post's author.
+    title = _("Post from {}").format(window._displayLabel(post.get("handle"), post.get("display_name")))
+    postDetails.show_post_details(window, title, _full_post_text(post), _post_detail_rows(post), post)
 
 
 def propagate_post_state(post: dict):
@@ -612,15 +678,6 @@ class FeedListMixin:
             return list(self._cellsAt(index))
         return [self.postList.GetItemText(index, col) for col in range(self.postList.GetColumnCount())]
 
-    def _setCell(self, index, col, text):
-        if not self.VIRTUAL_LIST:
-            self.postList.SetItem(index, col, text)
-            return
-        cells = list(self._cellsAt(index))
-        cells[col] = text
-        self._cellCache[index] = cells
-        self.postList.RefreshItem(index)
-
     def _clearSelection(self, keep=None):
         selected = []
         i = self.postList.GetFirstSelected()
@@ -772,6 +829,7 @@ class FeedListMixin:
         else:
             self._applyFocusPosition(targetIndex)
 
+    @uiutil.safe_ui_callback
     def _applyFocusPosition(self, targetIndex):
         self._suppressFocusEvents = True
         try:
@@ -1155,7 +1213,7 @@ class FeedListMixin:
                 uiutil.jump_to_row(self, focused, row_text=rowText)
                 return
         if keymap.matches(evt, "reveal_warning") and inList:
-            self._revealContentWarning()
+            self._showFullPost()
             return
         if keymap.matches(evt, "next_unread") and getattr(self, "SUPPORTS_FOCUS_NEXT_UNREAD", False) and inList:
             self._focusNextUnread()
@@ -1185,31 +1243,22 @@ class FeedListMixin:
         url = _post_web_url(post.get("uri"), post.get("handle") or post.get("author_did"))
         uiutil.copy_text_to_clipboard(_compose_copy_text(parts, url))
 
-    def _revealContentWarning(self):
-        # Rewrites the FOCUSED ROW's own displayed embed AND message
-        # columns in place (SetItem only, never touches self._posts or
-        # any cached state) so the real content actually replaces both
-        # placeholders on screen, not just spoken once. Deliberately
-        # transient -- any future _render() call (arrow off and back,
-        # F5, tab switch) recomputes from _visible_embed_text/
-        # _visible_message_text again and goes right back to showing
-        # the warning; nothing here is remembered.
-        index = self.postList.GetFocusedItem()
+    def _fullPostContent(self, post):
+        """(title, text, post whose details are listed) for the full-post dialog."""
+        # Translators: Title of the full-post dialog. {} is the post's author.
+        title = _("Post from {}").format(self._authorLabel(post, self._currentAuthorMode()))
+        return title, _full_post_text(post), post
+
+    def _showFullPost(self):
         post = self._getFocusedPost()
         if post is None:
+            # Translators: Announced when the post-action menu is invoked with no post focused.
+            nvdaUi.message(_("No post selected."))
             return
-        if _label_visibility(post) != "warn":
-            # Translators: Announced when Ctrl+Space is pressed on a post with no content warning to reveal.
-            nvdaUi.message(_("This post has no content warning."))
-            return
-        realEmbedText = _describe_embed(post.get("embed_json"))
-        realMessageText = _message_text(post)
-        matchedNames = _matched_label_names(post)
-        revealedEmbedText = f"{CONTENT_WARNING_EMBED_TEXT}, {realEmbedText}" if realEmbedText else CONTENT_WARNING_EMBED_TEXT
-        revealedMessageText = f"{CONTENT_WARNING_MESSAGE_TEXT.format(matchedNames)} {realMessageText}".strip()
-        self._setCell(index, 0, revealedEmbedText)
-        self._setCell(index, 2, revealedMessageText)
-        nvdaUi.message(", ".join(p for p in [revealedEmbedText, revealedMessageText] if p))
+        from . import postDetails
+        title, text, detailsPost = self._fullPostContent(post)
+        rows = _post_detail_rows(detailsPost) if detailsPost else None
+        postDetails.show_post_details(self, title, text, rows, detailsPost)
 
     def _checkListBoundaryBeforeKey(self, keyCode):
         # Deterministic instead of comparing focus before/after via

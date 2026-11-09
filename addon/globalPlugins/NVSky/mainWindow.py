@@ -33,10 +33,8 @@ Each tab panel is expected to expose:
 Ctrl+Delete (clear the tab's cache) is handled by each tab itself.
 """
 import json
-import threading
 import wx
 
-import gui
 import ui as nvdaUi
 from logHandler import log
 

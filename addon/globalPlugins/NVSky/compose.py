@@ -217,7 +217,7 @@ class VideoUploadDialog(wx.Dialog):
 
 
 class ComposeDialog(wx.Dialog):
-    def __init__(self, parent, onClosed=None, reply_to=None, quote_of=None):
+    def __init__(self, parent, onClosed=None, reply_to=None, quote_of=None, initial_text=""):
         # reply_to / quote_of: {"uri", "cid", "handle", "text", "is_reply"}
         # of the target post, or None. Only one of the two should be set.
         # Translators: Compose-window title for a plain new post.
@@ -328,6 +328,9 @@ class ComposeDialog(wx.Dialog):
         self.Bind(wx.EVT_CLOSE, self.onCloseEvent)
 
         self._updateTitle()
+        if initial_text:
+            self.textCtrl.SetValue(initial_text)
+            self.textCtrl.SetInsertionPointEnd()
         self.textCtrl.SetFocus()
 
     def _selectedSelfLabels(self):

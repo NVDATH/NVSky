@@ -201,8 +201,6 @@ def _remember_session(client, account):
 
 
 def _client_from_cached_session(account):
-    from atproto import Client as ATProtoClient
-
     with _session_lock:
         sessionString = _session_cache.get(account["did"])
     if not sessionString:
@@ -226,8 +224,6 @@ def _client_from_cached_session(account):
 
 
 def get_client_for_active_account():
-    from atproto import Client as ATProtoClient
-
     account = db.get_active_account()
     if account is None:
         # Translators: Shown when an action needs an account but none is stored.
@@ -1062,6 +1058,8 @@ def _extract_embed_info(post):
             author = _view_field(recordView, "author")
             info["quoted_text"] = _view_field(value, "text")
             info["quoted_author_handle"] = _view_field(author, "handle")
+            if info["quoted_author_handle"]:
+                info["quoted_uri"] = _view_field(recordView, "uri")
         else:
             _fill_media_info(info, embedView, embedType)
     except Exception as e:
@@ -1714,6 +1712,51 @@ def resolve_posts(client, account_id: int, uris: list) -> dict:
             except Exception as e:
                 log.info(f"NVSky: failed to cache resolved post {post.uri}: {e}")
     return resolved
+
+
+def get_post_counts(client, post_uri: str) -> dict:
+    """Fresh interaction counts of one post (getPosts); the local cache is left alone. A count the server doesn't report is None."""
+    resp = client.app.bsky.feed.get_posts(params={"uris": [post_uri]})
+    if not resp.posts:
+        # Translators: Shown when a thread's post was deleted, blocked, or can't be seen.
+        raise RuntimeError(_("This post was deleted or isn't visible to you."))
+    post = resp.posts[0]
+    return {
+        "replies": post.reply_count or 0, "likes": post.like_count or 0, "reposts": post.repost_count or 0,
+        "quotes": getattr(post, "quote_count", None), "bookmarks": getattr(post, "bookmark_count", None),
+    }
+
+
+def resolve_quoted_post(client, account_id: int, post: dict):
+    """
+    The post that `post` quotes, as a cached post row with fresh like/repost/save state, or None when
+    it can't be seen. A row that is already cached keeps its other fields: hydrating it again would
+    overwrite its repost framing.
+    """
+    try:
+        embed = json.loads(post.get("embed_json") or "{}")
+    except (ValueError, TypeError):
+        embed = {}
+    quotedUri = embed.get("quoted_uri") if isinstance(embed, dict) else None
+    if not quotedUri:
+        # Cached before quoted_uri was stored: read it from the quote post itself.
+        resp = client.app.bsky.feed.get_posts(params={"uris": [post["uri"]]})
+        info = _extract_embed_info(resp.posts[0]) if resp.posts else None
+        quotedUri = (info or {}).get("quoted_uri")
+    if not quotedUri:
+        return None
+    resp = client.app.bsky.feed.get_posts(params={"uris": [quotedUri]})
+    if not resp.posts:
+        return None
+    view = resp.posts[0]
+    if db.get_post(quotedUri) is None:
+        _store_resolved_post(view, account_id)
+    else:
+        viewer = getattr(view, "viewer", None)
+        db.set_post_like_uri(quotedUri, getattr(viewer, "like", None) if viewer else None)
+        db.set_post_repost_uri(quotedUri, getattr(viewer, "repost", None) if viewer else None)
+        db.set_post_bookmarked(quotedUri, bool(getattr(viewer, "bookmarked", False)) if viewer else False)
+    return db.get_post(quotedUri)
 
 
 def store_jetstream_repost(client, account_id: int, subject_uri: str, subject_cid: str, reposter_did: str, created_at: str = None):
@@ -2772,6 +2815,12 @@ def _post_view_to_dict(post) -> dict:
         "display_name": getattr(author, "display_name", None),
         "text": text,
         "indexed_at": post.indexed_at,
+        "created_at": _view_field(record, "createdAt") or _view_field(record, "created_at"),
+        "reply_count": getattr(post, "reply_count", None) or 0,
+        "like_count": getattr(post, "like_count", None) or 0,
+        "repost_count": getattr(post, "repost_count", None) or 0,
+        "quote_count": getattr(post, "quote_count", None),
+        "bookmark_count": getattr(post, "bookmark_count", None),
         "is_repost": False,
         "reply_parent_uri": reply_parent_uri,
         "reply_to_did": reply_to_did,

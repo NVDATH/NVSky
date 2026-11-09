@@ -228,6 +228,12 @@ class NotificationsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, Embed
         url = _post_web_url(notif.get("subject_uri"), notif.get("subject_author_handle"))
         uiutil.copy_text_to_clipboard(_compose_copy_text(parts, url))
 
+    def _fullPostContent(self, notif):
+        # Translators: Title of the full-notification dialog. {} is who the notification is from.
+        title = _("Notification from {}").format(self._authorLabel(notif, self._currentAuthorMode()))
+        subjectUri = notif.get("subject_uri")
+        return title, _describe_notification(notif), db.get_post(subjectUri) if subjectUri else None
+
     def onClearCache(self, evt=None):
         if self._account is None:
             # Translators: Announced when clearing cache with no active account.

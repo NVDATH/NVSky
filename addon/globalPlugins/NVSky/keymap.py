@@ -63,6 +63,7 @@ _DEFS = [
     ("select_page", "ctrl", "dialog", ("dialog",), _FIXED_DIGITS),
 
     ("post_reply", "", "post", ("tab",), _EDIT),
+    ("post_reply_all", "", "post", ("tab",), _EDIT),
     ("post_quote", "", "post", ("tab",), _EDIT),
     ("post_repost", "", "post", ("tab",), _EDIT),
     ("post_like", "", "post", ("tab",), _EDIT),
@@ -429,7 +430,7 @@ def label(action_id):
             # Translators: Keymap action name.
             "jump_row": _("Jump to a row number"),
             # Translators: Keymap action name.
-            "reveal_warning": _("Reveal a content warning"),
+            "reveal_warning": _("Show the full post (also reveals a content warning)"),
             # Translators: Keymap action name.
             "select_all": _("Select all posts"),
             # Translators: Keymap action name.
@@ -458,6 +459,8 @@ def label(action_id):
             "select_page": _("Go to settings page number"),
             # Translators: Keymap action name.
             "post_reply": _("Reply to the post"),
+            # Translators: Keymap action name.
+            "post_reply_all": _("Reply to the post, mentioning everyone else in it"),
             # Translators: Keymap action name.
             "post_quote": _("Quote the post"),
             # Translators: Keymap action name.

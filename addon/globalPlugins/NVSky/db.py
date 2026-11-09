@@ -274,6 +274,8 @@ _ACCOUNT_SCHEMA = """
         viewer_bookmarked INTEGER DEFAULT 0,
         viewer_thread_muted INTEGER DEFAULT 0,
         labels_json TEXT,
+        quote_count INTEGER,
+        bookmark_count INTEGER,
         FOREIGN KEY (author_did) REFERENCES authors(did)
     );
 
@@ -1142,6 +1144,19 @@ def set_post_thread_muted(uri: str, muted: bool):
     with _connect() as conn:
         conn.execute("UPDATE posts SET viewer_thread_muted = ? WHERE uri = ?", (1 if muted else 0, uri))
         conn.commit()
+
+def update_post_counts(uri: str, counts: dict):
+    """Stores the counts a details refresh fetched; a count that is None keeps its stored value."""
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE posts SET reply_count = COALESCE(?, reply_count), like_count = COALESCE(?, like_count),
+               repost_count = COALESCE(?, repost_count), quote_count = COALESCE(?, quote_count),
+               bookmark_count = COALESCE(?, bookmark_count) WHERE uri = ?""",
+            (counts.get("replies"), counts.get("likes"), counts.get("reposts"),
+             counts.get("quotes"), counts.get("bookmarks"), uri),
+        )
+        conn.commit()
+
 
 def get_unread_count(account_id: int, feed_key: str) -> int:
     with _connect(account_id) as conn:

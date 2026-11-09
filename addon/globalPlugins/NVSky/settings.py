@@ -739,7 +739,7 @@ class DisplayPanel(wx.Panel):
                 "while it is off, the adult categories (all except Nudity) are hidden. "
                 "Press Space on a row to cycle Show -> Warn -> Hide. \"Warn\" hides "
                 "the post's text and embed behind a content-warning placeholder -- "
-                "press Ctrl+Space on the focused post (in a feed) to hear it once. "
+                "press Ctrl+Space on the focused post (in a feed) to read it in full. "
                 "\"Hide\" removes the post from feeds entirely. "
                 "Changes are saved when you press OK or Apply."
             ),
@@ -2361,6 +2361,7 @@ class NVSkySettingsDialog(wx.Dialog):
         if index != wx.NOT_FOUND:
             self._activatePage(index)
 
+    @uiutil.safe_ui_callback(check_app_closing=False)
     def _activatePage(self, index):
         panel = self.notebook.GetPage(index)
         # Announce the tab name first, then grant real focus (the order that avoids losing the race).
