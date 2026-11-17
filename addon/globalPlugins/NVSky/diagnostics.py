@@ -42,6 +42,7 @@ import ui as nvdaUi
 from logHandler import log
 
 from . import client
+from . import clientPrefs
 from . import db
 from . import jetstream
 from . import uiutil
@@ -450,7 +451,7 @@ def _probe_likes(rep):
 
 def _probe_preferences(rep):
     atp = rep.ctx["atp"]
-    prefs = client._get_cleaned_preferences(atp)
+    prefs = clientPrefs._get_cleaned_preferences(atp)
     types = [p.get("$type", "?") for p in prefs]
     notif = client.get_notification_prefs(atp)
     return f"{len(prefs)} preference entries: {', '.join(types)}\nnotification categories: {', '.join(sorted(notif))}"
@@ -737,8 +738,8 @@ def _probe_bypass_equivalence(rep):
     dump = lambda m: m.model_dump(mode="json", by_alias=True, exclude_none=True)
     compare(
         "preferences (cleaned vs plain typed dump)",
-        lambda: client._get_cleaned_preferences(atp),
-        lambda: [client._pref_to_dict(p) for p in atp.app.bsky.actor.get_preferences().preferences],
+        lambda: clientPrefs._get_cleaned_preferences(atp),
+        lambda: [clientPrefs._pref_to_dict(p) for p in atp.app.bsky.actor.get_preferences().preferences],
     )
     dm = client.get_chat_client(atp).chat.bsky.convo
     convos = dm.list_convos(params={"limit": 1}).convos

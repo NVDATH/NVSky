@@ -1312,7 +1312,7 @@ def set_content_label_prefs_cache(account_id: int, prefs: dict):
 
 # ---------------- user list cache (followers/following/people-search tabs) ----------------
 # Same ui_state-backed JSON-blob pattern as saved_feeds_cache above --
-# UserListTabWindow (feedWindow.py) shows this instantly on open, then
+# UserListTabWindow (feedTabs.py) shows this instantly on open, then
 # silently re-fetches in the background and only re-renders/announces
 # if the result actually changed. Keyed by the tab's own TAB_TEMP_KEY
 # (e.g. "followers:did:xyz", "search:some query").

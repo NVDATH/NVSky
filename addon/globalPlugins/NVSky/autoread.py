@@ -42,8 +42,8 @@ from . import client
 from . import db
 from . import soundpack
 from . import uiutil
-from .feedWindow import (
-    FeedListMixin,
+from .feedWindow import FeedListMixin
+from .postText import (
     _announce_now,
     _embed_sound_event,
     _format_post_time,

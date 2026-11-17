@@ -156,20 +156,7 @@ def sync_lists(atprotoClient, account_id: int, my_did: str):
     beforeLists = db.get_lists(account_id)
     beforeSnapshot = {l["list_uri"]: (l.get("name"), l.get("muted")) for l in beforeLists}
     try:
-        entries = client.get_lists(atprotoClient, my_did)
-        for entry in entries:
-            db.upsert_list({
-                "account_id": account_id,
-                "list_uri": entry["uri"],
-                "cid": entry["cid"],
-                "name": entry["name"],
-                "description": entry["description"],
-                "purpose": entry["purpose"],
-                "creator_did": entry["creator_did"],
-                "creator_handle": entry["creator_handle"],
-                "muted": int(entry["muted"]),
-                "blocked_uri": entry["blocked_uri"],
-            })
+        client.sync_lists(atprotoClient, account_id, my_did)
     except Exception as e:
         log.error(f"NVSky: background list-of-lists sync failed: {e}")
     afterLists = db.get_lists(account_id)
@@ -268,40 +255,16 @@ def sync_profile(atprotoClient, account_id: int):
             cacheKey = entry.get("key")
             if not kind or not cacheKey:
                 continue
+            targetField = {
+                "followers": "did", "following": "did", "known_followers": "did",
+                "likes": "post_uri", "reposts": "post_uri",
+            }.get(kind, "query")
+            target = entry.get(targetField)
+            if not target:
+                continue
             before = db.get_user_list_cache(account_id, cacheKey)
             try:
-                if kind in ("followers", "following", "known_followers"):
-                    did = entry.get("did")
-                    if not did:
-                        continue
-                    if kind == "followers":
-                        users = client.get_followers(atprotoClient, did)
-                    elif kind == "following":
-                        users = client.get_follows(atprotoClient, did)
-                    else:
-                        users = client.get_known_followers(atprotoClient, did)
-                elif kind in ("likes", "reposts"):
-                    # likes/reposts tabs store "post_uri", not "query".
-                    postUri = entry.get("post_uri")
-                    if not postUri:
-                        continue
-                    users = (
-                        client.get_post_likes(atprotoClient, postUri) if kind == "likes"
-                        else client.get_post_reposted_by(atprotoClient, postUri)
-                    )
-                else:
-                    query = entry.get("query")
-                    if not query:
-                        continue
-                    response = client.search_actors(atprotoClient, query)
-                    users = [
-                        {
-                            "did": a.did, "handle": a.handle,
-                            "display_name": getattr(a, "display_name", None),
-                            "description": getattr(a, "description", None),
-                        }
-                        for a in response.actors
-                    ]
+                users = client.fetch_user_list(atprotoClient, kind, target)
             except Exception as e:
                 log.error(f"NVSky: background user_list sync failed for {cacheKey}: {e}")
                 continue

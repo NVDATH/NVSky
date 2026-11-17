@@ -39,12 +39,13 @@ from . import attachments
 from . import jetstream
 from . import timeutils
 from .settings import NVSkySettingsDialog, LoginDialog
-from .feedWindow import *
+from .feedWindow import FeedWindow, FeedListMixin
 from .notificationsWindow import NotificationsWindow
 from .listsWindow import ListsWindow, ListTabWindow
 from .exploreWindow import ExploreWindow
 from .peopleWindow import PeopleWindow
-from .feedTabs import ThreadTabWindow, QuotesTabWindow, UserListTabWindow, UserTimelineTabWindow, FeedPreviewTabWindow, SavedWindow, LikesWindow
+from .feedTabs import UserListTabWindow, UserTimelineTabWindow, FeedPreviewTabWindow, SavedWindow, LikesWindow
+from .postTabs import ThreadTabWindow, QuotesTabWindow
 from .mainWindow import MainWindow
 from .chatWindow import ChatWindow, ConvoTabWindow
 from .compose import ComposeDialog
@@ -885,11 +886,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         evt.Skip()
 
     script_quickNewPost.__doc__ = _("Open a quick new post window")
-
-    def script_readUnread(self, gesture):
-        ui.message(self._unreadSummary())
-
-    script_readUnread.__doc__ = _("Read the unread count of every open NVSky tab")
 
     def script_toggleAutoRead(self, gesture):
         self._autoReader.toggle()

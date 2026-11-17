@@ -95,7 +95,7 @@ class VideoUploadDialog(wx.Dialog):
         self._currentStep = 0
         self._beepTimer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._onBeepTick, self._beepTimer)
-        self._beepTimer.Start(1000)  # same interval as feedWindow.py's loading beep
+        self._beepTimer.Start(1000)  # one beep per second while waiting
 
         self.cancelButton.Bind(wx.EVT_BUTTON, self.onCancel)
         self.Bind(wx.EVT_CLOSE, self.onCancel)
@@ -487,7 +487,7 @@ class ComposeDialog(wx.Dialog):
         for path in paths:
             size = os.path.getsize(path)
             if size > MAX_IMAGE_BYTES:
-                # Resizing happens at upload time (client._upload_blob_dict); just let it through.
+                # Resizing happens at upload time (client.upload_blob_dict); just let it through.
                 confirmResize = wx.MessageBox(
                     # Translators: Asks whether to auto-resize an oversized image. First {} is the file name, second {} is its size in MB.
                     _("{} is {:.1f}MB, over Bluesky's 1MB image limit. "
@@ -648,7 +648,7 @@ class ComposeDialog(wx.Dialog):
                         link_card = client.fetch_link_card(linkUrl)
                         if link_card.get("image_url"):
                             thumbPath = attachmentModule.download_to_temp(link_card["image_url"], suffix=".jpg")
-                            link_card["thumb_blob"] = client._upload_blob_dict(atprotoClient, thumbPath)
+                            link_card["thumb_blob"] = client.upload_blob_dict(atprotoClient, thumbPath)
                     except Exception as e:
                         log.info(f"NVSky: link card fetch failed, posting without preview: {e}")
                         link_card = None

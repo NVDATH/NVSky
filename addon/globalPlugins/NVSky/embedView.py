@@ -1,9 +1,6 @@
 """
 EmbedViewMixin for NVSky: the shared "Embed..." submenu and its
 open/send/copy handlers for images, video, and links.
-
-feedWindow is imported as a module (not by name) because it imports this
-file; its helpers are only touched inside method bodies.
 """
 import json
 import webbrowser
@@ -19,7 +16,7 @@ from . import db
 from . import soundpack
 from . import uiutil
 from . import attachments
-from . import feedWindow
+from . import postText
 
 
 class EmbedViewMixin:
@@ -88,7 +85,7 @@ class EmbedViewMixin:
             added = True
 
         linkUrl = embed.get("link_url")
-        if linkUrl and feedWindow._is_gif_url(linkUrl):
+        if linkUrl and postText._is_gif_url(linkUrl):
             # Translators: Context menu item to open a post's animated GIF in a browser.
             self._addMenuItem(menu, _("Open &GIF"), lambda: self._openWebLink(linkUrl))
             # Translators: Context menu item to copy a post's animated GIF address.
@@ -111,18 +108,18 @@ class EmbedViewMixin:
         # Web links only -- never hand an arbitrary URI scheme to the shell.
         if not str(url).lower().startswith(("http://", "https://")):
             # Translators: Announced when a post's link uses a scheme other than http/https and is refused.
-            feedWindow._announce_now(_("Only http and https links can be opened."))
+            postText._announce_now(_("Only http and https links can be opened."))
             return
         webbrowser.open(url)
 
     def _copyEmbedUrl(self, url, label):
         self._copyToClipboard(url)
         # Translators: Announced after copying an embed's URL to the clipboard. {} is already-translated (e.g. "Video URL").
-        feedWindow._announce_now(_("{} copied to clipboard.").format(label))
+        postText._announce_now(_("{} copied to clipboard.").format(label))
 
     def _openEmbedImage(self, url):
         # Translators: Announced while downloading an image to open it.
-        feedWindow._announce_now(_("Downloading image, please wait..."))
+        postText._announce_now(_("Downloading image, please wait..."))
 
         def worker():
             try:
@@ -138,7 +135,7 @@ class EmbedViewMixin:
 
     def _sendEmbedImageToBeMyEyes(self, url):
         # Translators: Announced while downloading an image to send it to Be My Eyes.
-        feedWindow._announce_now(_("Downloading image, please wait..."))
+        postText._announce_now(_("Downloading image, please wait..."))
 
         def worker():
             try:
@@ -182,7 +179,7 @@ class EmbedViewMixin:
 
     def _openEmbedVideo(self, url):
         # Translators: Announced while downloading a video to open it.
-        feedWindow._announce_now(_("Downloading video, please wait..."))
+        postText._announce_now(_("Downloading video, please wait..."))
 
         def worker():
             try:
@@ -204,7 +201,7 @@ class EmbedViewMixin:
         soundpack.play("like" if post.get("viewer_like_uri") else "unlike")
         account = db.get_active_account()
         if account is not None:
-            feedWindow.sync_like_state(post, account["id"])
+            postText.sync_like_state(post, account["id"])
 
     @uiutil.safe_ui_callback
     def _onActionDone(self, message, error):

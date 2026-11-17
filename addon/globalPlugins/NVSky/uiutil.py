@@ -12,6 +12,7 @@ import time
 
 import api
 import controlTypes
+import gui
 import queueHandler
 import speech
 import wx
@@ -241,6 +242,31 @@ def single_line(text: str) -> str:
     separate ~511-char cell limit exists; see chatWindow's column split.)
     """
     return text.replace("\r\n", " ").replace("\n", " ")
+
+
+def user_choice_label(user):
+    """List entry for a user dict (handle plus display name), e.g. in search-result checklists."""
+    # Translators: Fallback shown for a user with no display name. Used as "@handle ({})".
+    return f'@{user["handle"]} ({user.get("display_name") or _("no display name")})'
+
+
+class EscapeCloseDialog(wx.Dialog):
+    """Dialog shown non-modally after gui.mainFrame.prePopup(): Escape closes it, closing releases the popup state."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+        self.Bind(wx.EVT_CLOSE, self.onClose)
+
+    def onCharHook(self, evt):
+        if evt.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        evt.Skip()
+
+    def onClose(self, evt):
+        gui.mainFrame.postPopup()
+        self.Destroy()
 
 
 def move_focus_and_check_announce(list_ctrl, index: int) -> bool:

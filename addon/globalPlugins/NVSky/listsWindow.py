@@ -20,15 +20,12 @@ from . import client
 from . import uiutil
 from . import soundpack
 from . import keymap
-from .feedWindow import (
-    RemovableTabMixin,
-    FeedListMixin,
-    ItemActionMixin,
-    UserActionMixin,
-    EmbedViewMixin,
-    _VirtualPostList,
-    _announce_now,
-)
+from .feedWindow import RemovableTabMixin, FeedListMixin, _VirtualPostList
+from .itemActions import ItemActionMixin
+from .userActions import UserActionMixin
+from .userPicker import UserSearchMixin, take_checked
+from .embedView import EmbedViewMixin
+from .postText import _announce_now
 
 
 class AddListDialog(wx.Dialog):
@@ -80,7 +77,7 @@ class AddListDialog(wx.Dialog):
         return self.nameText.GetValue().strip(), self.descText.GetValue().strip(), purpose
 
 
-class SubscribeListDialog(wx.Dialog):
+class SubscribeListDialog(uiutil.EscapeCloseDialog):
     """
     Find someone else's lists by searching for their handle/name (same
     typeahead search as Manage members below), then either open one of
@@ -167,8 +164,6 @@ class SubscribeListDialog(wx.Dialog):
         self.subscribeAsMuteButton.Bind(wx.EVT_BUTTON, lambda e: self.onSubscribe("mute"))
         self.subscribeAsBlockButton.Bind(wx.EVT_BUTTON, lambda e: self.onSubscribe("block"))
         closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
         if self._preselected:
             # Search controls never apply here -- hide them and go
@@ -184,16 +179,9 @@ class SubscribeListDialog(wx.Dialog):
         else:
             self.userSearchText.SetFocus()
 
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        evt.Skip()
-
     def onClose(self, evt):
-        gui.mainFrame.postPopup()
         parent = self.GetParent()
-        self.Destroy()
+        super().onClose(evt)
         # Only the Lists tab has a list tree to return to; other hosts keep their own focus.
         if parent is not None and hasattr(parent, "listTree"):
             parent.listTree.SetFocus()
@@ -226,8 +214,7 @@ class SubscribeListDialog(wx.Dialog):
         if error:
             return
         self._userSuggestions = results
-        # Translators: List entry format for a search result with no display name set. {} is the handle.
-        self.userChoice.Set([f'@{r["handle"]} ({r.get("display_name") or _("no display name")})' for r in results])
+        self.userChoice.Set([uiutil.user_choice_label(r) for r in results])
         self.loadListsButton.Show(bool(results))
         self.Layout()
         if results:
@@ -361,7 +348,7 @@ class SubscribeListDialog(wx.Dialog):
             nvdaUi.message(_("Some subscriptions failed: {}").format("; ".join(errors)))
 
 
-class ManageMembersDialog(wx.Dialog):
+class ManageMembersDialog(UserSearchMixin, uiutil.EscapeCloseDialog):
     """
     Add/remove members for a list. Read-only (no Add/Remove controls)
     if you're not the list's creator -- membership can only be edited
@@ -378,7 +365,6 @@ class ManageMembersDialog(wx.Dialog):
         self._listInfo = list_info
         self._members = list(list_info.get("members", []))
         self._isOwner = list_info["creator_did"] == account["did"]
-        self._suggestions = []
 
         # Translators: Title of the manage-list-members dialog. {} is the list's name.
         super().__init__(parent, title=_("Manage members - {}").format(list_info['name']), size=(460, 520))
@@ -436,11 +422,9 @@ class ManageMembersDialog(wx.Dialog):
 
         if self._isOwner:
             self.removeButton.Bind(wx.EVT_BUTTON, self.onRemove)
-            self.searchText.Bind(wx.EVT_TEXT, self.onSearchTextChanged)
+            self._bindUserSearch(self.searchText, self.suggestLabel, self.suggestionList, self.addButton)
             self.addButton.Bind(wx.EVT_BUTTON, self.onAddSuggestion)
         closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
         if self._isOwner and not self._members:
             self.searchText.SetFocus()
@@ -448,19 +432,11 @@ class ManageMembersDialog(wx.Dialog):
             self.memberList.SetFocus()
 
     def _memberChoiceLabels(self):
-        # Translators: Fallback shown for a member with no display name. Used as "@handle ({})".
-        return [f'@{m["handle"]} ({m.get("display_name") or _("no display name")})' for m in self._members]
-
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        evt.Skip()
+        return [uiutil.user_choice_label(m) for m in self._members]
 
     def onClose(self, evt):
-        gui.mainFrame.postPopup()
         parent = self.GetParent()
-        self.Destroy()
+        super().onClose(evt)
         # Return focus to the list tree (Manage members opens from its context menu).
         if parent is not None and hasattr(parent, "listTree"):
             parent.listTree.SetFocus()
@@ -479,14 +455,11 @@ class ManageMembersDialog(wx.Dialog):
         db.set_user_list_cache(self._account["id"], f"list_members:{self._listInfo['uri']}", self._members)
 
     def onRemove(self, evt):
-        if not self.removeButton.IsShown():
-            return
-        indices = list(self.memberList.CheckedItems)
-        if not indices:
+        toRemove = take_checked(
+            self.memberList, self._members, self.removeButton,
             # Translators: Announced when removing list members with nothing checked.
-            nvdaUi.message(_("No members checked."))
-            return
-        toRemove = [self._members[i] for i in indices if 0 <= i < len(self._members)]
+            _("No members checked."),
+        )
         if not toRemove:
             return
 
@@ -538,59 +511,14 @@ class ManageMembersDialog(wx.Dialog):
             # Translators: Announced when some member removals fail. {} is a semicolon-separated list of "handle: error" entries.
             nvdaUi.message(_("Some members could not be removed: {}").format("; ".join(errors)))
 
-    def onSearchTextChanged(self, evt):
-        wx.CallLater(400, self._runSearch, self.searchText.GetValue())
-
-    def _runSearch(self, query):
-        if query != self.searchText.GetValue():
-            return  # a newer keystroke already superseded this debounce
-        if not query.strip():
-            self.suggestionList.Set([])
-            self._suggestions = []
-            self.suggestLabel.Hide()
-            self.suggestionList.Hide()
-            self.addButton.Hide()
-            self.Layout()
-            return
-
-        def worker():
-            try:
-                atprotoClient = client.get_client_for_active_account()
-                results = client.search_actors_typeahead(atprotoClient, query)
-                error = None
-            except Exception as e:
-                results = []
-                error = str(e)
-            wx.CallAfter(self._onSearchDone, results, error)
-
-        uiutil.start_worker(worker, progress=False)
-
-    @uiutil.safe_ui_callback
-    def _onSearchDone(self, results, error):
-        if error:
-            return
-        existingDids = {m["did"] for m in self._members}
-        self._suggestions = [r for r in results if r["did"] not in existingDids]
-        hasResults = bool(self._suggestions)
-        self.suggestLabel.Show(hasResults)
-        self.suggestionList.Show(hasResults)
-        self.addButton.Show(hasResults)
-        self.Layout()
-        # Translators: List entry format for a search result with no display name set. {} is the handle.
-        self.suggestionList.Set([f'@{r["handle"]} ({r.get("display_name") or _("no display name")})' for r in self._suggestions])
-        self.suggestionList.CheckedItems = []
-        if self._suggestions:
-            self.suggestionList.SetSelection(0)
+    def _excludedDids(self):
+        return {m["did"] for m in self._members}
 
     def onAddSuggestion(self, evt):
-        if not self.addButton.IsShown():
-            return
-        indices = list(self.suggestionList.CheckedItems)
-        if not indices:
+        toAdd = self._takeCheckedSuggestions(
             # Translators: Announced when adding list members with nothing checked in search results.
-            nvdaUi.message(_("No suggestions checked."))
-            return
-        toAdd = [self._suggestions[i] for i in indices if 0 <= i < len(self._suggestions)]
+            _("No suggestions checked.")
+        )
         if not toAdd:
             return
 
@@ -625,12 +553,7 @@ class ManageMembersDialog(wx.Dialog):
         self._renderMembers()
         self.removeButton.Show(bool(self._members))
         self._persistCache()
-        self.searchText.SetValue("")
-        self.suggestionList.Set([])
-        self.suggestLabel.Hide()
-        self.suggestionList.Hide()
-        self.addButton.Hide()
-        self.Layout()
+        self._clearUserSearch()
         if added:
             names = ", ".join(f'@{a["handle"]}' for a, _listitemUri in added)
             # Translators: Announced after adding list members. {} is a comma-separated list of handles.
@@ -640,7 +563,7 @@ class ManageMembersDialog(wx.Dialog):
             nvdaUi.message(_("Some members could not be added: {}").format("; ".join(errors)))
 
 
-class AddToListDialog(wx.Dialog):
+class AddToListDialog(uiutil.EscapeCloseDialog):
     """
     User action's "Add to list..." -- checklist of every list the
     active account owns (both curation and moderation lists -- the
@@ -689,8 +612,6 @@ class AddToListDialog(wx.Dialog):
 
         self.addButton.Bind(wx.EVT_BUTTON, self.onAdd)
         closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
         if self._lists:
             self.listCheckBox.SetFocus()
@@ -703,16 +624,6 @@ class AddToListDialog(wx.Dialog):
         kind = _("moderation list") if lst["purpose"] == client.LIST_PURPOSE_MOD else _("curation list")
         # Translators: Checklist entry combining a list's name and type. First {} is the name, second {} is the type.
         return _("{} ({})").format(lst["name"], kind)
-
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        evt.Skip()
-
-    def onClose(self, evt):
-        gui.mainFrame.postPopup()
-        self.Destroy()
 
     def onAdd(self, evt):
         indices = list(self.listCheckBox.CheckedItems)
@@ -974,20 +885,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
-                entries = client.get_lists(atprotoClient, self._account["did"])
-                for entry in entries:
-                    db.upsert_list({
-                        "account_id": self._account["id"],
-                        "list_uri": entry["uri"],
-                        "cid": entry["cid"],
-                        "name": entry["name"],
-                        "description": entry["description"],
-                        "purpose": entry["purpose"],
-                        "creator_did": entry["creator_did"],
-                        "creator_handle": entry["creator_handle"],
-                        "muted": int(entry["muted"]),
-                        "blocked_uri": entry["blocked_uri"],
-                    })
+                client.sync_lists(atprotoClient, self._account["id"], self._account["did"])
                 error = None
             except Exception as e:
                 error = str(e)
@@ -1003,37 +901,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
             nvdaUi.message(_("Could not refresh lists: {}").format(error))
             return
         selectedUri = self._selectedList["list_uri"] if self._selectedList else None
-        self._lists = db.get_lists(self._account["id"])
-        self.listTree.Freeze()
-        try:
-            self.listTree.DeleteAllItems()
-            self._listRoot = self.listTree.AddRoot(_("Lists"))
-            for lst in self._lists:
-                item = self.listTree.AppendItem(self._listRoot, self._listLabel(lst))
-                self.listTree.SetItemData(item, lst["list_uri"])
-
-            item, cookie = self.listTree.GetFirstChild(self._listRoot)
-            selected = False
-            while item.IsOk():
-                if self.listTree.GetItemData(item) == selectedUri:
-                    self.listTree.SelectItem(item)
-                    selected = True
-                    break
-                item, cookie = self.listTree.GetNextChild(self._listRoot, cookie)
-            if not selected:
-                firstItem, _cookie = self.listTree.GetFirstChild(self._listRoot)
-                if firstItem.IsOk():
-                    self.listTree.SelectItem(firstItem)
-                else:
-                    self._selectedList = None
-                    self.postList.DeleteAllItems()
-                    self.memberList.DeleteAllItems()
-                    self.postActionButton.Hide()
-                    self.userActionButton.Hide()
-                    self.Layout()
-        finally:
-            self.listTree.Thaw()
-        self._updateListsStatusBar()
+        self._loadListsFromCache(select_uri=selectedUri)
 
     def _checkListTreeBoundaryBeforeKey(self, keyCode):
         # Same deterministic-boundary reasoning as chatWindow.py's
@@ -1534,20 +1402,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
         # the given client (_syncListsFromServer spawns its own thread and
         # login, and returns nothing to report changes with).
         beforeSnapshot = {l["list_uri"]: l.get("muted") for l in self._lists}
-        entries = client.get_lists(atprotoClient, self._account["did"])
-        for entry in entries:
-            db.upsert_list({
-                "account_id": self._account["id"],
-                "list_uri": entry["uri"],
-                "cid": entry["cid"],
-                "name": entry["name"],
-                "description": entry["description"],
-                "purpose": entry["purpose"],
-                "creator_did": entry["creator_did"],
-                "creator_handle": entry["creator_handle"],
-                "muted": int(entry["muted"]),
-                "blocked_uri": entry["blocked_uri"],
-            })
+        client.sync_lists(atprotoClient, self._account["id"], self._account["did"])
         afterLists = db.get_lists(self._account["id"])
         afterSnapshot = {l["list_uri"]: l.get("muted") for l in afterLists}
         listsChanged = afterSnapshot != beforeSnapshot
@@ -1561,29 +1416,7 @@ class ListsWindow(FeedListMixin, ItemActionMixin, UserActionMixin, EmbedViewMixi
     def _reloadAfterBulkCheck(self, moveFocus=True):
         # _syncForBulkCheck already wrote fresh metadata; rebuild the tree from the DB.
         selectedUri = self._selectedList["list_uri"] if self._selectedList else None
-        self._lists = db.get_lists(self._account["id"])
-        self.listTree.Freeze()
-        try:
-            self.listTree.DeleteAllItems()
-            self._listRoot = self.listTree.AddRoot(_("Lists"))
-            for lst in self._lists:
-                item = self.listTree.AppendItem(self._listRoot, self._listLabel(lst))
-                self.listTree.SetItemData(item, lst["list_uri"])
-            item, cookie = self.listTree.GetFirstChild(self._listRoot)
-            selected = False
-            while item.IsOk():
-                if self.listTree.GetItemData(item) == selectedUri:
-                    self.listTree.SelectItem(item)
-                    selected = True
-                    break
-                item, cookie = self.listTree.GetNextChild(self._listRoot, cookie)
-            if not selected:
-                firstItem, _cookie = self.listTree.GetFirstChild(self._listRoot)
-                if firstItem.IsOk():
-                    self.listTree.SelectItem(firstItem)
-        finally:
-            self.listTree.Thaw()
-        self._updateListsStatusBar()
+        self._loadListsFromCache(select_uri=selectedUri)
 
         if self._selectedList and self._selectedList["purpose"] == client.LIST_PURPOSE_CURATE:
             super()._reloadAfterBulkCheck(moveFocus=moveFocus)

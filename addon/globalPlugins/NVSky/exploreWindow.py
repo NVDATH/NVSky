@@ -14,19 +14,15 @@ from . import db
 from . import client
 from . import uiutil
 from . import keymap
-from .feedWindow import (
-    FeedListMixin,
-    ItemActionMixin,
-    UserActionMixin,
-    UserListMixin,
-    EmbedViewMixin,
-    _search_feed_key,
-    _announce_now,
-)
+from .feedWindow import FeedListMixin
+from .itemActions import ItemActionMixin
+from .userActions import UserActionMixin, UserListMixin
+from .embedView import EmbedViewMixin
+from .postText import _search_feed_key, _announce_now
 from .feedTabs import FeedPreviewTabWindow, UserListTabWindow
 
 
-class StarterPackDetailsDialog(wx.Dialog):
+class StarterPackDetailsDialog(uiutil.EscapeCloseDialog):
     """Read-only starter pack info, plus the same actions available
     from the results-list context menu -- so the user doesn't have to
     close this and reopen the menu separately."""
@@ -84,8 +80,6 @@ class StarterPackDetailsDialog(wx.Dialog):
         followBtn.Bind(wx.EVT_BUTTON, lambda e: self._doFollow())
         openBtn.Bind(wx.EVT_BUTTON, lambda e: self._doOpen())
         closeBtn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
-        self.Bind(wx.EVT_CLOSE, self.onClose)
-        self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
     def _doFollow(self):
         parent = self.GetParent()
@@ -98,12 +92,6 @@ class StarterPackDetailsDialog(wx.Dialog):
         pack = self._pack
         self.Close()
         parent._openStarterPackInBrowser(pack)
-
-    def onCharHook(self, evt):
-        if evt.GetKeyCode() == wx.WXK_ESCAPE:
-            self.Close()
-            return
-        evt.Skip()
 
     def onClose(self, evt):
         gui.mainFrame.postPopup()

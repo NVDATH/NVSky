@@ -12,12 +12,11 @@ from . import db
 from . import client
 from . import uiutil
 from . import keymap
-from .feedWindow import (
-    FeedListMixin,
-    ItemActionMixin,
-    UserActionMixin,
-    EmbedViewMixin,
-    _VirtualPostList,
+from .feedWindow import FeedListMixin, _VirtualPostList
+from .itemActions import ItemActionMixin
+from .userActions import UserActionMixin
+from .embedView import EmbedViewMixin
+from .postText import (
     _format_post_time,
     _announce_now,
     _post_web_url,

@@ -1,9 +1,6 @@
 """
 ItemActionMixin for NVSky: the shared Post action menu (Alt+A) and its
 handlers, used by every post-list tab.
-
-feedWindow is imported as a module (not by name) because it imports this
-file; its helpers are only touched inside method bodies.
 """
 import datetime
 import json
@@ -18,7 +15,7 @@ from . import client
 from . import db
 from . import soundpack
 from . import uiutil
-from . import feedWindow
+from . import postText
 from .compose import ComposeDialog
 
 
@@ -233,7 +230,7 @@ class ItemActionMixin:
             # Translators: Announced after marking a post unread.
             message = _("Marked as unread.")
         self._updateStatusBar()
-        feedWindow._announce_now(message)
+        postText._announce_now(message)
 
     def _togglePostLike(self, post):
         wasLiked = bool(post.get("viewer_like_uri"))
@@ -278,7 +275,7 @@ class ItemActionMixin:
         self._onActionDone(message, error)
         if error:
             return
-        feedWindow.propagate_post_state(post)
+        postText.propagate_post_state(post)
         if post.get("viewer_like_uri"):
             likedAt = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
             db.upsert_feed_item(self._account["id"], "likes", post["uri"], likedAt)
@@ -323,7 +320,7 @@ class ItemActionMixin:
         self._onActionDone(message, error)
         if error:
             return
-        feedWindow.propagate_post_state(post)
+        postText.propagate_post_state(post)
         if not post.get("viewer_bookmarked"):
             # Always drop the "saved" cache row, whichever tab unsaved it.
             db.delete_feed_item(self._account["id"], "saved", post["uri"])
@@ -351,7 +348,7 @@ class ItemActionMixin:
     def _copyPostText(self, post):
         self._copyToClipboard(post.get("text", ""))
         # Translators: Announced after copying a post's text to the clipboard.
-        feedWindow._announce_now(_("Post text copied to clipboard."))
+        postText._announce_now(_("Post text copied to clipboard."))
 
     def _copyPostLink(self, post):
         handle = post.get("handle") or post.get("author_did")
@@ -359,16 +356,16 @@ class ItemActionMixin:
         url = f"https://bsky.app/profile/{handle}/post/{rkey}"
         self._copyToClipboard(url)
         # Translators: Announced after copying a post's URL to the clipboard.
-        feedWindow._announce_now(_("Post URL copied to clipboard."))
+        postText._announce_now(_("Post URL copied to clipboard."))
 
     def _shareToChat(self, post):
         if self._account is None:
             # Translators: Announced when trying to share a post to chat with no active account.
             nvdaUi.message(_("No active account."))
             return
-        from . import chatWindow
+        from . import chatDialogs
         gui.mainFrame.prePopup()
-        dlg = chatWindow.ShareToChatDialog(self, self._account, post)
+        dlg = chatDialogs.ShareToChatDialog(self, self._account, post)
         dlg.Show()
 
     def _muteThread(self, post):
@@ -376,7 +373,7 @@ class ItemActionMixin:
         wasMuted = bool(post.get("viewer_thread_muted"))
         post["viewer_thread_muted"] = not wasMuted
         db.set_post_thread_muted(post["uri"], not wasMuted)
-        feedWindow.propagate_post_state(post)
+        postText.propagate_post_state(post)
         # Translators: Announced after unmuting a thread.
         # Translators: Announced after muting a thread.
         self._onActionDone(_("Thread unmuted.") if wasMuted else _("Thread muted."), None)
@@ -429,17 +426,9 @@ class ItemActionMixin:
 
     def _hidePost(self, post):
         db.hide_post(post["uri"])
-        for i, p in enumerate(self._posts):
-            if p["uri"] == post["uri"]:
-                del self._posts[i]
-                self._render()
-                if self._posts:
-                    newIndex = min(i, len(self._posts) - 1)
-                    self.postList.Focus(newIndex)
-                    self.postList.Select(newIndex)
-                break
+        self._removePostFromList(post)
         # Translators: Announced after hiding a post for the current account only.
-        feedWindow._announce_now(_("Post hidden."))
+        postText._announce_now(_("Post hidden."))
 
     def _deletePost(self, post):
         confirm = wx.MessageDialog(
@@ -456,14 +445,7 @@ class ItemActionMixin:
         # Optimistic: remove from the list right away instead of
         # waiting on the network round trip -- matches Like/Repost/
         # Bookmark/Mute thread's convention. Rolled back on failure.
-        previousIndex = next((i for i, p in enumerate(self._posts) if p["uri"] == post["uri"]), None)
-        if previousIndex is not None:
-            del self._posts[previousIndex]
-            self._render()
-            if self._posts:
-                newIndex = min(previousIndex, len(self._posts) - 1)
-                self.postList.Focus(newIndex)
-                self.postList.Select(newIndex)
+        previousIndex = self._removePostFromList(post)
         soundpack.play("delete")
         # Translators: Announced after deleting a post.
         nvdaUi.message(_("Post deleted."))
@@ -564,12 +546,9 @@ class ItemActionMixin:
             return
 
         # Translators: Announced while loading a post's quotes.
-        feedWindow._announce_now(_("Loading quotes, please wait..."))
+        postText._announce_now(_("Loading quotes, please wait..."))
         soundpack.start_progress()
-        activeIndex = mainWindow.notebook.GetSelection()
-        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
-        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
-        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+        originKey = mainWindow.currentOriginKey()
 
         def worker():
             try:
@@ -592,11 +571,11 @@ class ItemActionMixin:
             nvdaUi.message(_("Could not load quotes: {}").format(error))
             return
         from . import get_main_window
-        from . import feedTabs
+        from . import postTabs
         mainWindow = get_main_window()
         if mainWindow is None:
             return
-        tab = feedTabs.QuotesTabWindow(mainWindow.notebook, targetUri, quotes or [], origin_key=originKey)
+        tab = postTabs.QuotesTabWindow(mainWindow.notebook, targetUri, quotes or [], origin_key=originKey)
         mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
         account = db.get_active_account()
         if account is not None:
@@ -618,10 +597,7 @@ class ItemActionMixin:
         if mainWindow.focusTabByIdentity(identity):
             return
 
-        activeIndex = mainWindow.notebook.GetSelection()
-        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
-        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
-        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+        originKey = mainWindow.currentOriginKey()
 
         authorHandle = post.get("handle") or post.get("author_did")
         preview = (post.get("text") or "")[:40]
@@ -645,7 +621,7 @@ class ItemActionMixin:
 
     def _editReplyPermissions(self, post):
         # Translators: Announced while loading a post's current reply-permission settings.
-        feedWindow._announce_now(_("Loading current reply settings, please wait..."))
+        postText._announce_now(_("Loading current reply settings, please wait..."))
 
         def worker():
             try:
@@ -856,7 +832,7 @@ class ItemActionMixin:
 
     def _actOnQuoted(self, post, run):
         # Translators: Announced while loading the post a quote post quotes.
-        feedWindow._announce_now(_("Loading the quoted post, please wait..."))
+        postText._announce_now(_("Loading the quoted post, please wait..."))
         soundpack.start_progress()
         accountId = self._account["id"]
 
@@ -897,13 +873,10 @@ class ItemActionMixin:
             return
 
         # Translators: Announced while loading a whole thread.
-        feedWindow._announce_now(_("Loading thread, please wait..."))
+        postText._announce_now(_("Loading thread, please wait..."))
         soundpack.start_progress()
 
-        activeIndex = mainWindow.notebook.GetSelection()
-        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
-        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
-        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+        originKey = mainWindow.currentOriginKey()
 
         def worker():
             try:
@@ -934,7 +907,7 @@ class ItemActionMixin:
             return
 
         from . import get_main_window
-        from . import feedTabs
+        from . import postTabs
         mainWindow = get_main_window()
         if mainWindow is None:
             return
@@ -943,7 +916,7 @@ class ItemActionMixin:
         if mainWindow.focusTabByIdentity(identity):
             return
 
-        tab = feedTabs.ThreadTabWindow(mainWindow.notebook, rootUri, posts, targetIndex, origin_key=originKey)
+        tab = postTabs.ThreadTabWindow(mainWindow.notebook, rootUri, posts, targetIndex, origin_key=originKey)
         mainWindow.addTab(tab, tab.TAB_NAME, select=True, removable=True)
         account = db.get_active_account()
         if account is not None:
@@ -960,7 +933,7 @@ class ItemActionMixin:
                 return
         if post.get("viewer_repost_uri") == "pending":
             # Translators: Announced when an action is repeated while the previous one is still in progress.
-            feedWindow._announce_now(_("Please wait..."))
+            postText._announce_now(_("Please wait..."))
             return
         wasReposted = bool(post.get("viewer_repost_uri"))
         previousUri = post.get("viewer_repost_uri")
@@ -997,7 +970,7 @@ class ItemActionMixin:
         if not wasReposted:
             post["viewer_repost_uri"] = newUri
             db.set_post_repost_uri(post["uri"], newUri)
-        feedWindow.propagate_post_state(post)
+        postText.propagate_post_state(post)
         onRepostChanged = getattr(self, "_onRepostChanged", None)
         if callable(onRepostChanged):
             onRepostChanged(post)
@@ -1005,14 +978,14 @@ class ItemActionMixin:
     def _reportPost(self, post):
         # NOTE: was "for label, _ in REPORT_REASONS" -- bare `_` shadowed
         # gettext within this function's scope. Renamed to avoid that trap.
-        labels = [label for label, _reasonCode in feedWindow.REPORT_REASONS]
+        labels = [label for label, _reasonCode in postText.REPORT_REASONS]
         # Translators: Prompt in the report-post reason picker.
         # Translators: Title of the report-post reason picker.
         dlg = wx.SingleChoiceDialog(self, _("Reason for reporting this post:"), _("Report post"), labels)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
             return
-        reasonType = feedWindow.REPORT_REASONS[dlg.GetSelection()][1]
+        reasonType = postText.REPORT_REASONS[dlg.GetSelection()][1]
         dlg.Destroy()
 
         confirm = wx.MessageDialog(
@@ -1049,10 +1022,10 @@ class ItemActionMixin:
         self._updateStatusBar()
         if read:
             # Translators: Announced after marking several posts read. {} is the count.
-            feedWindow._announce_now(_("Marked {} posts as read.").format(len(posts)))
+            postText._announce_now(_("Marked {} posts as read.").format(len(posts)))
         else:
             # Translators: Announced after marking several posts unread. {} is the count.
-            feedWindow._announce_now(_("Marked {} posts as unread.").format(len(posts)))
+            postText._announce_now(_("Marked {} posts as unread.").format(len(posts)))
 
     def _getRelevantUsers(self, post):
         authorHandle = post.get("handle") or post.get("author_did")

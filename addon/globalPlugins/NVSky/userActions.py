@@ -1,9 +1,6 @@
 """
 UserActionMixin + UserListMixin for NVSky: the shared "act on a user"
 menu (Alt+U) used by every tab or dialog that shows posts or users.
-
-feedWindow is imported as a module (not by name) because it imports this
-file; its helpers are only touched inside method bodies.
 """
 
 import webbrowser
@@ -19,7 +16,7 @@ from . import db
 from . import soundpack
 from . import uiutil
 from . import keymap
-from . import feedWindow
+from . import postText
 
 
 class UserActionMixin:
@@ -195,10 +192,7 @@ class UserActionMixin:
         if mainWindow.focusTabByIdentity(identity):
             return
 
-        activeIndex = mainWindow.notebook.GetSelection()
-        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
-        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
-        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+        originKey = mainWindow.currentOriginKey()
 
         ownerLabel = self._displayLabel(handle, display_name)
         tab = feedTabs.UserTimelineTabWindow(mainWindow.notebook, did, ownerLabel, origin_key=originKey)
@@ -239,10 +233,7 @@ class UserActionMixin:
         # origin_key only set when opened from a PERMANENT tab -- a
         # removable-tab origin just lets wx.Notebook auto-select
         # whatever's next when this tab closes, no special fallback.
-        activeIndex = mainWindow.notebook.GetSelection()
-        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
-        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
-        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+        originKey = mainWindow.currentOriginKey()
 
         ownerLabel = self._displayLabel(handle, display_name)
         tab = feedTabs.UserListTabWindow(mainWindow.notebook, kind, did, ownerLabel, origin_key=originKey)
@@ -259,15 +250,15 @@ class UserActionMixin:
             })
 
     def _displayLabel(self, handle, display_name=None):
-        mode = db.get_ui_state("column1_display") or feedWindow.COLUMN_DISPLAY_NAME
-        if mode == feedWindow.COLUMN_DISPLAY_NAME and display_name:
+        mode = db.get_ui_state("column1_display") or postText.COLUMN_DISPLAY_NAME
+        if mode == postText.COLUMN_DISPLAY_NAME and display_name:
             return display_name
         # Translators: Fallback user label when neither display name nor handle is known.
         return f"@{handle}" if handle else _("unknown user")
 
     def viewProfile(self, did):
         # Translators: Announced while loading a user's profile.
-        feedWindow._announce_now(_("Loading profile, please wait..."))
+        postText._announce_now(_("Loading profile, please wait..."))
 
         def worker():
             try:
@@ -302,7 +293,7 @@ class UserActionMixin:
         self._copyToClipboard(url)
         label = f"@{handle}" if handle else did
         # Translators: Announced after copying a user's profile URL. {} is the user's label.
-        feedWindow._announce_now(_("Profile URL for {} copied to clipboard.").format(label))
+        postText._announce_now(_("Profile URL for {} copied to clipboard.").format(label))
 
     def startChat(self, did, handle):
         # Opens or focuses a ConvoTabWindow for this user (not the shared
@@ -329,7 +320,7 @@ class UserActionMixin:
             return
         label = f"@{handle}" if handle else did
         # Translators: Announced while starting a new chat. {} is the recipient's label.
-        feedWindow._announce_now(_("Starting chat with {}, please wait...").format(label))
+        postText._announce_now(_("Starting chat with {}, please wait...").format(label))
         soundpack.start_progress()
 
         def worker():
@@ -386,10 +377,7 @@ class UserActionMixin:
             return
         from . import chatWindow
         members = db.get_convo_members(account["id"], convoId)
-        activeIndex = mainWindow.notebook.GetSelection()
-        activePanel = mainWindow.notebook.GetPage(activeIndex) if activeIndex != wx.NOT_FOUND else None
-        activeIdentity = mainWindow._getTabIdentity(activePanel) if activePanel is not None else None
-        originKey = activeIdentity["key"] if activeIdentity and activeIdentity["kind"] == "permanent" else None
+        originKey = mainWindow.currentOriginKey()
         panel = chatWindow.ConvoTabWindow(mainWindow.notebook, convoRow, account, members, origin_key=originKey)
         tabLabel = db.describe_convo_from_members(convoRow, members)
         # Translators: Title of a popped-out conversation tab. {} is the conversation's display name.
@@ -515,7 +503,7 @@ class UserActionMixin:
     def _toggleRelationCached(self, did, handle, kind, currentValue):
         if currentValue == "pending":
             # Translators: Announced when an action is repeated while the previous one is still in progress.
-            feedWindow._announce_now(_("Please wait..."))
+            postText._announce_now(_("Please wait..."))
             return
         label = f"@{handle}" if handle else did
         if kind == "follow":
@@ -523,25 +511,25 @@ class UserActionMixin:
             soundpack.play("unfollow" if currentValue else "follow")
             # Translators: Announced after unfollowing a user. {} is their label.
             # Translators: Announced after following a user. {} is their label.
-            feedWindow._announce_now(_("Unfollowed {}.").format(label) if currentValue else _("Followed {}.").format(label))
+            postText._announce_now(_("Unfollowed {}.").format(label) if currentValue else _("Followed {}.").format(label))
         elif kind == "mute":
             db.set_author_muted(did, not currentValue)
             soundpack.play("block_mute")
             # Translators: Announced after unmuting a user. {} is their label.
             # Translators: Announced after muting a user. {} is their label.
-            feedWindow._announce_now(_("Unmuted {}.").format(label) if currentValue else _("Muted {}.").format(label))
+            postText._announce_now(_("Unmuted {}.").format(label) if currentValue else _("Muted {}.").format(label))
         elif kind == "activity_sub":
             db.set_author_activity_subscription(did, not currentValue)
             soundpack.play("block_mute")
             # Translators: Announced after unsubscribing from a user's post notifications. {} is their label.
             # Translators: Announced after subscribing to a user's post notifications. {} is their label.
-            feedWindow._announce_now(_("Unsubscribed from {}'s posts.").format(label) if currentValue else _("Subscribed to {}'s posts.").format(label))
+            postText._announce_now(_("Unsubscribed from {}'s posts.").format(label) if currentValue else _("Subscribed to {}'s posts.").format(label))
         else:
             db.set_author_blocking(did, None if currentValue else "pending")
             soundpack.play("block_mute")
             # Translators: Announced after unblocking a user. {} is their label.
             # Translators: Announced after blocking a user. {} is their label.
-            feedWindow._announce_now(_("Unblocked {}.").format(label) if currentValue else _("Blocked {}.").format(label))
+            postText._announce_now(_("Unblocked {}.").format(label) if currentValue else _("Blocked {}.").format(label))
 
         # Lists of one's own relationships drop the user right away (see UserListMixin).
         afterToggle = getattr(self, "_afterRelationToggled", None)
@@ -594,14 +582,14 @@ class UserActionMixin:
     def _reportActor(self, did, handle):
         # NOTE: was "for label, _ in REPORT_REASONS" -- bare `_` shadowed
         # gettext within this function's scope. Renamed to avoid that trap.
-        labels = [label for label, _reasonCode in feedWindow.REPORT_REASONS]
+        labels = [label for label, _reasonCode in postText.REPORT_REASONS]
         # Translators: Prompt in the report-user reason picker.
         # Translators: Title of the report-user reason picker.
         dlg = wx.SingleChoiceDialog(self, _("Reason for reporting this user:"), _("Report user"), labels)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
             return
-        reasonType = feedWindow.REPORT_REASONS[dlg.GetSelection()][1]
+        reasonType = postText.REPORT_REASONS[dlg.GetSelection()][1]
         dlg.Destroy()
 
         label = f"@{handle}" if handle else did

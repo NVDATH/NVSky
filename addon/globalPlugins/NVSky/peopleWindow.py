@@ -11,7 +11,7 @@ from . import db
 from . import client
 from . import uiutil
 from . import keymap
-from .feedWindow import UserActionMixin, UserListMixin
+from .userActions import UserActionMixin, UserListMixin
 
 
 class PeopleWindow(UserActionMixin, UserListMixin, wx.Panel):
@@ -159,16 +159,7 @@ class PeopleWindow(UserActionMixin, UserListMixin, wx.Panel):
         def worker():
             try:
                 atprotoClient = client.get_client_for_active_account()
-                if kind == "following":
-                    users = client.get_follows(atprotoClient, myDid)
-                elif kind == "followers":
-                    users = client.get_followers(atprotoClient, myDid)
-                elif kind == "muted":
-                    users = client.get_muted_actors(atprotoClient)
-                elif kind == "blocked":
-                    users = client.get_blocked_actors(atprotoClient)
-                else:
-                    users = client.get_activity_subscriptions(atprotoClient)
+                users = client.fetch_user_list(atprotoClient, kind, myDid)
                 db.cache_relationship_authors(users, kind)
                 error = None
             except Exception as e:

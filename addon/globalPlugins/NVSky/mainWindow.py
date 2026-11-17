@@ -39,7 +39,7 @@ import ui as nvdaUi
 from logHandler import log
 
 from . import db
-from . import chatWindow
+from . import chatDialogs
 from . import uiutil
 from . import soundpack
 from . import keymap
@@ -135,7 +135,7 @@ class MainWindow(wx.Frame):
                 # Translators: Announced when trying to start a new chat with no active account.
                 nvdaUi.message(_("No active account."))
                 return
-            dlg = chatWindow.NewChatDialog(self, account, on_started=self._openChatConvo)
+            dlg = chatDialogs.NewChatDialog(self, account, on_started=self._openChatConvo)
             dlg.Show()
             return
         if isListsContext:
@@ -288,6 +288,14 @@ class MainWindow(wx.Frame):
         if tempType and tempKey is not None:
             return {"kind": tempType, "key": tempKey}
         return None
+
+    def currentOriginKey(self):
+        """Key of the active tab when it is a permanent one, else None (where a new temp tab returns to on close)."""
+        index = self.notebook.GetSelection()
+        panel = self.notebook.GetPage(index) if index != wx.NOT_FOUND else None
+        identity = self._getTabIdentity(panel) if panel is not None else None
+        return identity["key"] if identity and identity["kind"] == "permanent" else None
+
 
     def onPageChanging(self, evt):
         # Focus the notebook before the swap: a focused control being hidden
